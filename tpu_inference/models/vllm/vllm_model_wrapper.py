@@ -58,10 +58,6 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.models.vllm.experimental.model_patcher import patch_mm_model
 from tpu_inference.models.vllm.experimental.qwen3_decoder_patcher import \
     maybe_apply_qwen3_decoder_output_cast
-from tpu_inference.models.vllm.experimental.qwen3_layer_trace import (
-    maybe_apply_qwen3_layer_trace, trace_torch_tensor)
-from tpu_inference.models.vllm.experimental.qwen_mlp_patcher import \
-    maybe_apply_qwen_mlp_activation_barrier
 from tpu_inference.models.vllm.experimental.qwen3_vl_patcher import \
     maybe_apply_qwen3_vl_patches
 from tpu_inference.models.vllm.experimental.vision_tower_jit import (
@@ -101,13 +97,10 @@ class _VllmRunner(torch.nn.Module):
 
     def compute_hidden_state(self, kwargs: dict) -> torch.Tensor:
         output = self.vllm_model(**kwargs)
-        trace_torch_tensor("model.hidden_state.output", output)
         return output
 
     def compute_logits(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        trace_torch_tensor("logits.input_hidden_state", hidden_state)
         logits = self.vllm_model.compute_logits(hidden_state)
-        trace_torch_tensor("logits.output", logits)
         return logits
 
 
@@ -255,11 +248,8 @@ class VllmModelWrapper:
 
         pcp_size = getattr(self.vllm_config.parallel_config,
                            "prefill_context_parallel_size", 1)
-        maybe_apply_qwen_mlp_activation_barrier(vllm_model,
-                                                enabled=pcp_size > 1)
         maybe_apply_qwen3_decoder_output_cast(vllm_model,
                                               enabled=pcp_size > 1)
-        maybe_apply_qwen3_layer_trace(vllm_model)
 
         self.model = _VllmRunner(vllm_model, self.vllm_config,
                                  self.is_draft_model)

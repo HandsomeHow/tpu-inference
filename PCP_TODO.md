@@ -241,22 +241,7 @@ PCP 下 page/block size 会随 `prefill_cp_size` 放大。短序列可能只使�
 - `kv_cache_dtype=fp8` 的真实 generate correctness/perf 回归。
 - sliding window / sinks / quantized QKV 等特定 attention 参数。
 
-### 14. 真实运行脚本需要固化（已添加手动 smoke 脚本）
-
-这次真实权重 smoke 是手工命令跑的，还没有固化成可重复脚本或 e2e test。
-
-已完成：
-
-- 增加 `scripts/pcp/run_qwen3_pcp_smoke.py`，可顺序运行 baseline `PCP=1` 和 candidate `PCP=N`。
-- 输出 prompt token ids、生成 token ids、文本、首个生成 token logprob，以及逐 prompt diff。
-- 参数化 prompt 文件、PCP/TP/DP、`cp_kv_cache_interleave_size`、`max_tokens`、`num_gpu_blocks_override` 等常用项。
-- 脚本默认设置 TPU/JAX PCP 所需环境变量，并强制 `async_scheduling=False`。
-
-需要做：
-
-- 后续可以把该脚本接入可选 e2e 流水线；目前仍作为手动 smoke 工具。
-
-### 15. 退出时有 JAX allocator cleanup 噪声（已修复）
+### 14. 退出时有 JAX allocator cleanup 噪声（已修复）
 
 真实运行结束后，EngineCore shutdown 时会出现：
 
