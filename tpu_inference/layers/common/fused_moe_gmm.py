@@ -118,6 +118,54 @@ def gmm_wrapper(lhs,
     return gmm_res
 
 
+def _remove_sharding_axis(axes, axis):
+    if axes is None or axis is None:
+        return axes
+    if isinstance(axes, str):
+        return None if axes == axis else axes
+    filtered_axes = tuple(cur_axis for cur_axis in axes if cur_axis != axis)
+    return filtered_axes or None
+
+
+def _moe_data_axes(mesh: Mesh):
+    data_axes = ShardingAxisName.MLP_DATA
+    if get_mesh_shape_product(mesh, ShardingAxisName.PREFILL_CONTEXT) <= 1:
+        return data_axes
+    return _remove_sharding_axis(data_axes, ShardingAxisName.PREFILL_CONTEXT)
+
+
+def _token_partition_spec(data_axes, ndim: int):
+    return P(data_axes, *(None for _ in range(ndim - 1)))
+
+
+def _gather_pcp_sharded_tokens(x: jax.Array, mesh: Mesh) -> jax.Array:
+    pcp_axis = ShardingAxisName.PREFILL_CONTEXT
+    if pcp_axis is None or get_mesh_shape_product(mesh, pcp_axis) <= 1:
+        return x
+
+    data_axes = _remove_sharding_axis(ShardingAxisName.MLP_DATA, pcp_axis)
+
+    def _gather_local(x_local):
+        return jax.lax.all_gather(x_local,
+                                  pcp_axis,
+                                  axis=0,
+                                  tiled=True)
+
+    return jax.shard_map(
+        _gather_local,
+        mesh=mesh,
+        in_specs=_token_partition_spec(ShardingAxisName.MLP_DATA, x.ndim),
+        out_specs=_token_partition_spec(data_axes, x.ndim),
+        check_vma=False,
+    )(x)
+
+
+def _has_attention_data_parallelism(mesh: Mesh) -> bool:
+    attn_data_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA)
+    mlp_data_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_DATA)
+    return (attn_data_size // mlp_data_size) > 1
+
+
 def valid_rows_mask(batch_size: int, group_sizes: jax.Array,
                     group_start: jax.Array, group_end: jax.Array) -> jax.Array:
     """Mask indicating rows processed by current shard."""
@@ -295,8 +343,10 @@ def tensor_parallel_gmm(
     enable_rs_kernel: bool = False,
     onehot_moe_permute_threshold: int = 0,
     scatter_results: bool = False,
+    data_axes=None,
 ) -> jax.Array:
-    data_p_spec = P(ShardingAxisName.MLP_DATA)
+    data_axes = ShardingAxisName.MLP_DATA if data_axes is None else data_axes
+    data_p_spec = P(data_axes)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
     group_offset = jnp.array([0])
 
@@ -377,10 +427,12 @@ def expert_parallel_gmm(
     enable_rs_kernel: bool = False,
     onehot_moe_permute_threshold: int = 0,
     scatter_results: bool = False,
+    data_axes=None,
 ) -> jax.Array:
     ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
     ep_p_spec = P(ShardingAxisName.EXPERT)
-    data_p_spec = P(ShardingAxisName.MLP_DATA)
+    data_axes = ShardingAxisName.MLP_DATA if data_axes is None else data_axes
+    data_p_spec = P(data_axes)
     ep_data_p_spec = P(ShardingAxisName.EXPERT_DATA)
     attn_data_p_spec = P(ShardingAxisName.ATTN_DATA)
     num_experts = w1.shape[0]
@@ -526,6 +578,9 @@ def fused_moe_func(
         f"16 but got {num_tokens}*{topk}={num_tokens*topk}")
 
     assert gating_output.shape == (num_tokens, global_num_experts)
+    data_axes = _moe_data_axes(mesh)
+    hidden_states = _gather_pcp_sharded_tokens(hidden_states, mesh)
+    gating_output = _gather_pcp_sharded_tokens(gating_output, mesh)
 
     topk_weights = apply_scoring_fn(scoring_fn, gating_output)
     if envs.MOE_APPROX_TOPK:
@@ -537,13 +592,15 @@ def fused_moe_func(
         topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
-    # All gathering topk_indices and topk_weights if attention dp is used.
-    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
+    # All gathering topk_indices and topk_weights if attention DP is used.
+    # ATTN_DATA also includes the PCP axis; PCP-only sharding is gathered later
+    # by the MoE data-axis constraint and must not trigger this path.
+    if _has_attention_data_parallelism(mesh):
         topk_indices, topk_weights = all_gather_topk_indices_and_weights(
             topk_indices, topk_weights, dtype, mesh)
     topk_weights = topk_weights.astype(dtype)
     topk_weights = jax.lax.with_sharding_constraint(
-        topk_weights, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
+        topk_weights, NamedSharding(mesh, P(data_axes, None)))
 
     # Only enable Reduce-Scatter if flag is on and Attention is pure DP
     total_num_devices = mesh.devices.size
@@ -613,13 +670,13 @@ def fused_moe_func(
         _process_tokens_locally,
         mesh=mesh,
         in_specs=(
-            P(ShardingAxisName.MLP_DATA, None),
-            P(ShardingAxisName.MLP_DATA, None),
+            P(data_axes, None),
+            P(data_axes, None),
         ),
         out_specs=(
-            P(ShardingAxisName.MLP_DATA),
-            P(ShardingAxisName.MLP_DATA),
-            P(ShardingAxisName.MLP_DATA),
+            P(data_axes),
+            P(data_axes),
+            P(data_axes),
         ),
         check_vma=False,
     )(hidden_states, topk_indices)
@@ -648,6 +705,7 @@ def fused_moe_func(
             mesh=mesh,
             enable_rs_kernel=actual_enable_rs_kernel,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            data_axes=data_axes,
         )
     else:
         x = tensor_parallel_gmm(
@@ -666,6 +724,9 @@ def fused_moe_func(
             mesh=mesh,
             enable_rs_kernel=actual_enable_rs_kernel,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            data_axes=data_axes,
         )
 
-    return x[:num_tokens, :hidden_size]
+    x = x[:num_tokens, :hidden_size]
+    return jax.lax.with_sharding_constraint(
+        x, NamedSharding(mesh, P(ShardingAxisName.MLP_DATA, None)))
