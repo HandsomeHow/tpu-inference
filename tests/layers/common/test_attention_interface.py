@@ -242,6 +242,20 @@ def _pcp_decode_source_location(pos, page_size, pcp_size, interleave_size):
     return src_rank, virtual_block, src_offset
 
 
+def _fake_compact_pcp_all_gather(gathered, source_block_tables):
+    source_pages = source_block_tables.reshape(-1)
+
+    def fake_all_gather(x, axis_name, axis, tiled):
+        assert axis_name == "pcp"
+        assert axis == 0
+        assert tiled is False
+        assert x.shape[0] == source_pages.size
+        assert x.shape[0] < gathered.shape[1]
+        return jnp.asarray(gathered[:, source_pages])
+
+    return fake_all_gather
+
+
 def test_materialize_pcp_kv_for_decode_repacks_tokens(monkeypatch):
     page_size = 4
     pcp_size = 2
@@ -270,13 +284,10 @@ def test_materialize_pcp_kv_for_decode_repacks_tokens(monkeypatch):
             gathered[src_rank, src_page, src_offset] = [value, -value]
             expected_tokens[(req_idx, pos)] = [value, -value]
 
-    def fake_all_gather(x, axis_name, axis, tiled):
-        assert axis_name == "pcp"
-        assert axis == 0
-        assert tiled is False
-        return jnp.asarray(gathered)
-
-    monkeypatch.setattr("jax.lax.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "jax.lax.all_gather",
+        _fake_compact_pcp_all_gather(gathered, source_block_tables),
+    )
     full_kv_cache, full_kv_lens, full_page_indices = (
         materialize_pcp_kv_for_decode(
             jnp.zeros((local_pages, page_size, 2), dtype=jnp.int32),
@@ -350,13 +361,10 @@ def test_materialize_pcp_kv_for_decode_repacks_pcp8_virtual_blocks(
                                                   pcp_size, interleave_size)
     assert last_rank != 0
 
-    def fake_all_gather(x, axis_name, axis, tiled):
-        assert axis_name == "pcp"
-        assert axis == 0
-        assert tiled is False
-        return jnp.asarray(gathered)
-
-    monkeypatch.setattr("jax.lax.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "jax.lax.all_gather",
+        _fake_compact_pcp_all_gather(gathered, source_block_tables),
+    )
     full_kv_cache, full_kv_lens, full_page_indices = (
         materialize_pcp_kv_for_decode(
             jnp.zeros((local_pages, page_size, 3), dtype=jnp.int32),
@@ -414,17 +422,14 @@ def test_pcp_decode_update_then_materialize_multiple_steps(monkeypatch):
         del v, q_dtype, kv_dtype
         return jnp.zeros_like(q), k.reshape(k.shape[0], 1, 1, 1)
 
-    def fake_all_gather(x, axis_name, axis, tiled):
-        assert axis_name == "pcp"
-        assert axis == 0
-        assert tiled is False
-        return jnp.asarray(gathered)
-
     monkeypatch.setattr(
         "tpu_inference.layers.common.attention_interface.batched_rpa_wrapper.prepare_inputs",
         fake_prepare_inputs,
     )
-    monkeypatch.setattr("jax.lax.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "jax.lax.all_gather",
+        _fake_compact_pcp_all_gather(gathered, np.asarray(source_block_tables)),
+    )
 
     for pos in range(4, 7):
         src_rank, _, src_offset = _pcp_decode_source_location(

@@ -646,6 +646,11 @@ def _materialize_gathered_pcp_kv_for_decode(
             "PCP decode materialize requires gathered PCP rank dimension "
             f"to match pcp_size: got {gathered_kv_cache.shape[0]} vs "
             f"{pcp_size}.")
+    if gathered_kv_cache.shape[1] != source_block_tables.size:
+        raise ValueError(
+            "PCP decode materialize requires compact gathered page dimension "
+            "to match source_block_tables.size: got "
+            f"{gathered_kv_cache.shape[1]} vs {source_block_tables.size}.")
     if interleave_size <= 0:
         raise ValueError(
             "PCP decode materialize requires interleave_size > 0.")
@@ -671,8 +676,8 @@ def _materialize_gathered_pcp_kv_for_decode(
     src_offsets = (
         (virtual_offsets // (pcp_size * interleave_size)) * interleave_size +
         (virtual_offsets % interleave_size))
-    src_pages = source_block_tables[req_indices, virtual_blocks]
-    values = gathered_kv_cache[src_ranks, src_pages, src_offsets]
+    compact_src_pages = req_indices * virtual_blocks_per_req + virtual_blocks
+    values = gathered_kv_cache[src_ranks, compact_src_pages, src_offsets]
 
     dst_page_indices = positions // page_size
     dst_pages = req_indices * standard_pages_per_req + dst_page_indices
@@ -702,8 +707,20 @@ def materialize_pcp_kv_for_decode(
     pcp_axis_name: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Materialize PCP-sharded KV cache into standard PCP=1 decode layout."""
+    if pcp_size <= 1:
+        raise ValueError("PCP decode materialize requires pcp_size > 1.")
+    if interleave_size <= 0:
+        raise ValueError(
+            "PCP decode materialize requires interleave_size > 0.")
+    if page_size % interleave_size != 0:
+        raise ValueError(
+            "PCP decode materialize requires page_size % interleave_size == 0."
+        )
+
+    compact_source_pages = source_block_tables.reshape(-1)
+    compact_pcp_kv_cache = pcp_kv_cache[compact_source_pages]
     gathered_kv_cache = jax.lax.all_gather(
-        pcp_kv_cache,
+        compact_pcp_kv_cache,
         axis_name=pcp_axis_name,
         axis=0,
         tiled=False,
