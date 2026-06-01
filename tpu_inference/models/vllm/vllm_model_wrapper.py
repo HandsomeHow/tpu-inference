@@ -56,8 +56,6 @@ from tpu_inference.models.common.interface import PoolerFunc
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.vllm.experimental.model_patcher import patch_mm_model
-from tpu_inference.models.vllm.experimental.qwen3_decoder_patcher import \
-    maybe_apply_qwen3_decoder_output_cast
 from tpu_inference.models.vllm.experimental.qwen3_vl_patcher import \
     maybe_apply_qwen3_vl_patches
 from tpu_inference.models.vllm.experimental.vision_tower_jit import (
@@ -245,11 +243,6 @@ class VllmModelWrapper:
         if self.vllm_config.speculative_config and self.vllm_config.speculative_config.method == "eagle3" and not self.is_draft_model:
             set_eagle3_aux_hidden_state_layers(
                 vllm_model, self.vllm_config.speculative_config)
-
-        pcp_size = getattr(self.vllm_config.parallel_config,
-                           "prefill_context_parallel_size", 1)
-        maybe_apply_qwen3_decoder_output_cast(vllm_model,
-                                              enabled=pcp_size > 1)
 
         self.model = _VllmRunner(vllm_model, self.vllm_config,
                                  self.is_draft_model)
