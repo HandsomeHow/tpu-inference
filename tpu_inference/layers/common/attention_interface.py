@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import inspect
 import math
 from typing import Any, Callable, Optional, Tuple
 
@@ -29,9 +30,12 @@ from jax.sharding import Sharding
 
 import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference import envs
+from tpu_inference.kernels.experimental.batched_rpa import \
+    wrapper as batched_rpa_wrapper
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
-from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.attention_metadata import (AttentionMetadata,
+                                                            PcpMode)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_megacore, get_mesh_shape_product
@@ -57,6 +61,15 @@ get_kv_cache_shape = rpa.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
+
+
+@functools.lru_cache(maxsize=None)
+def _ragged_paged_attention_accepts_pcp_metadata(
+        func: Callable[..., Any]) -> bool:
+    rpa_params = inspect.signature(func).parameters
+    return ("q_start_offsets" in rpa_params
+            or any(param.kind == inspect.Parameter.VAR_KEYWORD
+                   for param in rpa_params.values()))
 
 
 def sharded_flash_attention(
@@ -340,8 +353,30 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     update_kv_cache: bool = True,
+    pcp_mode: PcpMode = PcpMode.DISABLED,
+    use_pcp: bool = False,
+    use_pcp_decode: bool = False,
+    shard_pcp_axis: bool = True,
+    cp_kv_cache_interleave_size: int = 0,
+    pcp_kv_lens: jax.Array | None = None,
+    pcp_page_indices: jax.Array | None = None,
+    pcp_query_start_loc: jax.Array | None = None,
+    pcp_request_distribution: jax.Array | None = None,
+    pcp_q_start_offsets: jax.Array | None = None,
+    pcp_cu_k_lens: jax.Array | None = None,
+    pcp_slot_ids: jax.Array | None = None,
+    pcp_source_block_tables: jax.Array | None = None,
 ):
     """Shards along KV heads."""
+    if use_pcp_decode:
+        if pcp_mode not in (PcpMode.DISABLED, PcpMode.DECODE_SHARDED_KV):
+            raise ValueError("Conflicting PCP mode and use_pcp_decode=True.")
+        pcp_mode = PcpMode.DECODE_SHARDED_KV
+    elif use_pcp:
+        if pcp_mode not in (PcpMode.DISABLED, PcpMode.PREFILL_LOCAL_Q_FULL_KV):
+            raise ValueError("Conflicting PCP mode and use_pcp=True.")
+        pcp_mode = PcpMode.PREFILL_LOCAL_Q_FULL_KV
+
     # Handle GQA/MQA where num_kv_heads < tp_size
     # We replicate KV heads to match tp_size so that we can shard them evenly.
     # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
@@ -357,18 +392,70 @@ def sharded_ragged_paged_attention(
             k = jnp.repeat(k, factor, axis=1)
             v = jnp.repeat(v, factor, axis=1)
 
-    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
-    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
-                      ShardingAxisName.ATTN_HEAD, None, None)
+    if pcp_mode == PcpMode.DECODE_SHARDED_KV:
+        return sharded_pcp_decode_ragged_paged_attention(
+            mesh=mesh,
+            q=q,
+            k=k,
+            v=v,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            attention_sink=attention_sink,
+            sm_scale=sm_scale,
+            attention_chunk_size=attention_chunk_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=update_kv_cache,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            pcp_slot_ids=pcp_slot_ids,
+            pcp_source_block_tables=pcp_source_block_tables,
+        )
+
+    if pcp_mode == PcpMode.PREFILL_LOCAL_Q_FULL_KV:
+        return sharded_pcp_ragged_paged_attention(
+            mesh=mesh,
+            q=q,
+            k=k,
+            v=v,
+            kv_cache=kv_cache,
+            kv_lens=kv_lens,
+            page_indices=page_indices,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            attention_sink=attention_sink,
+            sm_scale=sm_scale,
+            attention_chunk_size=attention_chunk_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=update_kv_cache,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            pcp_kv_lens=pcp_kv_lens,
+            pcp_page_indices=pcp_page_indices,
+            pcp_query_start_loc=pcp_query_start_loc,
+            pcp_request_distribution=pcp_request_distribution,
+            pcp_q_start_offsets=pcp_q_start_offsets,
+            pcp_cu_k_lens=pcp_cu_k_lens,
+            pcp_slot_ids=pcp_slot_ids,
+        )
+
+    data_axis = (ShardingAxisName.ATTN_DATA
+                 if shard_pcp_axis else ShardingAxisName.BATCH)
+    qkv_spec = P(data_axis, ShardingAxisName.ATTN_HEAD, None)
+    kv_cache_spec = P(data_axis, None, ShardingAxisName.KV_CACHE_HEAD, None,
+                      None)
     in_specs = (
         qkv_spec,  # q
         qkv_spec,  # k
         qkv_spec,  # v
         kv_cache_spec,  # kv cache
-        P(ShardingAxisName.ATTN_DATA),  # kv_lens
-        P(ShardingAxisName.ATTN_DATA),  # page_indices
-        P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
-        P(ShardingAxisName.ATTN_DATA),  # distribution
+        P(data_axis),  # kv_lens
+        P(data_axis),  # page_indices
+        P(data_axis),  # cu_q_lens
+        P(data_axis),  # distribution
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
@@ -417,6 +504,565 @@ def sharded_ragged_paged_attention(
     )(*args)
 
 
+def _pcp_chunks_per_seq(max_num_tokens: int, pcp_size: int,
+                        interleave_size: int) -> int:
+    if interleave_size <= 0:
+        raise ValueError("PCP requires cp_kv_cache_interleave_size > 0.")
+    return max(1, math.ceil(max_num_tokens / (pcp_size * interleave_size)))
+
+
+def _make_pcp_interleaved_token_indices(
+    seq_lens: jax.Array,
+    local_num_tokens: int,
+    interleave_size: int,
+    *,
+    pcp_size: int,
+) -> jax.Array:
+    """Map contiguous sequence token order to rank-major interleaved order."""
+    max_num_seqs = seq_lens.shape[0]
+    max_total_tokens = local_num_tokens * pcp_size
+    chunks_per_seq = _pcp_chunks_per_seq(max_total_tokens, pcp_size,
+                                         interleave_size)
+    token_idx = jnp.arange(max_total_tokens, dtype=jnp.int32)
+
+    seq_starts = jnp.pad(jnp.cumsum(seq_lens), (1, 0))[:-1]
+    seq_ends = seq_starts + seq_lens
+    seq_mask = ((token_idx[:, None] >= seq_starts[None, :])
+                & (token_idx[:, None] < seq_ends[None, :]))
+    valid = jnp.any(seq_mask, axis=1)
+    seq_idx = jnp.argmax(seq_mask.astype(jnp.int32), axis=1)
+
+    token_offset = jnp.where(valid, token_idx - seq_starts[seq_idx], 0)
+    token_rank = (token_offset // interleave_size) % pcp_size
+    token_chunk = token_offset // (interleave_size * pcp_size)
+    token_chunk = jnp.minimum(token_chunk, chunks_per_seq - 1)
+    token_offset_in_chunk = token_offset % interleave_size
+
+    ranks = jnp.arange(pcp_size, dtype=jnp.int32)[:, None, None]
+    chunks = jnp.arange(chunks_per_seq, dtype=jnp.int32)[None, None, :]
+    chunk_starts = (chunks * pcp_size + ranks) * interleave_size
+    chunk_lens = jnp.clip(seq_lens[None, :, None] - chunk_starts, 0,
+                          interleave_size)
+    local_cu_lens_by_rank = jnp.pad(
+        jnp.cumsum(chunk_lens.reshape(pcp_size, -1), axis=1),
+        ((0, 0), (1, 0)),
+    )
+
+    chunk_seq_idx = seq_idx * chunks_per_seq + token_chunk
+    local_offset = (local_cu_lens_by_rank[token_rank, chunk_seq_idx] +
+                    token_offset_in_chunk)
+    src_idx = token_rank * local_num_tokens + local_offset
+    return jnp.where(valid, src_idx, 0)
+
+
+def _make_pcp_interleaved_metadata(
+    cu_q_lens: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    local_num_tokens: int,
+    interleave_size: int,
+    *,
+    pcp_size: int,
+    axis_name: str,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Build chunked local-Q/full-KV metadata for one PCP shard."""
+    pcp_rank = jax.lax.axis_index(axis_name)
+    max_num_seqs = kv_lens.shape[0]
+    chunks_per_seq = _pcp_chunks_per_seq(local_num_tokens * pcp_size, pcp_size,
+                                         interleave_size)
+
+    global_q_starts = cu_q_lens[:-1]
+    global_q_ends = cu_q_lens[1:]
+    global_q_lens = global_q_ends - global_q_starts
+
+    chunk_ids = jnp.arange(chunks_per_seq, dtype=jnp.int32)
+    chunk_offsets = (chunk_ids * pcp_size + pcp_rank) * interleave_size
+    local_q_lens = jnp.clip(global_q_lens[:, None] - chunk_offsets[None, :], 0,
+                            interleave_size)
+
+    # TODO(xiaohao.yxh): Treating every interleaved chunk as a pseudo sequence
+    # can create many tiny sequences when the interleave size is small. That
+    # hurts RPA schedule overhead and tile utilization; replace this with native
+    # multi-chunk-per-sequence support in the kernel scheduler.
+    flat_local_q_lens = local_q_lens.reshape(-1)
+    local_cu_q_lens = jnp.pad(jnp.cumsum(flat_local_q_lens), (1, 0))
+
+    q_start_offsets = ((kv_lens - global_q_lens)[:, None] +
+                       chunk_offsets[None, :])
+    q_start_offsets = jnp.where(local_q_lens > 0, q_start_offsets, 0)
+    q_start_offsets = q_start_offsets.reshape(-1)
+
+    expanded_kv_lens = jnp.where(local_q_lens > 0, kv_lens[:, None],
+                                 0).reshape(-1)
+    k_start_offsets = jnp.pad(jnp.cumsum(kv_lens), (1, 0))[:-1]
+    cu_k_lens = jnp.where(local_q_lens > 0, k_start_offsets[:, None],
+                          0).reshape(-1)
+    cu_k_lens = jnp.concatenate(
+        [cu_k_lens,
+         jnp.array([jnp.sum(kv_lens)], dtype=cu_k_lens.dtype)])
+
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    page_indices_by_seq = page_indices.reshape(max_num_seqs, pages_per_seq)
+    expanded_page_indices = jnp.broadcast_to(
+        page_indices_by_seq[:, None, :],
+        (max_num_seqs, chunks_per_seq, pages_per_seq),
+    ).reshape(-1)
+    expanded_distribution = jnp.array([0, 0, max_num_seqs * chunks_per_seq],
+                                      dtype=kv_lens.dtype)
+    return (expanded_kv_lens, expanded_page_indices, local_cu_q_lens,
+            expanded_distribution, q_start_offsets, cu_k_lens)
+
+
+def _update_local_paged_kv_cache(
+    kv_cache: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    slot_ids: jax.Array,
+) -> jax.Array:
+    """Write local K/V rows into the local paged KV cache shard."""
+    dummy_q = jnp.zeros_like(k)
+    _, packed_kv = batched_rpa_wrapper.prepare_inputs(dummy_q, k, v, k.dtype,
+                                                      kv_cache.dtype)
+    page_size = kv_cache.shape[1]
+    valid = slot_ids >= 0
+    page = jnp.where(valid, slot_ids // page_size, kv_cache.shape[0])
+    offset = jnp.where(valid, slot_ids % page_size, 0)
+    return kv_cache.at[page, offset].set(packed_kv, mode="drop")
+
+
+def _materialize_gathered_pcp_kv_for_decode(
+    gathered_kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    source_block_tables: jax.Array,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Repack gathered PCP KV cache into standard paged KV layout."""
+    if pcp_size <= 1:
+        raise ValueError("PCP decode materialize requires pcp_size > 1.")
+    if gathered_kv_cache.shape[0] != pcp_size:
+        raise ValueError(
+            "PCP decode materialize requires gathered PCP rank dimension "
+            f"to match pcp_size: got {gathered_kv_cache.shape[0]} vs "
+            f"{pcp_size}.")
+    if interleave_size <= 0:
+        raise ValueError(
+            "PCP decode materialize requires interleave_size > 0.")
+    if page_size % interleave_size != 0:
+        raise ValueError(
+            "PCP decode materialize requires page_size % interleave_size == 0."
+        )
+
+    max_num_reqs = kv_lens.shape[0]
+    virtual_blocks_per_req = source_block_tables.shape[1]
+    standard_pages_per_req = virtual_blocks_per_req * pcp_size
+    max_tokens_per_req = standard_pages_per_req * page_size
+    max_total_dst_pages = max_num_reqs * standard_pages_per_req
+
+    req_indices = jnp.arange(max_num_reqs, dtype=jnp.int32)[:, None]
+    positions = jnp.arange(max_tokens_per_req, dtype=jnp.int32)[None, :]
+    valid = positions < kv_lens[:, None]
+
+    virtual_block_size = page_size * pcp_size
+    virtual_blocks = positions // virtual_block_size
+    virtual_offsets = positions % virtual_block_size
+    src_ranks = (virtual_offsets // interleave_size) % pcp_size
+    src_offsets = (
+        (virtual_offsets // (pcp_size * interleave_size)) * interleave_size +
+        (virtual_offsets % interleave_size))
+    src_pages = source_block_tables[req_indices, virtual_blocks]
+    values = gathered_kv_cache[src_ranks, src_pages, src_offsets]
+
+    dst_page_indices = positions // page_size
+    dst_pages = req_indices * standard_pages_per_req + dst_page_indices
+    dst_offsets = positions % page_size
+    dst_pages = jnp.where(valid, dst_pages, max_total_dst_pages)
+
+    full_kv_cache = jnp.zeros(
+        (max_total_dst_pages, page_size, *gathered_kv_cache.shape[3:]),
+        dtype=gathered_kv_cache.dtype,
+    )
+    full_kv_cache = full_kv_cache.at[dst_pages, dst_offsets].set(values,
+                                                                 mode="drop")
+    full_page_indices_2d = (
+        jnp.arange(max_num_reqs, dtype=jnp.int32)[:, None] *
+        standard_pages_per_req +
+        jnp.arange(standard_pages_per_req, dtype=jnp.int32)[None, :])
+    return full_kv_cache, kv_lens, full_page_indices_2d.reshape(-1)
+
+
+def materialize_pcp_kv_for_decode(
+    pcp_kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    source_block_tables: jax.Array,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    pcp_axis_name: str,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Materialize PCP-sharded KV cache into standard PCP=1 decode layout."""
+    gathered_kv_cache = jax.lax.all_gather(
+        pcp_kv_cache,
+        axis_name=pcp_axis_name,
+        axis=0,
+        tiled=False,
+    )
+    return _materialize_gathered_pcp_kv_for_decode(
+        gathered_kv_cache,
+        kv_lens,
+        source_block_tables,
+        page_size,
+        pcp_size,
+        interleave_size,
+    )
+
+
+def _pcp_lse_merge_weight(partial_lse: jax.Array,
+                          all_lses: jax.Array) -> jax.Array:
+    max_lse = jnp.max(all_lses, axis=0)
+    valid = max_lse != -jnp.inf
+    safe_local_diff = jnp.where(valid, partial_lse - max_lse, 0.0)
+    local_exp = jnp.exp(safe_local_diff)
+
+    safe_all_diffs = jnp.where(valid[None], all_lses - max_lse[None], 0.0)
+    denom = jnp.sum(jnp.exp(safe_all_diffs), axis=0)
+    weight = local_exp / jnp.maximum(denom, 1e-30)
+    return jnp.where(valid, weight, 0.0)
+
+
+def pcp_lse_merge(
+    partial_out: jax.Array,
+    partial_lse: jax.Array,
+    pcp_axis_name: str,
+) -> jax.Array:
+    """Merge PCP partial attention outputs using log-sum-exp weights.
+
+    This runs inside a shard_map over the PCP axis. Each rank supplies the
+    attention result for its local KV shard. Rows where all ranks are empty
+    produce zero output instead of NaNs.
+    """
+    all_lses = jax.lax.all_gather(partial_lse,
+                                  axis_name=pcp_axis_name,
+                                  axis=0,
+                                  tiled=False)
+    weight = _pcp_lse_merge_weight(partial_lse, all_lses)
+    weighted_out = partial_out.astype(jnp.float32) * weight[..., None]
+    merged = jax.lax.psum(weighted_out, axis_name=pcp_axis_name)
+    return merged.astype(partial_out.dtype)
+
+
+def compute_pcp_local_mapping(
+    positions: jax.Array,
+    token_req_indices: jax.Array,
+    block_tables: jax.Array,
+    block_size: int,
+    cp_size: int,
+    cp_rank: int,
+    interleave_size: int = 1,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute vLLM-compatible local CP slot mapping for one PCP rank."""
+    if block_size <= 0:
+        raise ValueError(f"Expected positive block_size, got {block_size}.")
+    if cp_size <= 0:
+        raise ValueError(f"Expected positive cp_size, got {cp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"Expected cp_rank in [0, {cp_size}), got {cp_rank}.")
+    if interleave_size <= 0:
+        raise ValueError(
+            f"Expected positive interleave_size, got {interleave_size}.")
+
+    positions = positions.astype(jnp.int32)
+    token_req_indices = token_req_indices.astype(jnp.int32)
+    virtual_block_size = block_size * cp_size
+    block_indices = positions // virtual_block_size
+    block_numbers = block_tables[token_req_indices,
+                                 block_indices].astype(jnp.int32)
+
+    virtual_offsets = positions - block_indices * virtual_block_size
+    is_local = ((virtual_offsets // interleave_size) % cp_size) == cp_rank
+    local_offsets = ((virtual_offsets //
+                      (cp_size * interleave_size)) * interleave_size +
+                     (virtual_offsets % interleave_size))
+    slot_ids = block_numbers * block_size + local_offsets
+    slot_ids = jnp.where(is_local, slot_ids, -1)
+    return is_local, slot_ids.astype(jnp.int32)
+
+
+def sharded_pcp_ragged_paged_attention(
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    attention_sink: jax.Array | None,
+    sm_scale: float,
+    attention_chunk_size: int | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    update_kv_cache: bool = True,
+    cp_kv_cache_interleave_size: int = 0,
+    pcp_kv_lens: jax.Array | None = None,
+    pcp_page_indices: jax.Array | None = None,
+    pcp_query_start_loc: jax.Array | None = None,
+    pcp_request_distribution: jax.Array | None = None,
+    pcp_q_start_offsets: jax.Array | None = None,
+    pcp_cu_k_lens: jax.Array | None = None,
+    pcp_slot_ids: jax.Array | None = None,
+):
+    """Runs local-query/full-KV RPA over the prefill context axis."""
+    if attention_sink is not None:
+        raise NotImplementedError("PCP RPA does not support attention sinks.")
+    if q.shape[-1] == 64:
+        raise NotImplementedError("PCP RPA does not support head_dim==64.")
+    if cp_kv_cache_interleave_size <= 0:
+        raise ValueError("PCP RPA requires cp_kv_cache_interleave_size > 0.")
+    pcp_axis = ShardingAxisName.PREFILL_CONTEXT
+    if pcp_axis is None:
+        raise NotImplementedError("PCP requires a named prefill context axis.")
+    pcp_size = mesh.shape[pcp_axis]
+    if get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT) > 1:
+        raise NotImplementedError("PCP RPA does not support DCP yet.")
+
+    if not _ragged_paged_attention_accepts_pcp_metadata(
+            ragged_paged_attention):
+        raise NotImplementedError(
+            "PCP RPA requires the batched RPA wrapper with local-Q/full-KV "
+            "metadata support.")
+
+    precomputed_pcp_metadata = (
+        pcp_kv_lens,
+        pcp_page_indices,
+        pcp_query_start_loc,
+        pcp_request_distribution,
+        pcp_q_start_offsets,
+        pcp_cu_k_lens,
+        pcp_slot_ids,
+    )
+    has_precomputed_pcp_metadata = any(x is not None
+                                       for x in precomputed_pcp_metadata)
+    if has_precomputed_pcp_metadata and not all(
+            x is not None for x in precomputed_pcp_metadata):
+        raise ValueError(
+            "PCP RPA requires all precomputed PCP metadata fields when any "
+            "one of them is provided.")
+
+    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.KV_CACHE_HEAD,
+                 None)
+    kv_cache_spec = P(ShardingAxisName.KV_CACHE_BLOCK, None,
+                      ShardingAxisName.KV_CACHE_HEAD, None, None)
+    metadata_spec = P(ShardingAxisName.BATCH)
+    pcp_metadata_spec = P(ShardingAxisName.ATTN_DATA)
+    in_specs = (
+        qkv_spec,
+        qkv_spec,
+        qkv_spec,
+        kv_cache_spec,
+        metadata_spec,
+        metadata_spec,
+        metadata_spec,
+        metadata_spec,
+    )
+    out_specs = (qkv_spec, kv_cache_spec)
+    args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+    if has_precomputed_pcp_metadata:
+        in_specs += (
+            pcp_metadata_spec,  # pcp_kv_lens
+            pcp_metadata_spec,  # pcp_page_indices
+            pcp_metadata_spec,  # pcp_query_start_loc
+            pcp_metadata_spec,  # pcp_request_distribution
+            pcp_metadata_spec,  # pcp_q_start_offsets
+            pcp_metadata_spec,  # pcp_cu_k_lens
+            pcp_metadata_spec,  # pcp_slot_ids
+        )
+        args += precomputed_pcp_metadata
+
+    def _pcp_ragged_paged_attention(q_local, k_local, v_local, kv_cache,
+                                    kv_lens, page_indices, cu_q_lens,
+                                    distribution, *pcp_metadata_args):
+        kv_indices = _make_pcp_interleaved_token_indices(
+            kv_lens,
+            k_local.shape[0],
+            cp_kv_cache_interleave_size,
+            pcp_size=pcp_size,
+        )
+        if pcp_metadata_args:
+            (expanded_kv_lens, expanded_page_indices, local_cu_q_lens,
+             expanded_distribution, q_start_offsets, cu_k_lens,
+             slot_ids) = pcp_metadata_args
+        else:
+            if update_kv_cache:
+                raise ValueError(
+                    "PCP local KV cache updates require precomputed "
+                    "pcp_slot_ids from the runner.")
+            (expanded_kv_lens, expanded_page_indices, local_cu_q_lens,
+             expanded_distribution, q_start_offsets,
+             cu_k_lens) = _make_pcp_interleaved_metadata(
+                 cu_q_lens,
+                 kv_lens,
+                 page_indices,
+                 local_num_tokens=q_local.shape[0],
+                 interleave_size=cp_kv_cache_interleave_size,
+                 pcp_size=pcp_size,
+                 axis_name=pcp_axis,
+             )
+            slot_ids = None
+        if update_kv_cache:
+            kv_cache = _update_local_paged_kv_cache(kv_cache, k_local, v_local,
+                                                    slot_ids)
+        full_k = jax.lax.all_gather(k_local,
+                                    axis_name=pcp_axis,
+                                    axis=0,
+                                    tiled=True)
+        full_v = jax.lax.all_gather(v_local,
+                                    axis_name=pcp_axis,
+                                    axis=0,
+                                    tiled=True)
+        full_k = full_k[kv_indices]
+        full_v = full_v[kv_indices]
+        return ragged_paged_attention(
+            q_local,
+            full_k,
+            full_v,
+            kv_cache,
+            expanded_kv_lens,
+            expanded_page_indices,
+            local_cu_q_lens,
+            expanded_distribution,
+            sm_scale=sm_scale,
+            sliding_window=attention_chunk_size,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=False,
+            q_start_offsets=q_start_offsets,
+            cu_k_lens=cu_k_lens,
+        )
+
+    return jax.shard_map(
+        _pcp_ragged_paged_attention,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(*args)
+
+
+def sharded_pcp_decode_ragged_paged_attention(
+    mesh: Mesh,
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    attention_sink: jax.Array | None,
+    sm_scale: float,
+    attention_chunk_size: int | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    update_kv_cache: bool = True,
+    cp_kv_cache_interleave_size: int = 0,
+    pcp_slot_ids: jax.Array | None = None,
+    pcp_source_block_tables: jax.Array | None = None,
+):
+    """Runs replicated-query/local-KV decode over the prefill context axis."""
+    if attention_sink is not None:
+        raise NotImplementedError("PCP decode RPA does not support sinks.")
+    if attention_chunk_size is not None:
+        raise NotImplementedError(
+            "PCP decode materialize path supports full attention only.")
+    if q.shape[-1] == 64:
+        raise NotImplementedError(
+            "PCP decode RPA does not support head_dim==64.")
+    if cp_kv_cache_interleave_size <= 0:
+        raise ValueError(
+            "PCP decode RPA requires cp_kv_cache_interleave_size > 0.")
+    pcp_axis = ShardingAxisName.PREFILL_CONTEXT
+    if pcp_axis is None:
+        raise NotImplementedError("PCP decode requires a named PCP axis.")
+    if get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT) > 1:
+        raise NotImplementedError("PCP decode RPA does not support DCP yet.")
+    pcp_size = get_mesh_shape_product(mesh, pcp_axis)
+    if pcp_slot_ids is None or pcp_source_block_tables is None:
+        raise ValueError(
+            "PCP decode materialize path requires pcp_slot_ids and "
+            "pcp_source_block_tables from the runner.")
+
+    qkv_spec = P(ShardingAxisName.BATCH, ShardingAxisName.KV_CACHE_HEAD, None)
+    kv_cache_spec = P(ShardingAxisName.KV_CACHE_BLOCK, None,
+                      ShardingAxisName.KV_CACHE_HEAD, None, None)
+    metadata_spec = P(ShardingAxisName.BATCH)
+    source_block_tables_spec = P(ShardingAxisName.BATCH, None)
+    pcp_metadata_spec = P(ShardingAxisName.ATTN_DATA)
+    in_specs = (
+        qkv_spec,
+        qkv_spec,
+        qkv_spec,
+        kv_cache_spec,
+        metadata_spec,
+        metadata_spec,
+        metadata_spec,
+        source_block_tables_spec,
+        pcp_metadata_spec,
+    )
+    out_specs = (qkv_spec, kv_cache_spec)
+    args = (q, k, v, kv_cache, cu_q_lens, distribution, kv_lens,
+            pcp_source_block_tables, pcp_slot_ids)
+
+    def _pcp_decode_ragged_paged_attention(q_replicated, k_replicated,
+                                           v_replicated, kv_cache, cu_q_lens,
+                                           distribution, global_kv_lens,
+                                           source_block_tables,
+                                           local_slot_ids):
+        if update_kv_cache:
+            kv_cache = _update_local_paged_kv_cache(kv_cache, k_replicated,
+                                                    v_replicated,
+                                                    local_slot_ids)
+        full_kv_cache, full_kv_lens, full_page_indices = (
+            materialize_pcp_kv_for_decode(
+                kv_cache,
+                global_kv_lens,
+                source_block_tables,
+                kv_cache.shape[1],
+                pcp_size,
+                cp_kv_cache_interleave_size,
+                pcp_axis,
+            ))
+        output, _ = ragged_paged_attention(
+            q_replicated,
+            k_replicated,
+            v_replicated,
+            full_kv_cache,
+            full_kv_lens,
+            full_page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            sliding_window=None,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            update_kv_cache=False,
+        )
+        return output, kv_cache
+
+    return jax.shard_map(
+        _pcp_decode_ragged_paged_attention,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(*args)
+
+
 def attention(
     kv_cache: jax.Array,
     q: jax.Array,
@@ -432,6 +1078,11 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
+    pcp_mode: PcpMode = PcpMode.DISABLED,
+    use_pcp: bool = False,
+    use_pcp_decode: bool = False,
+    shard_pcp_axis: bool = True,
+    cp_kv_cache_interleave_size: int = 0,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -471,6 +1122,19 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
+        pcp_mode=pcp_mode,
+        use_pcp=use_pcp,
+        use_pcp_decode=use_pcp_decode,
+        shard_pcp_axis=shard_pcp_axis,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        pcp_kv_lens=md.pcp_kv_lens,
+        pcp_page_indices=md.pcp_page_indices,
+        pcp_query_start_loc=md.pcp_query_start_loc,
+        pcp_request_distribution=md.pcp_request_distribution,
+        pcp_q_start_offsets=md.pcp_q_start_offsets,
+        pcp_cu_k_lens=md.pcp_cu_k_lens,
+        pcp_slot_ids=md.pcp_slot_ids,
+        pcp_source_block_tables=md.pcp_source_block_tables,
     )
 
     return kv_cache, output

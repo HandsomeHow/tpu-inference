@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 MESH_AXIS_NAMES = ("data", "attn_dp", "attn_dp_expert", "expert", "model",
-                   "dcp")
+                   "dcp", "pcp")
 MESH_AXIS_NAMES_2D = ('data', 'model')
 
 
@@ -41,10 +41,11 @@ class ShardingAxisNameBase:
         'data',
         'attn_dp',
         'attn_dp_expert',
+        'pcp',
     )
-    ATTN_DATA = ('data', 'attn_dp', 'attn_dp_expert')
+    ATTN_DATA = ('data', 'attn_dp', 'attn_dp_expert', 'pcp')
     ATTN_DATA_EXPERT = ('attn_dp_expert', 'expert')
-    MLP_DATA = 'data'
+    MLP_DATA = ('data', 'pcp')
     ATTN_HEAD = ('model', 'expert', 'dcp')
     ATTN_TENSOR = None
     MLP_TENSOR = ('attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp')
@@ -61,6 +62,8 @@ class ShardingAxisNameBase:
 
     # These axes are used in KV caches management.
     BATCH = ('data', 'attn_dp', 'attn_dp_expert')
+    KV_CACHE_BLOCK = ('data', 'attn_dp', 'attn_dp_expert', 'pcp')
+    PREFILL_CONTEXT = 'pcp'
     CONTEXT = 'dcp'
     KV_CACHE_HEAD = ('model', 'expert')
 
@@ -82,6 +85,8 @@ class ShardingAxisName2D:
     EXPERT_DATA = ('data', 'model')
     VOCAB = ('data', 'model')
     BATCH = 'data'
+    KV_CACHE_BLOCK = 'data'
+    PREFILL_CONTEXT = None
     CONTEXT = None
     KV_CACHE_HEAD = 'model'
     MODEL = 'model'
@@ -138,6 +143,7 @@ class ShardingStrategy:
     attention_data_parallelism: int = 1
     attention_data_expert_parallelism: int = 1
     decode_context_parallelism: int = 1
+    prefill_context_parallelism: int = 1
 
 
 class ShardingConfigManager:
@@ -206,7 +212,15 @@ class ShardingConfigManager:
         sequence_parallelism = sharding_strategy.get("sequence_parallelism", 1)
         device_indexes = sharding_strategy.get("device_indexes", None)
 
-        decode_context_parallelism = parallel_config.decode_context_parallel_size
+        decode_context_parallelism = getattr(parallel_config,
+                                             "decode_context_parallel_size", 1)
+        if not isinstance(decode_context_parallelism, int):
+            decode_context_parallelism = 1
+        prefill_context_parallelism = getattr(parallel_config,
+                                              "prefill_context_parallel_size",
+                                              1)
+        if not isinstance(prefill_context_parallelism, int):
+            prefill_context_parallelism = 1
 
         if pc_tensor_parallelism != ss_tensor_parallelsim and ss_tensor_parallelsim:
             # The user has explicitly set the tensor parallelism in the sharding config.
@@ -275,7 +289,8 @@ class ShardingConfigManager:
             sequence_parallelism=sequence_parallelism,
             attention_data_parallelism=attn_dp,
             attention_data_expert_parallelism=attn_dp_expert,
-            decode_context_parallelism=decode_context_parallelism)
+            decode_context_parallelism=decode_context_parallelism,
+            prefill_context_parallelism=prefill_context_parallelism)
 
         # Must override here to avoid vLLM spinning up multiple DP engines.
         if (not multiprocess_dp
@@ -311,10 +326,26 @@ class ShardingConfigManager:
                 raise ValueError(
                     "Must run Context Parallelism with NEW_MODEL_DESIGN enabled. Please set "
                     "NEW_MODEL_DESIGN=True")
+        if sharding_strategy.prefill_context_parallelism > 1:
+            if not envs.NEW_MODEL_DESIGN:
+                raise ValueError(
+                    "Must run Prefill Context Parallelism with NEW_MODEL_DESIGN enabled. Please set "
+                    "NEW_MODEL_DESIGN=True")
 
     @property
     def total_dp_size(self) -> int:
         return self.sharding_strategy.data_parallelism * self.sharding_strategy.attention_data_parallelism * self.sharding_strategy.attention_data_expert_parallelism
+
+    @property
+    def kv_cache_num_blocks_are_per_dp_rank(self) -> bool:
+        """Whether vLLM KV cache num_blocks is already per DP rank.
+
+        TPU reports KV cache page size with all KV_CACHE_BLOCK axes folded into
+        the padded page size. For same-worker SPMD DP, that includes the data
+        axis, so vLLM's computed num_blocks is already the per-rank local page
+        count and must not be divided again by DPScheduler.
+        """
+        return True
 
     @property
     def model_dp_size(self) -> int:
@@ -343,6 +374,10 @@ class ShardingConfigManager:
     @property
     def decode_cp_size(self) -> int:
         return self.sharding_strategy.decode_context_parallelism
+
+    @property
+    def prefill_cp_size(self) -> int:
+        return self.sharding_strategy.prefill_context_parallelism
 
     @property
     def total_devices(self) -> int:

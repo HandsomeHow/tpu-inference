@@ -17,7 +17,8 @@ from vllm.v1.attention.backends.registry import (AttentionBackendEnum,
 
 from tpu_inference import utils
 from tpu_inference.layers.common.attention_interface import attention
-from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.attention_metadata import (AttentionMetadata,
+                                                            PcpMode)
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
@@ -100,6 +101,8 @@ class PallasAttentionBackend(AttentionBackend):
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
+    supports_pcp = True
+    supports_mtp_with_cp_non_trivial_interleave_size = False
 
     def __init__(
         self,
@@ -179,6 +182,25 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kv_cache = vllm_model_wrapper_context.kv_caches[kv_cache_index]
 
         mesh = vllm_model_wrapper_context.mesh
+        vllm_config = vllm_model_wrapper_context.vllm_config
+        pcp_configured = (vllm_config is not None
+                          and getattr(vllm_config.parallel_config,
+                                      "prefill_context_parallel_size", 1) > 1)
+        pcp_mode = PcpMode.DISABLED
+        if pcp_configured:
+            if attn_metadata.pcp_query_start_loc is not None:
+                pcp_mode = PcpMode.PREFILL_LOCAL_Q_FULL_KV
+            elif attn_metadata.pcp_slot_ids is not None:
+                pcp_mode = PcpMode.DECODE_SHARDED_KV
+        use_pcp = pcp_mode != PcpMode.DISABLED
+        shard_pcp_axis = not (pcp_configured and not use_pcp)
+        cp_kv_cache_interleave_size = 0
+        if use_pcp:
+            cp_kv_cache_interleave_size = getattr(
+                vllm_config.parallel_config, "cp_kv_cache_interleave_size", 0)
+            if cp_kv_cache_interleave_size <= 0:
+                raise ValueError(
+                    "PCP requires cp_kv_cache_interleave_size > 0.")
 
         query, key, value = jax_view(query), jax_view(key), jax_view(value)
         q_scale = k_scale = v_scale = None
@@ -209,6 +231,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             k_scale,
             v_scale,
             self.sliding_window,
+            pcp_mode,
+            shard_pcp_axis,
+            cp_kv_cache_interleave_size,
         )
         vllm_model_wrapper_context.kv_caches[kv_cache_index] = new_kv_cache
 
@@ -229,6 +254,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
         "k_scale",
         "v_scale",
         "sliding_window",
+        "pcp_mode",
+        "shard_pcp_axis",
+        "cp_kv_cache_interleave_size",
     ),
     donate_argnames=("kv_cache"),
 )
@@ -248,6 +276,9 @@ def _jax_attn_func(
     k_scale: float | None = None,
     v_scale: float | None = None,
     sliding_window: int | None = None,
+    pcp_mode: PcpMode = PcpMode.DISABLED,
+    shard_pcp_axis: bool = True,
+    cp_kv_cache_interleave_size: int = 0,
 ) -> Tuple[jax.Array, jax.Array]:
     # Get shapes from vllm
     q_len = q.shape[0]
@@ -271,6 +302,9 @@ def _jax_attn_func(
         v_scale=v_scale,
         sinks=sinks,
         attention_chunk_size=sliding_window,
+        pcp_mode=pcp_mode,
+        shard_pcp_axis=shard_pcp_axis,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
     )
 
     # Convert the shape back to vLLM's convention

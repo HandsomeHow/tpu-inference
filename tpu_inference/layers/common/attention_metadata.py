@@ -12,11 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import functools
 from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+
+
+class PcpMode(enum.Enum):
+    """Static PCP attention execution mode."""
+
+    DISABLED = 0
+    PREFILL_LOCAL_Q_FULL_KV = 1
+    DECODE_SHARDED_KV = 2
 
 
 @functools.partial(
@@ -28,6 +37,15 @@ import jax
         "query_start_loc",
         "request_distribution",
         "mamba_state_indices",
+        "pcp_kv_lens",
+        "pcp_page_indices",
+        "pcp_query_start_loc",
+        "pcp_request_distribution",
+        "pcp_q_start_offsets",
+        "pcp_cu_k_lens",
+        "pcp_slot_ids",
+        "pcp_source_block_tables",
+        "pcp_gdn_reorder_indices",
     ],
     meta_fields=["padded_num_reqs"],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
@@ -53,6 +71,23 @@ class AttentionMetadata(object):
     # None for models without mamba layers; pure-mamba models would also
     # use this field, only hybrid models exercise it today.
     mamba_state_indices: jax.Array | None = None
+    # Optional PCP-local metadata. When present, the runner has already applied
+    # the PCP sequence split policy and attention kernels consume only the
+    # resulting local-Q/global-position metadata.
+    pcp_kv_lens: jax.Array | None = None
+    pcp_page_indices: jax.Array | None = None
+    pcp_query_start_loc: jax.Array | None = None
+    pcp_request_distribution: jax.Array | None = None
+    pcp_q_start_offsets: jax.Array | None = None
+    pcp_cu_k_lens: jax.Array | None = None
+    pcp_slot_ids: jax.Array | None = None
+    pcp_source_block_tables: jax.Array | None = None
+    # (padded_total_num_scheduled_tokens,) int32 — maps packed rank-major
+    # token position → original sequential position. Used by GDN layers
+    # under PCP prefill to AllGather + reorder tokens to sequential order
+    # before running the recurrent scan.  -1 marks padding slots.
+    # None when PCP is disabled or model has no mamba/GDN layers.
+    pcp_gdn_reorder_indices: jax.Array | None = None
 
     # The actual number of requests padded to the compiled buckets. The bucket
     # contains only max_reqs by default to reduce model precompilation time.

@@ -29,6 +29,7 @@ class TestShardingConfigManager(unittest.TestCase):
         vllm_config.parallel_config.tensor_parallel_size = 8
         vllm_config.parallel_config.data_parallel_size = 2
         vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.model_config.use_mla = True
         vllm_config.model_config.get_total_num_kv_heads.return_value = 1
         vllm_config.speculative_config = None
@@ -43,6 +44,27 @@ class TestShardingConfigManager(unittest.TestCase):
         self.assertEqual(manager.attn_dp_size, 1)
         self.assertEqual(manager.attn_dp_expert_size, 1)
         self.assertEqual(manager.total_dp_size, 2)
+        self.assertEqual(manager.prefill_cp_size, 1)
+
+    @patch("tpu_inference.layers.common.sharding.envs.NEW_MODEL_DESIGN", True)
+    def test_sharding_config_manager_with_prefill_context_parallelism(self):
+        vllm_config = MagicMock()
+        vllm_config.parallel_config.tensor_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.prefill_context_parallel_size = 8
+        vllm_config.model_config.use_mla = True
+        vllm_config.model_config.get_total_num_kv_heads.return_value = 1
+        vllm_config.speculative_config = None
+        vllm_config.lora_config = None
+        vllm_config.additional_config = {"sharding": {}}
+
+        manager = ShardingConfigManager.from_vllm_config(vllm_config)
+
+        self.assertEqual(manager.tp_size, 1)
+        self.assertEqual(manager.prefill_cp_size, 8)
+        self.assertEqual(manager.total_devices, 8)
+        self.assertEqual(manager.total_dp_size, 1)
 
     @patch("tpu_inference.layers.common.sharding.envs.NEW_MODEL_DESIGN", True)
     def test_sharding_config_manager_with_dp_attention(self):
@@ -310,6 +332,18 @@ class TestShardingConfigManager(unittest.TestCase):
 
 
 class TestLazyShardingAxisName(unittest.TestCase):
+
+    def test_base_has_distinct_prefill_and_decode_context_axes(self):
+        self.assertEqual(ShardingAxisNameBase.PREFILL_CONTEXT, "pcp")
+        self.assertEqual(ShardingAxisNameBase.CONTEXT, "dcp")
+        self.assertNotEqual(ShardingAxisNameBase.PREFILL_CONTEXT,
+                            ShardingAxisNameBase.CONTEXT)
+        self.assertIn("pcp", ShardingAxisNameBase.ATTN_DATA)
+        self.assertNotIn("pcp", ShardingAxisNameBase.BATCH)
+
+    def test_2d_sharding_has_no_context_axes(self):
+        self.assertIsNone(ShardingAxisName2D.PREFILL_CONTEXT)
+        self.assertIsNone(ShardingAxisName2D.CONTEXT)
 
     def test_initial_state_is_uninitialized(self):
         lazy = LazyShardingAxisName()

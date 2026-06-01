@@ -297,6 +297,92 @@ class BatchingORef(pltpu.BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class BatchingLSERef(pltpu.BufferedRef):
+    """Stores per-query/head log-sum-exp values using Q block metadata."""
+
+    cfgs: configs.RpaConfigs = dataclasses.field(default=None,
+                                                 metadata=dict(static=True))
+
+    @classmethod
+    def create(
+        cls,
+        spec: pl.BlockSpec,
+        dtype_or_type: jax.Array,
+        buffer_type,  # pltpu.BufferType,
+        buffer_count: int,
+        use_lookahead: bool,
+        cfgs: configs.RpaConfigs,
+    ):
+        standard_ref = pltpu.BufferedRef.create(
+            spec=spec,
+            dtype_or_type=dtype_or_type,
+            buffer_type=buffer_type,
+            buffer_count=buffer_count,
+            grid_rank=1,
+            use_lookahead=use_lookahead,
+        )
+        return cls(
+            cfgs=cfgs,
+            **{
+                f.name: getattr(standard_ref, f.name)
+                for f in dataclasses.fields(pltpu.BufferedRef)
+            },
+        )
+
+    def copy_out(
+        self,
+        dst_ref: tuple[jax.Ref, ...],
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        # dst_ref: (lse_hbm, schedule_ref)
+        lse_hbm, schedule_ref = dst_ref
+        slot = self.current_copy_out_slot
+        sem = self.sem_sends.at[slot]
+        vmem_src = self.window_ref.at[slot]
+        block_idx = grid_indices[0]
+
+        dma_list = []
+        for b in range(self.cfgs.batch_size):
+            is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
+            q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
+            q_sz = jnp.where(is_last_k, q_sz, 0)
+            dma_list.append((q_src, q_sz, b))
+
+        for i in range(len(dma_list)):
+            q_src, q_sz, b = dma_list[i]
+            pltpu.make_async_copy(
+                vmem_src.at[b, :, pl.ds(0, q_sz)],
+                lse_hbm.at[:, pl.ds(q_src, q_sz)],
+                sem,
+            ).start()
+
+    def wait_out(
+        self,
+        dst_ref: tuple[jax.Ref, ...],
+        grid_indices: tuple[int | jax.Array, ...],
+    ):
+        lse_hbm, schedule_ref = dst_ref
+        slot = self.current_wait_out_slot
+        sem = self.sem_sends.at[slot]
+        block_idx = grid_indices[0]
+
+        total_sz = 0
+        for b in range(self.cfgs.batch_size):
+            is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
+            _, q_sz = schedule_ref.get_dma_q(block_idx, b)
+            q_sz = jnp.where(is_last_k, q_sz, 0)
+            total_sz += q_sz
+
+        flat_ref = lse_hbm.reshape((-1, *lse_hbm.shape[2:]))
+        pltpu.make_async_copy(
+            flat_ref.at[pl.ds(0, total_sz * lse_hbm.shape[0])],
+            flat_ref.at[pl.ds(0, total_sz * lse_hbm.shape[0])],
+            sem,
+        ).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class BatchingQRef(pltpu.BufferedRef):
     """Handles fetching Q blocks using precomputed metadata."""
 
