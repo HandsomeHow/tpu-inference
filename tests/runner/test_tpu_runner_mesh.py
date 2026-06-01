@@ -36,6 +36,7 @@ class TestTPUModelRunnerMeshInit:
         config.sharding_config.device_indexes = None
         config.sharding_config.total_dp_size = 4
         config.sharding_config.decode_cp_size = 1
+        config.sharding_config.prefill_cp_size = 1
         return config
 
     @pytest.fixture
@@ -134,17 +135,43 @@ class TestTPUModelRunnerMeshInit:
             mock_mesh_utils.create_device_mesh.assert_called_once()
             call_args = mock_mesh_utils.create_device_mesh.call_args
 
-            # Verify mesh_shape: (model_dp_size, attn_dp_size, attn_dp_expert_size, expert_size, tp_size, dcp_size)
-            assert call_args[0][0] == (4, 2, 1, 1, 8, 1)
+            # Verify mesh_shape: (model_dp_size, attn_dp_size, attn_dp_expert_size, expert_size, tp_size, dcp_size, pcp_size)
+            assert call_args[0][0] == (4, 2, 1, 1, 8, 1, 1)
             assert call_args[0][1] == runner_instance.devices
             assert call_args[1]['allow_split_physical_axes'] is True
 
             # Verify Mesh was created with correct axis names
             mock_jax_mesh.assert_called_once_with(
                 mock_devices_array, ("data", "attn_dp", "attn_dp_expert",
-                                     "expert", "model", "dcp"))
+                                     "expert", "model", "dcp", "pcp"))
 
             assert runner_instance.mesh == mock_mesh
+
+    def test_init_mesh_new_model_single_slice_with_pcp(self, runner_instance,
+                                                       mock_vllm_config):
+        """Test new model mesh creation with independent PCP axis."""
+        mock_vllm_config.sharding_config.model_dp_size = 1
+        mock_vllm_config.sharding_config.attn_dp_size = 1
+        mock_vllm_config.sharding_config.tp_size = 1
+        mock_vllm_config.sharding_config.prefill_cp_size = 8
+
+        with patch.dict(os.environ, {'NEW_MODEL_DESIGN': '1', 'NUM_SLICES': '1'}), \
+             patch('tpu_inference.runner.tpu_runner.mesh_utils') as mock_mesh_utils, \
+             patch('jax.sharding.Mesh') as mock_jax_mesh, \
+             patch('tpu_inference.runner.tpu_runner.logger'):
+
+            mock_devices_array = Mock()
+            mock_mesh_utils.create_device_mesh.return_value = mock_devices_array
+            mock_mesh = Mock()
+            mock_jax_mesh.return_value = mock_mesh
+
+            runner_instance._init_mesh()
+
+            call_args = mock_mesh_utils.create_device_mesh.call_args
+            assert call_args[0][0] == (1, 1, 1, 1, 1, 1, 8)
+            mock_jax_mesh.assert_called_once_with(
+                mock_devices_array, ("data", "attn_dp", "attn_dp_expert",
+                                     "expert", "model", "dcp", "pcp"))
 
     def test_init_mesh_new_model_multi_slice(self, runner_instance,
                                              mock_vllm_config):
@@ -166,18 +193,18 @@ class TestTPUModelRunnerMeshInit:
             mock_mesh_utils.create_hybrid_device_mesh.assert_called_once()
             call_args = mock_mesh_utils.create_hybrid_device_mesh.call_args
 
-            # Verify intra_node_shape: (dp_inner, attn_dp_size, attn_dp_expert_size, expert_size, tp_size, dcp_size)
+            # Verify intra_node_shape: (dp_inner, attn_dp_size, attn_dp_expert_size, expert_size, tp_size, dcp_size, pcp_size)
             # dp_inner = model_dp_size // num_slices = 4 // 2 = 2
-            assert call_args[1]['mesh_shape'] == (2, 2, 1, 1, 8, 1)
-            # Verify outer_node_shape: (num_slices, 1, 1, 1, 1)
-            assert call_args[1]['dcn_mesh_shape'] == (2, 1, 1, 1, 1, 1)
+            assert call_args[1]['mesh_shape'] == (2, 2, 1, 1, 8, 1, 1)
+            # Verify outer_node_shape: (num_slices, 1, 1, 1, 1, 1, 1)
+            assert call_args[1]['dcn_mesh_shape'] == (2, 1, 1, 1, 1, 1, 1)
             assert call_args[1]['devices'] == runner_instance.devices
             assert call_args[1]['allow_split_physical_axes'] is True
 
             # Verify Mesh was created with correct axis names
             mock_jax_mesh.assert_called_once_with(
                 mock_devices_array, ("data", "attn_dp", "attn_dp_expert",
-                                     "expert", "model", "dcp"))
+                                     "expert", "model", "dcp", "pcp"))
 
             assert runner_instance.mesh == mock_mesh
 

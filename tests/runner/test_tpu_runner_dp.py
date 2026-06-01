@@ -21,7 +21,10 @@ import pytest
 from jax.sharding import Mesh
 
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.runner.tpu_runner import TPUModelRunner
+from tpu_inference.runner.tpu_runner import (
+    TPUModelRunner,
+    _build_pcp_rank_major_token_order,
+)
 
 
 class TestTPUJaxRunnerDPInputsLightweight:
@@ -34,6 +37,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         self.runner.max_num_tokens = 64
         self.runner.max_num_reqs = 8
         self.runner.max_num_blocks_per_req = 8
+        self.runner.block_size = 16
         self.runner.num_tokens_paddings = [16, 32, 64]
 
         # Mock input batch - adjust num_reqs to match test data
@@ -117,6 +121,177 @@ class TestTPUJaxRunnerDPInputsLightweight:
         mock_kv_cache_config.has_mamba_layers = False
         self.runner.kv_cache_config = mock_kv_cache_config
         self.runner.use_hybrid_kvcache = True
+
+    def _enable_pcp_config(self, pcp_size=2, interleave_size=2):
+        self.runner.vllm_config = MagicMock()
+        self.runner.vllm_config.parallel_config.prefill_context_parallel_size = (
+            pcp_size)
+        self.runner.vllm_config.parallel_config.cp_kv_cache_interleave_size = (
+            interleave_size)
+        self.runner.parallel_config = MagicMock()
+        self.runner.parallel_config.decode_context_parallel_size = 1
+
+    @patch('jax.device_put', side_effect=lambda x, *args, **kwargs: x)
+    @patch('tpu_inference.runner.tpu_runner.NamedSharding')
+    @patch('tpu_inference.runner.tpu_runner.runner_utils')
+    @patch('tpu_inference.runner.tpu_runner.device_array',
+           side_effect=lambda mesh, tensors, **kwargs: tensors)
+    @patch('tpu_inference.runner.tpu_runner.TPUSupportedSamplingMetadata')
+    def test_prepare_inputs_pcp_config_initial_prefill_builds_pcp_metadata(
+            self, mock_sampling_metadata, mock_device_array, mock_runner_utils,
+            mock_named_sharding, mock_device_put):
+        self._enable_pcp_config()
+        self.runner.input_batch.num_reqs = 2
+        self.runner.input_batch.num_computed_tokens_cpu = np.array([0, 0, 5, 15])
+        mock_runner_utils.get_padded_token_len.return_value = 16
+        mock_sampling_metadata.from_input_batch.return_value = MagicMock()
+        mock_named_sharding.return_value = MagicMock()
+
+        scheduler_output = self._create_mock_scheduler_output(
+            {
+                "req1": 4,
+                "req2": 4
+            },
+            {
+                "req1": 0,
+                "req2": 1
+            },
+        )
+
+        result = self.runner._prepare_inputs(scheduler_output)
+        attention_metadata = result[2]
+
+        assert attention_metadata.pcp_query_start_loc is not None
+        assert attention_metadata.pcp_slot_ids is not None
+
+    @patch('jax.device_put', side_effect=lambda x, *args, **kwargs: x)
+    @patch('tpu_inference.runner.tpu_runner.NamedSharding')
+    @patch('tpu_inference.runner.tpu_runner.runner_utils')
+    @patch('tpu_inference.runner.tpu_runner.device_array',
+           side_effect=lambda mesh, tensors, **kwargs: tensors)
+    @patch('tpu_inference.runner.tpu_runner.TPUSupportedSamplingMetadata')
+    def test_prepare_inputs_pcp_mamba_prefill_builds_gdn_reorder_indices(
+            self, mock_sampling_metadata, mock_device_array, mock_runner_utils,
+            mock_named_sharding, mock_device_put):
+        self._enable_pcp_config()
+        self.runner.input_batch.num_reqs = 2
+        self.runner.input_batch.num_computed_tokens_cpu = np.array([0, 0, 5,
+                                                                    15])
+        self.runner.input_batch._mamba_local_slots = 16
+        self.runner.input_batch.mamba_state_indices_cpu = np.arange(
+            self.runner.max_num_reqs, dtype=np.int32)
+        self.runner.kv_cache_config.has_mamba_layers = True
+        mock_runner_utils.get_padded_token_len.return_value = 16
+        mock_sampling_metadata.from_input_batch.return_value = MagicMock()
+        mock_named_sharding.return_value = MagicMock()
+
+        scheduler_output = self._create_mock_scheduler_output(
+            {
+                "req1": 4,
+                "req2": 4
+            },
+            {
+                "req1": 0,
+                "req2": 1
+            },
+        )
+
+        result = self.runner._prepare_inputs(scheduler_output)
+        attention_metadata = result[2]
+
+        expected_dp0, _ = _build_pcp_rank_major_token_order(
+            [4],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=16,
+        )
+        expected_dp1, _ = _build_pcp_rank_major_token_order(
+            [4],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=16,
+        )
+        expected = np.concatenate([expected_dp0, expected_dp1]).astype(
+            np.int32)
+
+        np.testing.assert_array_equal(
+            np.asarray(attention_metadata.pcp_gdn_reorder_indices), expected)
+        assert attention_metadata.mamba_state_indices is not None
+
+    @patch('jax.device_put', side_effect=lambda x, *args, **kwargs: x)
+    @patch('tpu_inference.runner.tpu_runner.NamedSharding')
+    @patch('tpu_inference.runner.tpu_runner.runner_utils')
+    @patch('tpu_inference.runner.tpu_runner.device_array',
+           side_effect=lambda mesh, tensors, **kwargs: tensors)
+    @patch('tpu_inference.runner.tpu_runner.TPUSupportedSamplingMetadata')
+    def test_prepare_inputs_pcp_config_decode_builds_pcp_decode_metadata(
+            self, mock_sampling_metadata, mock_device_array, mock_runner_utils,
+            mock_named_sharding, mock_device_put):
+        self._enable_pcp_config()
+        self.runner.input_batch.num_reqs = 2
+        mock_runner_utils.get_padded_token_len.return_value = 16
+        mock_sampling_metadata.from_input_batch.return_value = MagicMock()
+        mock_named_sharding.return_value = MagicMock()
+
+        scheduler_output = self._create_mock_scheduler_output(
+            {
+                "req1": 1,
+                "req2": 1
+            },
+            {
+                "req1": 0,
+                "req2": 1
+            },
+        )
+
+        result = self.runner._prepare_inputs(scheduler_output)
+        attention_metadata = result[2]
+        logits_indices = result[4]
+
+        assert attention_metadata.pcp_query_start_loc is None
+        assert attention_metadata.pcp_kv_lens is None
+        assert attention_metadata.pcp_page_indices is None
+        assert attention_metadata.pcp_slot_ids is not None
+        assert attention_metadata.pcp_source_block_tables is not None
+        assert attention_metadata.pcp_source_block_tables.shape == (8, 4)
+        expected_source_block_tables = np.zeros((8, 4), dtype=np.int32)
+        expected_source_block_tables[0] = np.arange(4, dtype=np.int32)
+        expected_source_block_tables[4] = np.arange(8, 12, dtype=np.int32)
+        np.testing.assert_array_equal(
+            np.asarray(attention_metadata.pcp_source_block_tables),
+            expected_source_block_tables,
+        )
+        np.testing.assert_array_equal(np.asarray(logits_indices[:17]),
+                                      np.array([0] + [-1] * 15 + [16],
+                                               dtype=np.int32))
+
+    @pytest.mark.parametrize(
+        ("scheduled_tokens", "computed_tokens"),
+        [
+            ({
+                "req1": 4,
+                "req2": 1,
+            }, [0, 8, 5, 15]),
+        ],
+    )
+    def test_prepare_inputs_pcp_config_rejects_unsupported_batch_shapes(
+            self, scheduled_tokens, computed_tokens):
+        self._enable_pcp_config()
+        self.runner.input_batch.num_reqs = 2
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            computed_tokens)
+
+        scheduler_output = self._create_mock_scheduler_output(
+            scheduled_tokens,
+            {
+                "req1": 0,
+                "req2": 1
+            },
+        )
+
+        with pytest.raises(NotImplementedError,
+                           match="mixed prefill/decode"):
+            self.runner._prepare_inputs(scheduler_output)
 
     @patch('jax.device_put')
     @patch('tpu_inference.runner.tpu_runner.NamedSharding')

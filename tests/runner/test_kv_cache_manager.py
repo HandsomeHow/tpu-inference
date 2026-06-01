@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import jax
@@ -32,8 +33,12 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.request import Request
 
 from tpu_inference import utils as common_utils
+from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
+                                                  ShardingAxisName,
+                                                  ShardingAxisNameBase)
 from tpu_inference.runner.input_batch import CachedRequestState
-from tpu_inference.runner.kv_cache import get_attention_page_size_bytes
+from tpu_inference.runner.kv_cache import (get_attention_kv_cache_sizing,
+                                           get_attention_page_size_bytes)
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
@@ -46,12 +51,12 @@ class TestKVCacheManager:
         self.mock_devices = [MagicMock(coords=i) for i in range(4)]
         self.mock_rng_key = MagicMock()
 
-        # create 1x1 mesh
+        # create a 1-device mesh with the full base axis set so tests using
+        # KV_CACHE_BLOCK/CONTEXT sharding exercise the same axes as serving.
         devices = np.asarray(jax.devices()[:1])
-        axis_names = ('data', 'attn_dp', 'model', 'expert')
-        mesh_shape = (1, 1, 1, 1)
+        mesh_shape = (1, ) * len(MESH_AXIS_NAMES)
         self.mock_mesh = jax.sharding.Mesh(devices.reshape(mesh_shape),
-                                           axis_names)
+                                           MESH_AXIS_NAMES)
 
         with patch('jax.devices', return_value=self.mock_devices), \
              patch('jax.make_mesh', return_value=self.mock_mesh), \
@@ -371,6 +376,133 @@ class TestKVCacheManager:
         for i in range(num_layers):
             assert kv_cache_spec[f'layer.{i}'] == expected_full_attn_spec
         assert len(self.runner.kv_cache_manager.shared_kv_cache_layers) == 0
+
+    def test_get_kv_cache_spec_keeps_physical_block_size_with_pcp(self):
+        pcp_size = 4
+        base_block_size = self.runner.vllm_config.cache_config.block_size
+        self.runner.vllm_config.parallel_config.prefill_context_parallel_size = (
+            pcp_size)
+        self.runner.vllm_config.parallel_config.decode_context_parallel_size = 1
+
+        num_kv_heads = 16
+        head_size = 128
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "layer.0":
+            MagicMock(
+                spec=Attention,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                attn_type=AttentionType.DECODER,
+                sliding_window=None,
+                kv_sharing_target_layer_name=None,
+            ),
+        }
+
+        kv_cache_spec = self.runner.get_kv_cache_spec()
+
+        expected_block_size = base_block_size
+        expected_num_kv_heads = common_utils.get_padded_num_heads(
+            num_kv_heads, self.runner.mesh.shape["model"])
+        expected_head_size = common_utils.get_padded_head_dim(head_size)
+        assert kv_cache_spec == {
+            "layer.0":
+            FullAttentionSpec(
+                block_size=expected_block_size,
+                num_kv_heads=expected_num_kv_heads,
+                head_size=expected_head_size,
+                dtype=torch.bfloat16,
+                page_size_padded=get_attention_page_size_bytes(
+                    self.runner.mesh, expected_block_size,
+                    expected_num_kv_heads, expected_head_size,
+                    self.runner.kv_cache_dtype, False),
+            )
+        }
+
+    def test_get_kv_cache_spec_rejects_pcp_mla(self):
+        self.runner.vllm_config.parallel_config.prefill_context_parallel_size = 2
+        self.runner.kv_cache_manager.use_mla = True
+
+        with pytest.raises(NotImplementedError,
+                           match="MLA KV cache support is not implemented"):
+            self.runner.get_kv_cache_spec()
+
+    def test_get_kv_cache_spec_rejects_pcp_jax_kv_share(self):
+        self.runner.vllm_config.parallel_config.prefill_context_parallel_size = 2
+        self.runner.vllm_config.compilation_config.static_forward_context = {}
+        model_config = self.runner.vllm_config.model_config
+        parallel_config = self.runner.vllm_config.parallel_config
+        num_layers = model_config.get_num_layers(parallel_config)
+        assert num_layers >= 2
+
+        mock_hf_text_config = MagicMock()
+        mock_hf_text_config.num_hidden_layers = num_layers
+        mock_hf_text_config.num_kv_shared_layers = 1
+        mock_hf_text_config.layer_types = ["full_attention"] * num_layers
+        mock_hf_text_config.num_global_key_value_heads = None
+        mock_hf_text_config.global_head_dim = None
+        mock_hf_text_config.num_key_value_heads = None
+        mock_hf_text_config.head_dim = None
+        self.runner.model_config.hf_text_config = mock_hf_text_config
+
+        with pytest.raises(NotImplementedError,
+                           match="does not support KV-share"):
+            self.runner.get_kv_cache_spec()
+
+    def test_get_kv_cache_spec_rejects_pcp_static_kv_share(self):
+        self.runner.vllm_config.parallel_config.prefill_context_parallel_size = 2
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "layer.0":
+            MagicMock(
+                spec=Attention,
+                num_kv_heads=16,
+                head_size=128,
+                attn_type=AttentionType.DECODER,
+                sliding_window=None,
+                kv_sharing_target_layer_name=None,
+            ),
+            "layer.1":
+            MagicMock(
+                spec=Attention,
+                num_kv_heads=16,
+                head_size=128,
+                attn_type=AttentionType.DECODER,
+                sliding_window=None,
+                kv_sharing_target_layer_name="layer.0",
+            ),
+        }
+
+        with pytest.raises(NotImplementedError,
+                           match="does not support KV-share"):
+            self.runner.get_kv_cache_spec()
+
+    def test_get_kv_cache_spec_accepts_pcp_mamba_state_cache(self):
+        """PCP + Mamba is now supported (GDN layers bypass PCP splitting)."""
+        self.runner.vllm_config.parallel_config.prefill_context_parallel_size = 2
+        mock_attention = MagicMock(spec=Attention)
+        mock_attention.get_kv_cache_spec.return_value = MagicMock(
+            spec=FullAttentionSpec)
+        mock_mamba = MagicMock(spec=MambaBase)
+        mock_mamba_spec = MagicMock(spec=MambaSpec)
+        mock_mamba_spec.shapes = ((3, 128),)
+        mock_mamba_spec.dtypes = (torch.bfloat16,)
+        mock_mamba.get_kv_cache_spec.return_value = mock_mamba_spec
+        layers = {"layer.0": mock_attention, "layer.1": mock_mamba}
+        self.runner.vllm_config.compilation_config.static_forward_context = (
+            layers)
+
+        with patch(
+                "tpu_inference.runner.kv_cache_manager.get_layers_from_vllm_config",
+                return_value=layers):
+            # Should NOT raise NotImplementedError("Mamba state cache").
+            # Other exceptions from incomplete mocks are acceptable here —
+            # we only care that the PCP+Mamba guard is gone.
+            try:
+                self.runner.get_kv_cache_spec()
+            except Exception as e:
+                if isinstance(e, NotImplementedError) and (
+                        "Mamba state cache" in str(e)):
+                    pytest.fail(
+                        f"PCP+Mamba should be supported but got: {e}")
 
     def test_get_kv_cache_spec_without_compilation_cfg_none_text_config_attrs(
             self):
@@ -1193,6 +1325,68 @@ class TestKVCacheManager:
         assert manager._mamba_num_blocks is None
         assert self.runner.cache_config.num_gpu_blocks_override == 999
 
+    def test_compact_mamba_override_uses_batch_divisor_with_pcp(self):
+        """When pcp > 1, mamba_num_blocks is rounded to the BATCH divisor
+        (excludes pcp), while attn_num_blocks uses the full ATTN_DATA divisor
+        (includes pcp). This ensures mamba state is replicated across PCP
+        ranks rather than split."""
+        from tpu_inference.layers.common.sharding import (
+            ShardingAxisNameBase)
+        from tpu_inference.runner.kv_cache_manager import KVCacheManager
+
+        # Force base sharding (multi-axis) so ATTN_DATA includes 'pcp'.
+        sharding_axis = ShardingAxisName
+        old_cls = sharding_axis._cls
+        sharding_axis._cls = ShardingAxisNameBase
+
+        try:
+            # Mock mesh with pcp=2: ATTN_DATA product=2, BATCH product=1.
+            mock_mesh = MagicMock()
+            mock_mesh.shape = {
+                'data': 1, 'attn_dp': 1, 'attn_dp_expert': 1,
+                'expert': 1, 'model': 1, 'dcp': 1, 'pcp': 2
+            }
+            mock_mesh.devices = MagicMock()
+            mock_mesh.devices.flatten = MagicMock(
+                return_value=[MagicMock() for _ in range(2)])
+            self.runner.mesh = mock_mesh
+
+            manager = KVCacheManager(self.runner)
+            manager.use_mla = False
+
+            avail_per_device = 304 * (2**30) // 4
+            attn_page = 2**20
+            unpadded_mamba = 4 * (2**20)
+            max_num_reqs = 254  # 254+1=255 is NOT a multiple of 2
+
+            self.runner.cache_config.gpu_memory_utilization = 1.0
+            self.runner.cache_config.num_gpu_blocks_override = None
+            self.runner.scheduler_config = MagicMock(
+                max_num_seqs=max_num_reqs)
+            self.runner.max_num_reqs = max_num_reqs
+
+            with patch(
+                    "tpu_inference.runner.kv_cache_manager.utils"
+                    ".hbm_usage_bytes",
+                    return_value=[(0, avail_per_device)] * 4):
+                self._run_compact_mamba_override(
+                    manager, attn_page=attn_page,
+                    unpadded_mamba=unpadded_mamba)
+
+            # Mamba uses BATCH divisor (1): 254 + 1 = 255, no rounding.
+            assert manager._mamba_num_blocks == max_num_reqs + 1  # 255
+
+            # Attention uses ATTN_DATA divisor (2): rounded down to even.
+            avail_per_tensor = (304 * 2**30) // 15
+            mamba_per_tensor = 3 * (max_num_reqs + 1) * unpadded_mamba
+            attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
+            expected_attn_raw = attn_per_tensor_avail // attn_page
+            expected_attn = (expected_attn_raw // 2) * 2
+            assert (self.runner.cache_config.num_gpu_blocks_override ==
+                    expected_attn)
+        finally:
+            sharding_axis._cls = old_cls
+
     def test_get_kv_cache_spec_pure_attention_no_cache_config_updates(self):
         mock_attn = MagicMock(spec=MambaBase)
         layers = {'layer.0': mock_attn}
@@ -1273,6 +1467,77 @@ class TestKVCacheManager:
 
         attn_cache = self.runner.kv_caches[1]
         assert attn_cache.shape[0] == num_blocks
+
+    def test_initialize_kv_cache_converts_attention_override_to_global_blocks(
+            self):
+        local_num_blocks = 5
+        pcp_size = 4
+        block_size = self.runner.vllm_config.cache_config.block_size
+        num_kv_heads = 8
+        head_size = 128
+        dtype = torch.bfloat16
+        fake_mesh = SimpleNamespace(
+            shape={
+                "data": 1,
+                "attn_dp": 1,
+                "attn_dp_expert": 1,
+                "pcp": pcp_size,
+                "dcp": 1,
+                "model": 1,
+                "expert": 1,
+            },
+            devices=np.array([MagicMock()] * pcp_size),
+        )
+        self.runner.mesh = fake_mesh
+        self.runner.cache_config.num_gpu_blocks_override = local_num_blocks
+
+        with patch.object(ShardingAxisName, "_cls", ShardingAxisNameBase):
+            sizing = get_attention_kv_cache_sizing(
+                fake_mesh,
+                spec_block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+            )
+            attn_spec = FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                page_size_padded=sizing.vllm_page_size_padded,
+            )
+            kv_cache_config = KVCacheConfig(
+                num_blocks=local_num_blocks,
+                kv_cache_tensors=[
+                    KVCacheTensor(
+                        size=sizing.vllm_tensor_size(local_num_blocks),
+                        shared_by=["layer.0"],
+                    )
+                ],
+                kv_cache_groups=[
+                    KVCacheGroupSpec(layer_names=["layer.0"],
+                                     kv_cache_spec=attn_spec)
+                ],
+            )
+
+            captured = {}
+
+            def fake_create_kv_caches(**kwargs):
+                captured.update(kwargs)
+                cache = MagicMock()
+                cache.shape = (kwargs["num_blocks"], kwargs["block_size"], 1,
+                               1, kwargs["head_size"])
+                cache.dtype = jnp.bfloat16
+                cache.sharding = "fake_sharding"
+                return [cache]
+
+            with patch(
+                    "tpu_inference.runner.kv_cache_manager.create_kv_caches",
+                    side_effect=fake_create_kv_caches):
+                self.runner.initialize_kv_cache(kv_cache_config)
+
+        assert captured["num_blocks"] == local_num_blocks * pcp_size
+        assert captured["block_size"] == block_size
 
     def test_hybrid_num_blocks_matches_vllm_pool_for_qwen35_topology(self):
         """Regression test for the OOB block-id bug observed on Qwen3.5.

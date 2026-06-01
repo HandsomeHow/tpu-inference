@@ -46,6 +46,61 @@ class KVCacheMetadata:
     sharding: NamedSharding = None
 
 
+@dataclass(frozen=True)
+class AttentionKVCacheSizing:
+    """Phase-0 sizing terms for TPU sharded KV cache accounting."""
+
+    spec_block_size: int
+    allocation_block_size: int
+    allocation_page_size_bytes: int
+    kv_cache_block_shard_count: int
+    vllm_page_size_padded: int
+
+    def vllm_num_blocks(self, aggregate_available_memory: int) -> int:
+        return aggregate_available_memory // self.vllm_page_size_padded
+
+    def vllm_tensor_size(self, local_num_blocks: int) -> int:
+        return local_num_blocks * self.vllm_page_size_padded
+
+    def global_num_blocks_from_tensor_size(self, tensor_size: int) -> int:
+        assert tensor_size % self.allocation_page_size_bytes == 0
+        return tensor_size // self.allocation_page_size_bytes
+
+    def local_num_blocks_from_global(self, global_num_blocks: int) -> int:
+        assert global_num_blocks % self.kv_cache_block_shard_count == 0
+        return global_num_blocks // self.kv_cache_block_shard_count
+
+
+def get_kv_cache_block_shard_count(mesh: Mesh) -> int:
+    return utils.get_mesh_shape_product(mesh, ShardingAxisName.KV_CACHE_BLOCK)
+
+
+def get_attention_kv_cache_sizing(
+    mesh: Mesh,
+    spec_block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    dtype,
+    *,
+    dcp_size: int | None = None,
+    use_mla: bool = False,
+) -> AttentionKVCacheSizing:
+    if dcp_size is None:
+        dcp_size = utils.get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT)
+    allocation_block_size = spec_block_size * dcp_size
+    allocation_page_size_bytes = get_attention_page_size_bytes(
+        mesh, allocation_block_size, num_kv_heads, head_size, dtype, use_mla)
+    kv_cache_block_shard_count = get_kv_cache_block_shard_count(mesh)
+    return AttentionKVCacheSizing(
+        spec_block_size=spec_block_size,
+        allocation_block_size=allocation_block_size,
+        allocation_page_size_bytes=allocation_page_size_bytes,
+        kv_cache_block_shard_count=kv_cache_block_shard_count,
+        vllm_page_size_padded=(allocation_page_size_bytes *
+                               kv_cache_block_shard_count),
+    )
+
+
 def get_kv_cache_shape_with_mesh(mesh: Mesh,
                                  total_num_pages: int,
                                  block_size: int,
@@ -120,17 +175,19 @@ def create_kv_caches(
                                                num_kv_heads, head_size,
                                                cache_dtype, use_mla)
 
-    # num_blocks --> shard by data batch
+    # num_blocks --> shard by KV cache block owner axes
     # block_size --> shard by context
     # head       --> shard by heads
     if use_mla:
         sharding = NamedSharding(
             mesh,
-            PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.CONTEXT))
+            PartitionSpec(ShardingAxisName.KV_CACHE_BLOCK,
+                          ShardingAxisName.CONTEXT))
     else:
         sharding = NamedSharding(
             mesh,
-            PartitionSpec(ShardingAxisName.BATCH, ShardingAxisName.CONTEXT,
+            PartitionSpec(ShardingAxisName.KV_CACHE_BLOCK,
+                          ShardingAxisName.CONTEXT,
                           ShardingAxisName.KV_CACHE_HEAD))
 
     def _allocate() -> jax.Array:

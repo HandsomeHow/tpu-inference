@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import jax.numpy as jnp
@@ -19,10 +20,34 @@ import pytest
 import torch
 from vllm.config import CacheConfig, CompilationMode, ModelConfig, VllmConfig
 
-from tpu_inference.platforms.tpu_platform import TpuPlatform
+from tpu_inference.core.sched.pcp_scheduler import PcpAwareScheduler
+from tpu_inference.platforms import tpu_platform
+from tpu_inference.platforms.tpu_platform import (
+    TpuPlatform, _patch_torch_accelerator_empty_cache_for_jax_tpu)
 
 
 class TestTpuPlatform:
+
+    def test_tpu_platform_noops_torch_accelerator_empty_cache(self,
+                                                             monkeypatch):
+        calls = []
+
+        def original_empty_cache():
+            calls.append("called")
+
+        accelerator = SimpleNamespace(empty_cache=original_empty_cache)
+        monkeypatch.setattr(tpu_platform.torch, "accelerator", accelerator)
+
+        _patch_torch_accelerator_empty_cache_for_jax_tpu()
+        accelerator.empty_cache()
+
+        assert calls == []
+        assert accelerator._tpu_inference_empty_cache_noop is True
+        assert accelerator.empty_cache.__wrapped__ is original_empty_cache
+
+        patched = accelerator.empty_cache
+        _patch_torch_accelerator_empty_cache_for_jax_tpu()
+        assert accelerator.empty_cache is patched
 
     @pytest.fixture
     def vllm_config(self):
@@ -34,8 +59,10 @@ class TestTpuPlatform:
         vllm_config.cache_config = cache_config
         vllm_config.model_config = MagicMock(dtype='bfloat16')
         vllm_config.model_config.use_mla = False
-        vllm_config.scheduler_config = MagicMock(is_multimodal_model=False)
+        vllm_config.scheduler_config = MagicMock(is_multimodal_model=False,
+                                                 async_scheduling=False)
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.sharding_config = MagicMock()
         vllm_config.compilation_config = MagicMock(mode="dynamo_trace_once",
                                                    backend="openxla")
@@ -236,6 +263,41 @@ class TestTpuPlatform:
 
         # Fallback behaviour defaults to `uni`
         assert vllm_config.parallel_config.distributed_executor_backend == "uni"
+
+    @patch("tpu_inference.platforms.tpu_platform.envs.TPU_MULTIHOST_BACKEND",
+           "")
+    @patch("tpu_inference.platforms.tpu_platform.ShardingConfigManager")
+    @patch(
+        "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
+    )
+    def test_check_and_update_config_rejects_pcp_async_scheduling(
+            self, mock_update, mock_sharding, vllm_config):
+        vllm_config.cache_config = None
+        vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.scheduler_config.async_scheduling = True
+
+        with pytest.raises(ValueError,
+                           match="PCP runner path does not support async"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        mock_update.assert_not_called()
+
+    @patch("tpu_inference.platforms.tpu_platform.envs.TPU_MULTIHOST_BACKEND",
+           "")
+    @patch("tpu_inference.platforms.tpu_platform.ShardingConfigManager")
+    @patch(
+        "tpu_inference.core.sched.dp_scheduler.update_vllm_config_for_dp_scheduler"
+    )
+    def test_check_and_update_config_uses_pcp_aware_scheduler(
+            self, mock_update, mock_sharding, vllm_config):
+        vllm_config.cache_config = None
+        vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.scheduler_config.async_scheduling = False
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.scheduler_cls == PcpAwareScheduler
+        mock_update.assert_called_once_with(vllm_config)
 
     @patch("tpu_inference.platforms.tpu_platform.envs.TPU_MULTIHOST_BACKEND",
            "")

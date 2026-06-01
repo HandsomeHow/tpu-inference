@@ -22,9 +22,470 @@ from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig, VllmConfig)
 from vllm.config.multimodal import BaseDummyOptions
 
+from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.models.common.interface import (ModelInterface,
                                                    MultiModalInterface)
-from tpu_inference.runner.tpu_runner import TPUModelRunner
+from tpu_inference.runner.tpu_runner import (TPUModelRunner,
+                                             _attention_metadata_uses_pcp,
+                                             _apply_pcp_rank_major_token_order,
+                                             _batch_uses_pcp_decode,
+                                             _batch_uses_pcp_prefill,
+                                             _build_pcp_decode_attention_metadata,
+                                             _build_pcp_attention_metadata,
+                                             _build_pcp_logits_indices,
+                                             _build_pcp_rank_major_token_order,
+                                             _logits_indices_require_global_gather,
+                                             _pcp_local_token_counts)
+
+
+class TestPCPTokenPacking:
+
+    def test_local_token_counts_balanced_for_interleaved_chunks(self):
+        counts = _pcp_local_token_counts([8], pcp_size=2, interleave_size=2)
+
+        np.testing.assert_array_equal(counts, np.array([4, 4], dtype=np.int32))
+
+    def test_local_token_counts_handles_multiple_partial_requests(self):
+        counts = _pcp_local_token_counts([5, 7],
+                                         pcp_size=3,
+                                         interleave_size=2)
+
+        np.testing.assert_array_equal(counts,
+                                      np.array([5, 4, 3], dtype=np.int32))
+
+    def test_local_token_counts_use_global_start_offsets(self):
+        counts = _pcp_local_token_counts(
+            [4],
+            pcp_size=2,
+            interleave_size=2,
+            token_start_offsets_per_req=[6],
+        )
+
+        np.testing.assert_array_equal(counts,
+                                      np.array([2, 2], dtype=np.int32))
+
+    def test_rank_major_token_order_single_request(self):
+        order, inverse = _build_pcp_rank_major_token_order(
+            [8],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=8,
+        )
+
+        np.testing.assert_array_equal(order, np.array([0, 1, 4, 5, 2, 3, 6,
+                                                       7]))
+        np.testing.assert_array_equal(inverse,
+                                      np.array([0, 1, 4, 5, 2, 3, 6, 7]))
+
+    def test_rank_major_token_order_multiple_requests_with_padding(self):
+        order, inverse = _build_pcp_rank_major_token_order(
+            [5, 3],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=12,
+        )
+
+        np.testing.assert_array_equal(
+            order, np.array([0, 1, 4, 5, 6, -1, 2, 3, 7, -1, -1, -1]))
+        np.testing.assert_array_equal(inverse,
+                                      np.array([0, 1, 6, 7, 2, 3, 4, 8]))
+
+    def test_rank_major_token_order_uses_global_start_offsets(self):
+        order, inverse = _build_pcp_rank_major_token_order(
+            [4],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=4,
+            token_start_offsets_per_req=[6],
+        )
+
+        np.testing.assert_array_equal(order, np.array([2, 3, 0, 1]))
+        np.testing.assert_array_equal(inverse, np.array([2, 3, 0, 1]))
+
+    def test_rank_major_token_order_rejects_non_divisible_padding(self):
+        with pytest.raises(ValueError, match="must be divisible"):
+            _build_pcp_rank_major_token_order(
+                [8],
+                pcp_size=2,
+                interleave_size=2,
+                padded_num_tokens=9,
+            )
+
+    def test_apply_rank_major_token_order_reorders_inputs_positions_and_mrope(
+            self):
+        input_ids = np.array([10, 11, 12, 13, 14, 15, 16, 17, 0, 0, 0, 0],
+                             dtype=np.int32)
+        positions = np.array([0, 1, 2, 3, 4, 0, 1, 2, 0, 0, 0, 0],
+                             dtype=np.int32)
+        mrope = np.stack([positions, positions + 100, positions + 200])
+
+        inverse = _apply_pcp_rank_major_token_order(
+            input_ids,
+            positions,
+            [5, 3],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=12,
+            mrope_positions_cpu=mrope,
+        )
+
+        np.testing.assert_array_equal(
+            input_ids,
+            np.array([10, 11, 14, 15, 16, 0, 12, 13, 17, 0, 0, 0],
+                     dtype=np.int32))
+        np.testing.assert_array_equal(
+            positions,
+            np.array([0, 1, 4, 0, 1, 0, 2, 3, 2, 0, 0, 0], dtype=np.int32))
+        np.testing.assert_array_equal(
+            mrope[1],
+            np.array([100, 101, 104, 100, 101, 0, 102, 103, 102, 0, 0, 0]))
+        np.testing.assert_array_equal(inverse,
+                                      np.array([0, 1, 6, 7, 2, 3, 4, 8]))
+
+    def test_build_logits_indices_adds_dp_token_offset(self):
+        logits_indices = _build_pcp_logits_indices(
+            [5, 3],
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=12,
+            token_offset=24,
+        )
+
+        np.testing.assert_array_equal(logits_indices, np.array([26, 32]))
+
+    def test_build_attention_metadata_single_request(self):
+        metadata = _build_pcp_attention_metadata(
+            num_scheduled_tokens_per_req=[8],
+            seq_lens_per_req=[8],
+            block_tables=np.array([[7, 8]], dtype=np.int32),
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=8,
+            max_num_reqs_per_dp_rank=1,
+            block_size=4,
+        )
+
+        np.testing.assert_array_equal(metadata.kv_lens,
+                                      np.array([8, 8, 8, 8], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.page_indices,
+            np.array([7, 8, 7, 8, 7, 8, 7, 8], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.query_start_loc,
+            np.array([0, 2, 4, 0, 2, 4], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.request_distribution,
+            np.array([0, 0, 2, 0, 0, 2], dtype=np.int32))
+        np.testing.assert_array_equal(metadata.q_start_offsets,
+                                      np.array([0, 4, 2, 6], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.cu_k_lens, np.array([0, 0, 8, 0, 0, 8], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.slot_ids,
+            np.array([28, 29, 30, 31, 28, 29, 30, 31], dtype=np.int32))
+
+    def test_build_attention_metadata_chunked_prefill_continuation(self):
+        metadata = _build_pcp_attention_metadata(
+            num_scheduled_tokens_per_req=[4],
+            seq_lens_per_req=[12],
+            block_tables=np.array([[7, 8, 9]], dtype=np.int32),
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=4,
+            max_num_reqs_per_dp_rank=1,
+            block_size=4,
+        )
+
+        np.testing.assert_array_equal(metadata.kv_lens,
+                                      np.array([12, 12], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.page_indices,
+            np.array([7, 8, 9, 7, 8, 9], dtype=np.int32))
+        np.testing.assert_array_equal(metadata.query_start_loc,
+                                      np.array([0, 2, 0, 2], dtype=np.int32))
+        np.testing.assert_array_equal(metadata.q_start_offsets,
+                                      np.array([8, 10], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.cu_k_lens, np.array([0, 12, 0, 12], dtype=np.int32))
+        np.testing.assert_array_equal(metadata.slot_ids,
+                                      np.array([32, 33, 32, 33],
+                                               dtype=np.int32))
+
+    def test_build_attention_metadata_adds_dummy_query_for_empty_pcp_rank(self):
+        metadata = _build_pcp_attention_metadata(
+            num_scheduled_tokens_per_req=[4],
+            seq_lens_per_req=[12],
+            block_tables=np.array([[7, 8, 9]], dtype=np.int32),
+            pcp_size=2,
+            interleave_size=4,
+            padded_num_tokens=16,
+            max_num_reqs_per_dp_rank=1,
+            block_size=8,
+        )
+
+        local_padded_tokens = 8
+        rank1_query_start = metadata.query_start_loc[3:]
+        np.testing.assert_array_equal(rank1_query_start,
+                                      np.array([0, 1, 1], dtype=np.int32))
+        assert metadata.q_start_offsets[2] == 0
+        assert metadata.slot_ids[local_padded_tokens] == -1
+
+    def test_build_attention_metadata_rejects_invalid_seq_lens(self):
+        with pytest.raises(ValueError, match="seq_lens_per_req"):
+            _build_pcp_attention_metadata(
+                num_scheduled_tokens_per_req=[4],
+                seq_lens_per_req=[3],
+                block_tables=np.array([[3]], dtype=np.int32),
+                pcp_size=2,
+                interleave_size=2,
+                padded_num_tokens=4,
+                max_num_reqs_per_dp_rank=1,
+                block_size=4,
+            )
+
+    def test_build_pcp_decode_attention_metadata(self):
+        metadata = _build_pcp_decode_attention_metadata(
+            seq_lens_per_req=[5, 4],
+            block_tables=np.array([[7, 8], [3, 4]], dtype=np.int32),
+            block_size=4,
+            pcp_size=2,
+            interleave_size=2,
+            padded_num_tokens=4,
+            max_num_reqs_per_dp_rank=2,
+        )
+
+        np.testing.assert_array_equal(
+            metadata["source_block_tables"],
+            np.array([[7], [3]], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            metadata["slot_ids"],
+            np.array([30, -1, -1, -1, -1, 13, -1, -1], dtype=np.int32),
+        )
+
+    def test_build_pcp_decode_attention_metadata_multi_token_continuation(self):
+        metadata = _build_pcp_decode_attention_metadata(
+            seq_lens_per_req=[12],
+            block_tables=np.array([[7, 8, 9]], dtype=np.int32),
+            block_size=8,
+            pcp_size=2,
+            interleave_size=4,
+            padded_num_tokens=8,
+            max_num_reqs_per_dp_rank=1,
+            num_scheduled_tokens_per_req=[4],
+        )
+
+        np.testing.assert_array_equal(
+            metadata["source_block_tables"],
+            np.array([[7, 8]], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            metadata["slot_ids"],
+            np.array([60, 61, 62, 63, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                      -1, -1, -1],
+                     dtype=np.int32),
+        )
+
+    def test_build_pcp_decode_attention_metadata_pcp8_nonzero_owner_rank(self):
+        block_tables = np.array(
+            [
+                [17, 3, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+                 111, 112, 113, 114],
+                [5, 29, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
+                 211, 212, 213, 214],
+                [11, 23, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310,
+                 311, 312, 313, 314],
+                [41, 43, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410,
+                 411, 412, 413, 414],
+            ],
+            dtype=np.int32,
+        )
+
+        metadata = _build_pcp_decode_attention_metadata(
+            seq_lens_per_req=[6, 31, 130],
+            block_tables=block_tables,
+            block_size=16,
+            pcp_size=8,
+            interleave_size=4,
+            padded_num_tokens=8,
+            max_num_reqs_per_dp_rank=4,
+        )
+
+        np.testing.assert_array_equal(
+            metadata["source_block_tables"],
+            np.array(
+                [
+                    [17, 3],
+                    [5, 29],
+                    [11, 23],
+                    [41, 43],
+                ],
+                dtype=np.int32,
+            ),
+        )
+        expected_slot_ids = np.full(64, -1, dtype=np.int32)
+        expected_slot_ids[2] = 23 * 16 + 1
+        expected_slot_ids[8] = 17 * 16 + 1
+        expected_slot_ids[57] = 5 * 16 + 2
+        np.testing.assert_array_equal(metadata["slot_ids"],
+                                      expected_slot_ids)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"block_size": 0}, "block_size > 0"),
+            ({"pcp_size": 1}, "pcp_size > 1"),
+            ({"interleave_size": 0}, "interleave_size > 0"),
+            ({"interleave_size": 3}, "block_size % interleave_size"),
+            ({"seq_lens_per_req": [33]}, "block table capacity"),
+        ],
+    )
+    def test_build_pcp_decode_attention_metadata_rejects_invalid_args(
+            self, kwargs, match):
+        args = {
+            "seq_lens_per_req": [5],
+            "block_tables": np.array([[7, 8]], dtype=np.int32),
+            "block_size": 16,
+            "pcp_size": 2,
+            "interleave_size": 4,
+            "padded_num_tokens": 4,
+            "max_num_reqs_per_dp_rank": 1,
+        }
+        args.update(kwargs)
+
+        with pytest.raises(ValueError, match=match):
+            _build_pcp_decode_attention_metadata(**args)
+
+
+class TestPCPBatchSelection:
+
+    @staticmethod
+    def _vllm_config(pcp_size=2, interleave_size=2):
+        vllm_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = interleave_size
+        return vllm_config
+
+    @staticmethod
+    def _input_batch(req_ids, computed_tokens, prompt_tokens=None):
+        input_batch = MagicMock()
+        input_batch.req_ids = req_ids
+        input_batch.req_id_to_index = {
+            req_id: idx for idx, req_id in enumerate(req_ids)
+        }
+        input_batch.num_computed_tokens_cpu = np.array(computed_tokens,
+                                                       dtype=np.int32)
+        if prompt_tokens is None:
+            prompt_tokens = computed_tokens
+        input_batch.num_prompt_tokens = np.array(prompt_tokens, dtype=np.int32)
+        return input_batch
+
+    @staticmethod
+    def _scheduler(num_scheduled_tokens):
+        scheduler_output = MagicMock()
+        scheduler_output.num_scheduled_tokens = num_scheduled_tokens
+        return scheduler_output
+
+    def test_initial_prefill_batch_uses_pcp(self):
+        assert _batch_uses_pcp_prefill(
+            self._vllm_config(),
+            self._input_batch(["req1", "req2"], [0, 0], [8, 4]),
+            self._scheduler({
+                "req1": 8,
+                "req2": 4
+            }),
+            num_reqs=2,
+        )
+
+    def test_single_token_prompt_continuation_uses_pcp_decode(self):
+        input_batch = self._input_batch(["req1"], [4096], [4097])
+        scheduler_output = self._scheduler({"req1": 1})
+
+        assert not _batch_uses_pcp_prefill(
+            self._vllm_config(),
+            input_batch,
+            scheduler_output,
+            num_reqs=1,
+        )
+        assert _batch_uses_pcp_decode(
+            self._vllm_config(),
+            input_batch,
+            scheduler_output,
+            num_reqs=1,
+        )
+
+    def test_chunked_prompt_continuation_multiple_tokens_materializes_pcp_kv(
+            self):
+        assert not _batch_uses_pcp_prefill(
+            self._vllm_config(pcp_size=1),
+            self._input_batch(["req1"], [4096], [4100]),
+            self._scheduler({"req1": 4}),
+            num_reqs=1,
+        )
+        input_batch = self._input_batch(["req1"], [4096], [4100])
+        scheduler_output = self._scheduler({"req1": 4})
+        assert not _batch_uses_pcp_prefill(
+            self._vllm_config(),
+            input_batch,
+            scheduler_output,
+            num_reqs=1,
+        )
+        assert _batch_uses_pcp_decode(
+            self._vllm_config(),
+            input_batch,
+            scheduler_output,
+            num_reqs=1,
+        )
+
+    def test_pcp_disabled_in_config_does_not_use_pcp(self):
+        assert not _batch_uses_pcp_prefill(
+            self._vllm_config(pcp_size=1),
+            self._input_batch(["req1"], [0], [8]),
+            self._scheduler({"req1": 8}),
+            num_reqs=1,
+        )
+
+    def test_decode_batch_uses_pcp_decode(self):
+        assert _batch_uses_pcp_decode(
+            self._vllm_config(),
+            self._input_batch(["req1", "req2"], [8, 10], [8, 10]),
+            self._scheduler({
+                "req1": 1,
+                "req2": 1
+            }),
+            num_reqs=2,
+        )
+        assert not _batch_uses_pcp_decode(
+            self._vllm_config(),
+            self._input_batch(["req1", "req2"], [0, 0], [8, 1]),
+            self._scheduler({
+                "req1": 8,
+                "req2": 1
+            }),
+            num_reqs=2,
+        )
+
+    def test_attention_metadata_uses_pcp_checks_actual_metadata(self):
+        normal_md = AttentionMetadata(input_positions=jnp.array([0]))
+        pcp_md = AttentionMetadata(input_positions=jnp.array([0]),
+                                   pcp_slot_ids=jnp.array([0]),
+                                   pcp_query_start_loc=jnp.array([0]))
+        pcp_decode_md = AttentionMetadata(input_positions=jnp.array([0]),
+                                          pcp_slot_ids=jnp.array([0]))
+
+        assert not _attention_metadata_uses_pcp(normal_md)
+        assert _attention_metadata_uses_pcp(pcp_md)
+        assert _attention_metadata_uses_pcp(pcp_decode_md)
+        assert _attention_metadata_uses_pcp({"layer.0": normal_md,
+                                             "layer.1": pcp_decode_md})
+
+    def test_pcp_config_uses_global_logits_indices_for_mixed_batches(self):
+        normal_md = AttentionMetadata(input_positions=jnp.array([0]))
+
+        assert _logits_indices_require_global_gather(
+            self._vllm_config(pcp_size=2), normal_md)
+        assert not _logits_indices_require_global_gather(
+            self._vllm_config(pcp_size=1), normal_md)
 
 
 class TestTPUJaxRunner:

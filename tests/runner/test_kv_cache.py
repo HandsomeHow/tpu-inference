@@ -21,7 +21,8 @@ import pytest
 import torch
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sharding import (ShardingAxisName,
+                                                  ShardingAxisNameBase)
 from tpu_inference.runner.kv_cache import (create_kv_caches,
                                            get_attention_page_size_bytes,
                                            get_kv_cache_shape_with_mesh)
@@ -84,6 +85,44 @@ def test_create_kv_caches(mesh: Mesh):
 
         # Ensure that separate array objects were created for each layer
         assert kv_caches[0] is not kv_caches[1]
+
+
+def test_create_kv_caches_shards_blocks_over_pcp_axis():
+    if len(jax.local_devices()) < 2:
+        pytest.skip("requires at least 2 local devices")
+
+    devices = np.array(jax.local_devices()[:2]).reshape((1, 1, 1, 1, 1, 1, 2))
+    pcp_mesh = Mesh(
+        devices,
+        axis_names=("data", "attn_dp", "attn_dp_expert", "expert", "model",
+                    "dcp", "pcp"),
+    )
+    local_num_blocks = 8
+    pcp_size = 2
+    global_num_blocks = local_num_blocks * pcp_size
+
+    with patch.object(ShardingAxisName, "_cls", ShardingAxisNameBase):
+        kv_cache = create_kv_caches(
+            num_blocks=global_num_blocks,
+            block_size=16,
+            num_kv_heads=4,
+            head_size=128,
+            mesh=pcp_mesh,
+            layer_names=["layer.0"],
+        )[0]
+        expected_sharding = NamedSharding(
+            pcp_mesh,
+            PartitionSpec(ShardingAxisName.KV_CACHE_BLOCK,
+                          ShardingAxisName.CONTEXT,
+                          ShardingAxisName.KV_CACHE_HEAD),
+        )
+
+    assert kv_cache.sharding == expected_sharding
+    assert kv_cache.shape[0] == global_num_blocks
+    local_shapes = [
+        shard.data.shape[0] for shard in kv_cache.addressable_shards
+    ]
+    assert local_shapes == [local_num_blocks] * pcp_size
 
 
 def test_create_kv_caches_mla(mesh: Mesh):

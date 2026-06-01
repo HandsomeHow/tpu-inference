@@ -40,7 +40,7 @@ from tpu_inference.offload.utils import get_kv_connector_cache_layout
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache import (KVCacheMetadata, create_kv_caches,
-                                           get_attention_page_size_bytes)
+                                           get_attention_kv_cache_sizing)
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -83,20 +83,67 @@ class KVCacheManager:
         self._mamba_num_blocks: int | None = None
         self.actual_mamba_num_blocks: int | None = None
 
+    def _pcp_enabled(self) -> bool:
+        pcp_size = getattr(self.runner.vllm_config.parallel_config,
+                           "prefill_context_parallel_size", 1)
+        return isinstance(pcp_size, int) and pcp_size > 1
+
+    def _get_attention_kv_cache_sizing(
+        self,
+        spec_block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        dtype,
+        *,
+        use_mla: bool | None = None,
+    ):
+        if use_mla is None:
+            use_mla = self.use_mla
+        return get_attention_kv_cache_sizing(
+            self.runner.mesh,
+            spec_block_size=spec_block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+            use_mla=use_mla,
+        )
+
+    def _get_attention_allocation_page_size_bytes(
+        self,
+        spec_block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        dtype,
+        *,
+        use_mla: bool | None = None,
+    ) -> int:
+        return self._get_attention_kv_cache_sizing(
+            spec_block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+            use_mla=use_mla,
+        ).allocation_page_size_bytes
+
     def _create_attention_spec(
             self,
             block_size: int,
             num_kv_heads: int,
             head_size: int,
             sliding_window: bool | None = None) -> KVCacheSpec:
+        spec_block_size = block_size
+        sizing = self._get_attention_kv_cache_sizing(
+            spec_block_size,
+            num_kv_heads,
+            head_size,
+            self.runner.kv_cache_dtype,
+            use_mla=self.use_mla,
+        )
         if self.use_mla:
-            page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
-                self.runner.kv_cache_dtype, True)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
-                                is not None else int(page_size_bytes))
-            return MLAAttentionSpec(block_size=block_size,
+                                is not None else sizing.vllm_page_size_padded)
+            return MLAAttentionSpec(block_size=spec_block_size,
                                     num_kv_heads=1,
                                     head_size=head_size,
                                     dtype=self.runner.kv_cache_dtype,
@@ -104,21 +151,18 @@ class KVCacheManager:
                                     cache_config.cache_dtype,
                                     page_size_padded=page_size_padded)
         else:
-            page_size_bytes = get_attention_page_size_bytes(
-                self.runner.mesh, block_size, num_kv_heads, head_size,
-                self.runner.kv_cache_dtype, False)
             page_size_padded = (self._hybrid_uniform_page_size_bytes
                                 if self._hybrid_uniform_page_size_bytes
-                                is not None else int(page_size_bytes))
+                                is not None else sizing.vllm_page_size_padded)
             if sliding_window is not None:
-                return SlidingWindowSpec(block_size=block_size,
+                return SlidingWindowSpec(block_size=spec_block_size,
                                          num_kv_heads=num_kv_heads,
                                          head_size=head_size,
                                          dtype=self.runner.kv_cache_dtype,
                                          sliding_window=sliding_window,
                                          page_size_padded=page_size_padded)
             else:
-                return FullAttentionSpec(block_size=block_size,
+                return FullAttentionSpec(block_size=spec_block_size,
                                          num_kv_heads=num_kv_heads,
                                          head_size=head_size,
                                          dtype=self.runner.kv_cache_dtype,
@@ -153,7 +197,7 @@ class KVCacheManager:
         The fix: set every layer's reported `page_size_padded` equal to the
         full per-`shared_by` footprint — `num_attn_groups × attn_page +
         num_mamba_groups × mamba_unpadded`, where `attn_page` is the
-        TPU-actual per-block bytes (from `get_attention_page_size_bytes`,
+        TPU-actual per-block bytes (from `get_attention_kv_cache_sizing`,
         which accounts for dtype packing like fp8) and `mamba_unpadded` is
         the natural `prod(shape) × dtype_size`. vLLM then computes a
         smaller `num_blocks` that exactly matches what we allocate per layer
@@ -182,9 +226,13 @@ class KVCacheManager:
                                                 ShardingAxisName.ATTN_HEAD))
         head_size = common_utils.get_padded_head_dim(
             first_attn_module.head_size)
-        attn_page_size_bytes = get_attention_page_size_bytes(
-            self.runner.mesh, self.runner.cache_config.block_size,
-            num_kv_heads, head_size, self.runner.kv_cache_dtype, False)
+        attn_page_size_bytes = self._get_attention_kv_cache_sizing(
+            self.runner.cache_config.block_size,
+            num_kv_heads,
+            head_size,
+            self.runner.kv_cache_dtype,
+            use_mla=False,
+        ).vllm_page_size_padded
 
         mamba_modules = [
             module for module in layers.values()
@@ -346,30 +394,31 @@ class KVCacheManager:
         if avail <= 0:
             return
 
-        # Sharding divisor: per-layer num_blocks must be a multiple of the
-        # per-axis device count so JAX shardings don't round up. MLA shards
-        # over MLP_TENSOR (unless DP attention is on); other layouts shard
-        # over ATTN_DATA. Match `initialize_kv_cache` exactly so what we
-        # compute here is what gets allocated.
+        # Sharding divisors: attention blocks must align to ATTN_DATA (includes
+        # PCP), mamba state blocks align to BATCH (excludes PCP) because mamba
+        # state is replicated across PCP ranks.
         if self.use_mla and not self.runner.vllm_config.additional_config.get(
                 "sharding", {}).get("sharding_strategy", {}).get(
                     "enable_dp_attention", False):
-            divisor = common_utils.get_mesh_shape_product(
+            attn_divisor = common_utils.get_mesh_shape_product(
                 self.runner.mesh, ShardingAxisName.MLP_TENSOR)
         else:
-            divisor = common_utils.get_mesh_shape_product(
+            attn_divisor = common_utils.get_mesh_shape_product(
                 self.runner.mesh, ShardingAxisName.ATTN_DATA)
-        # `get_mesh_shape_product` returns 1 for an absent axis, but be
-        # defensive against an empty mesh shape that produces 0.
-        divisor = max(divisor, 1)
+        attn_divisor = max(attn_divisor, 1)
+
+        mamba_divisor = common_utils.get_mesh_shape_product(
+            self.runner.mesh, ShardingAxisName.BATCH)
+        mamba_divisor = max(mamba_divisor, 1)
 
         # Mamba slot budget: one per persistent-batch slot plus the null
-        # block, rounded up to the sharding divisor. `runner.max_num_reqs`
-        # already includes the DP multiplier
+        # block, rounded up to the mamba sharding divisor.
+        # `runner.max_num_reqs` already includes the DP multiplier
         # (= `dp_size × scheduler_config.max_num_seqs`).
         mamba_num_blocks = self.runner.max_num_reqs + 1
         mamba_num_blocks = (
-            (mamba_num_blocks + divisor - 1) // divisor) * divisor
+            (mamba_num_blocks + mamba_divisor - 1) // mamba_divisor
+        ) * mamba_divisor
 
         # Attention block count: fits into HBM left after mamba.
         # `attn_page_size_bytes` is per-block per-attention-layer; the
@@ -396,13 +445,14 @@ class KVCacheManager:
 
         attn_num_blocks = attn_per_tensor_avail // (num_attn_groups *
                                                     attn_page_size_bytes)
-        attn_num_blocks = (attn_num_blocks // divisor) * divisor
+        attn_num_blocks = (attn_num_blocks // attn_divisor) * attn_divisor
         if attn_num_blocks <= 0:
             logger.warning(
                 "Compact-mamba sizing skipped: attn_num_blocks=0 after "
-                "rounding to divisor=%d (avail_per_tensor=%d, "
+                "rounding to attn_divisor=%d (avail_per_tensor=%d, "
                 "mamba_per_tensor=%d). Lower `gpu_memory_utilization` or "
-                "`max_num_seqs`.", divisor, avail_per_tensor, mamba_per_tensor)
+                "`max_num_seqs`.", attn_divisor, avail_per_tensor,
+                mamba_per_tensor)
             return
 
         cache_config.num_gpu_blocks_override = int(attn_num_blocks)
@@ -423,10 +473,12 @@ class KVCacheManager:
             avail / (2**30))
 
     def get_kv_cache_spec(self):
-        # TODO(xiang): this hack tricks engine core to init successfully
         block_size = self.runner.cache_config.block_size
-        block_size *= self.runner.vllm_config.parallel_config.decode_context_parallel_size
         kv_cache_spec: dict[str, KVCacheSpec] = {}
+        if self._pcp_enabled() and self.use_mla:
+            raise NotImplementedError(
+                "PCP sharded KV cache currently supports full attention only; "
+                "MLA KV cache support is not implemented.")
 
         tp_axis_name = ShardingAxisName.ATTN_HEAD
         model_cnt = common_utils.get_mesh_shape_product(
@@ -460,6 +512,10 @@ class KVCacheManager:
             # for models that don't use KV-share, so this is a no-op for
             # the common case.
             kv_share_map = compute_kv_share_map(text_config)
+            if self._pcp_enabled() and kv_share_map:
+                raise NotImplementedError(
+                    "PCP sharded KV cache does not support KV-share layers "
+                    "yet.")
 
             for i in range(model_config.get_num_layers(parallel_config)):
                 # If this layer is KV-shared, register the redirect and skip
@@ -578,6 +634,10 @@ class KVCacheManager:
 
                 if (kv_tgt_layer :=
                         attn_module.kv_sharing_target_layer_name) is not None:
+                    if self._pcp_enabled():
+                        raise NotImplementedError(
+                            "PCP sharded KV cache does not support KV-share "
+                            "layers yet.")
                     # The layer doesn't need its own KV cache and will use that of
                     # the target layer. We skip creating a KVCacheSpec for it, so
                     # that KV cache management logic will act as this layer does
@@ -721,6 +781,7 @@ class KVCacheManager:
                     break
 
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+            first_layer_spec = layer_name_to_spec[kv_cache_tensor.shared_by[0]]
             if duplicate_shared_layers:
                 total_group_page_size = 0
                 for name in kv_cache_tensor.shared_by:
@@ -738,30 +799,44 @@ class KVCacheManager:
                         total_group_page_size += dataclasses.replace(
                             spec, page_size_padded=None).page_size_bytes
                     else:
-                        total_group_page_size += get_attention_page_size_bytes(
-                            self.runner.mesh, spec.block_size,
-                            spec.num_kv_heads, spec.head_size, spec.dtype,
-                            self.use_mla)
+                        total_group_page_size += (
+                            self._get_attention_allocation_page_size_bytes(
+                                spec.block_size,
+                                spec.num_kv_heads,
+                                spec.head_size,
+                                spec.dtype,
+                                use_mla=self.use_mla))
                 num_blocks = kv_cache_tensor.size // total_group_page_size
             else:
                 # If sharing KV cache, compute `num_blocks` using the page size
                 # of the first layer.
-                page_size_bytes = layer_name_to_spec[
-                    kv_cache_tensor.shared_by[0]].page_size_bytes
+                if isinstance(first_layer_spec, MambaSpec):
+                    page_size_bytes = first_layer_spec.page_size_bytes
+                else:
+                    page_size_bytes = (
+                        self._get_attention_allocation_page_size_bytes(
+                            first_layer_spec.block_size,
+                            first_layer_spec.num_kv_heads,
+                            first_layer_spec.head_size,
+                            first_layer_spec.dtype,
+                            use_mla=self.use_mla))
                 assert kv_cache_tensor.size % page_size_bytes == 0
                 num_blocks = kv_cache_tensor.size // page_size_bytes
 
-            # Default KV cache is sharded over (BATCH=(dp, attn_dp))
+            # Attention KV cache is sharded over KV_CACHE_BLOCK; num_blocks
+            # here is the JAX global leading dimension.
             divisor = common_utils.get_mesh_shape_product(
-                self.runner.mesh, ShardingAxisName.BATCH)
+                self.runner.mesh, ShardingAxisName.KV_CACHE_BLOCK)
 
             # num_blocks must be a multiple of the sharding divisor
             num_blocks = (num_blocks // divisor) * divisor
 
             if self.runner.cache_config.num_gpu_blocks_override is not None:
-                num_blocks = min(
-                    num_blocks,
+                override_num_blocks = (
                     self.runner.cache_config.num_gpu_blocks_override)
+                if not isinstance(first_layer_spec, MambaSpec):
+                    override_num_blocks *= divisor
+                num_blocks = min(num_blocks, override_num_blocks)
 
             # When compact-mamba sizing succeeded (set by
             # `_maybe_set_compact_mamba_num_blocks_override`), mamba layers
@@ -785,12 +860,13 @@ class KVCacheManager:
                         cache_shape = (mamba_num_blocks, *shape)
                         if state_index == 0:
                             # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
-                            spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
+                            # Mamba state is replicated across PCP ranks (BATCH excludes pcp).
+                            spec = PartitionSpec(ShardingAxisName.BATCH,
                                                  None,
                                                  ShardingAxisName.ATTN_HEAD)
                         elif state_index == 1:
                             # ssm_state: [num_blocks, num_heads, head_dim, state_size]
-                            spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
+                            spec = PartitionSpec(ShardingAxisName.BATCH,
                                                  ShardingAxisName.ATTN_HEAD,
                                                  None, None)
                         else:
@@ -837,9 +913,12 @@ class KVCacheManager:
                         else:
                             head_size = layer_spec.head_size
 
+                        dcp_size = common_utils.get_mesh_shape_product(
+                            self.runner.mesh, ShardingAxisName.CONTEXT)
+                        allocation_block_size = layer_spec.block_size * dcp_size
                         kv_cache = create_kv_caches(
                             num_blocks=num_blocks,
-                            block_size=layer_spec.block_size,
+                            block_size=allocation_block_size,
                             num_kv_heads=layer_spec.num_kv_heads,
                             head_size=head_size,
                             mesh=self.runner.mesh,

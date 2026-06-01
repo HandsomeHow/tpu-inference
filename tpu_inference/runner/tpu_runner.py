@@ -280,6 +280,639 @@ def _jax_logprobs_materialize(
     )
 
 
+def _get_pcp_parallel_config(vllm_config: VllmConfig) -> tuple[int, int]:
+    parallel_config = vllm_config.parallel_config
+    pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+    interleave_size = getattr(parallel_config, "cp_kv_cache_interleave_size",
+                              1)
+    if not isinstance(pcp_size, int):
+        pcp_size = 1
+    if not isinstance(interleave_size, int):
+        interleave_size = 1
+    return pcp_size, interleave_size
+
+
+def _scheduled_token_span(
+    input_batch: InputBatch,
+    scheduler_output: VllmSchedulerOutput,
+    req_id: str,
+) -> tuple[int, int, int]:
+    req_index = input_batch.req_id_to_index[req_id]
+    return (
+        int(input_batch.num_computed_tokens_cpu[req_index]),
+        int(scheduler_output.num_scheduled_tokens[req_id]),
+        int(input_batch.num_prompt_tokens[req_index]),
+    )
+
+
+def _request_uses_initial_pcp_prefill(
+    input_batch: InputBatch,
+    scheduler_output: VllmSchedulerOutput,
+    req_id: str,
+) -> bool:
+    computed_tokens, scheduled_tokens, prompt_tokens = _scheduled_token_span(
+        input_batch, scheduler_output, req_id)
+    return (scheduled_tokens > 1 and computed_tokens == 0
+            and scheduled_tokens <= prompt_tokens)
+
+
+def _request_uses_pcp_materialized_kv(
+    input_batch: InputBatch,
+    scheduler_output: VllmSchedulerOutput,
+    req_id: str,
+) -> bool:
+    computed_tokens, scheduled_tokens, prompt_tokens = _scheduled_token_span(
+        input_batch, scheduler_output, req_id)
+    if scheduled_tokens <= 0:
+        return False
+    if computed_tokens < prompt_tokens:
+        if computed_tokens + scheduled_tokens > prompt_tokens:
+            return False
+        return not _request_uses_initial_pcp_prefill(input_batch,
+                                                     scheduler_output, req_id)
+    return scheduled_tokens == 1
+
+
+def _batch_has_unsupported_pcp_mix(
+    input_batch: InputBatch,
+    scheduler_output: VllmSchedulerOutput,
+    num_reqs: int,
+) -> bool:
+    has_prompt = False
+    has_decode = False
+    for req_id in input_batch.req_ids[:num_reqs]:
+        if _request_uses_initial_pcp_prefill(input_batch, scheduler_output,
+                                             req_id):
+            has_prompt = True
+            continue
+        if _request_uses_pcp_materialized_kv(input_batch, scheduler_output,
+                                             req_id):
+            has_decode = True
+            continue
+        if scheduler_output.num_scheduled_tokens[req_id] > 0:
+            return True
+    return has_prompt and has_decode
+
+
+def _batch_uses_pcp_prefill(
+    vllm_config: VllmConfig,
+    input_batch: InputBatch,
+    scheduler_output: VllmSchedulerOutput,
+    num_reqs: int,
+) -> bool:
+    """Return whether this scheduled batch should use PCP attention."""
+    pcp_size, _ = _get_pcp_parallel_config(vllm_config)
+    if pcp_size <= 1 or num_reqs <= 0:
+        return False
+
+    for req_id in input_batch.req_ids[:num_reqs]:
+        if not _request_uses_initial_pcp_prefill(input_batch, scheduler_output,
+                                                 req_id):
+            return False
+    return True
+
+
+def _batch_uses_pcp_decode(
+    vllm_config: VllmConfig,
+    input_batch: InputBatch,
+    scheduler_output: VllmSchedulerOutput,
+    num_reqs: int,
+) -> bool:
+    """Return whether this batch should materialize PCP KV before attention."""
+    pcp_size, _ = _get_pcp_parallel_config(vllm_config)
+    if pcp_size <= 1 or num_reqs <= 0:
+        return False
+
+    for req_id in input_batch.req_ids[:num_reqs]:
+        if not _request_uses_pcp_materialized_kv(input_batch, scheduler_output,
+                                                 req_id):
+            return False
+    return True
+
+
+def _attention_metadata_uses_pcp(
+        attn_metadata: AttentionMetadata | dict[str, AttentionMetadata]) -> bool:
+    if isinstance(attn_metadata, dict):
+        return any(_attention_metadata_uses_pcp(md)
+                   for md in attn_metadata.values())
+    return getattr(attn_metadata, "pcp_slot_ids", None) is not None
+
+
+def _logits_indices_require_global_gather(
+    vllm_config: VllmConfig,
+    attn_metadata: AttentionMetadata | dict[str, AttentionMetadata],
+) -> bool:
+    pcp_size, _ = _get_pcp_parallel_config(vllm_config)
+    return pcp_size > 1 or _attention_metadata_uses_pcp(attn_metadata)
+
+
+def _pcp_local_token_counts(
+    num_scheduled_tokens_per_req: list[int] | np.ndarray,
+    pcp_size: int,
+    interleave_size: int,
+    token_start_offsets_per_req: list[int] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Return local token counts for each PCP rank under chunk interleave."""
+    if pcp_size <= 1:
+        return np.array([int(np.sum(num_scheduled_tokens_per_req))],
+                        dtype=np.int32)
+    if interleave_size <= 0:
+        raise ValueError("cp_kv_cache_interleave_size must be positive.")
+
+    tokens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int64)
+    if tokens.size == 0:
+        return np.zeros(pcp_size, dtype=np.int32)
+    starts = _pcp_query_start_offsets(tokens, token_start_offsets_per_req)
+    counts = np.zeros(pcp_size, dtype=np.int64)
+    for q_len, q_start in zip(tokens, starts):
+        for rank in range(pcp_size):
+            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
+                    int(q_len), int(q_start), rank, pcp_size,
+                    interleave_size):
+                counts[rank] += chunk_end - chunk_start
+    return counts.astype(np.int32)
+
+
+def _pcp_query_start_offsets(
+    num_scheduled_tokens_per_req: np.ndarray,
+    token_start_offsets_per_req: list[int] | np.ndarray | None,
+) -> np.ndarray:
+    if token_start_offsets_per_req is None:
+        return np.zeros(num_scheduled_tokens_per_req.size, dtype=np.int64)
+    starts = np.asarray(token_start_offsets_per_req, dtype=np.int64)
+    if starts.size != num_scheduled_tokens_per_req.size:
+        raise ValueError("token_start_offsets_per_req must have the same "
+                         "number of entries as num_scheduled_tokens_per_req.")
+    if np.any(starts < 0):
+        raise ValueError("token_start_offsets_per_req must be non-negative.")
+    return starts
+
+
+def _pcp_query_chunk_ranges(q_len: int, q_global_base: int, pcp_rank: int,
+                            pcp_size: int, interleave_size: int):
+    if q_len <= 0:
+        return
+    cycle = pcp_size * interleave_size
+    q_end = q_global_base + q_len
+    chunk_start = ((q_global_base // cycle) * cycle +
+                   pcp_rank * interleave_size)
+    if chunk_start + interleave_size <= q_global_base:
+        chunk_start += cycle
+    while chunk_start < q_end:
+        overlap_start = max(chunk_start, q_global_base)
+        overlap_end = min(chunk_start + interleave_size, q_end)
+        if overlap_end > overlap_start:
+            yield overlap_start, overlap_end
+        chunk_start += cycle
+
+
+def _build_pcp_rank_major_token_order(
+    num_scheduled_tokens_per_req: list[int] | np.ndarray,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+    token_start_offsets_per_req: list[int] | np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build token reorder indices for rank-major PCP chunk packing.
+
+    Returns:
+        token_order: [padded_num_tokens] source indices in original per-DP
+            request-major token order. Padding entries are -1.
+        inverse_order: [total_num_tokens] destination indices in packed order.
+    """
+    if pcp_size <= 1:
+        total = int(np.sum(num_scheduled_tokens_per_req))
+        token_order = np.full(padded_num_tokens, -1, dtype=np.int64)
+        token_order[:total] = np.arange(total, dtype=np.int64)
+        return token_order, np.arange(total, dtype=np.int64)
+    if interleave_size <= 0:
+        raise ValueError("cp_kv_cache_interleave_size must be positive.")
+    if padded_num_tokens % pcp_size != 0:
+        raise ValueError(
+            f"{padded_num_tokens=} must be divisible by {pcp_size=}.")
+
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    token_order = np.full(padded_num_tokens, -1, dtype=np.int64)
+    total_num_tokens = int(np.sum(num_scheduled_tokens_per_req))
+    inverse_order = np.full(total_num_tokens, -1, dtype=np.int64)
+    starts = _pcp_query_start_offsets(
+        np.asarray(num_scheduled_tokens_per_req, dtype=np.int64),
+        token_start_offsets_per_req,
+    )
+
+    req_start = 0
+    rank_offsets = np.zeros(pcp_size, dtype=np.int64)
+    for num_tokens, q_global_base in zip(num_scheduled_tokens_per_req, starts):
+        num_tokens = int(num_tokens)
+        for rank in range(pcp_size):
+            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
+                    num_tokens, int(q_global_base), rank, pcp_size,
+                    interleave_size):
+                chunk_len = chunk_end - chunk_start
+                dst_start = rank * local_padded_num_tokens + rank_offsets[rank]
+                dst_end = dst_start + chunk_len
+                if dst_end > (rank + 1) * local_padded_num_tokens:
+                    raise ValueError(
+                        "PCP local token count exceeds padded local capacity.")
+                local_chunk_start = chunk_start - q_global_base
+                local_chunk_end = chunk_end - q_global_base
+                src = np.arange(req_start + local_chunk_start,
+                                req_start + local_chunk_end,
+                                dtype=np.int64)
+                token_order[dst_start:dst_end] = src
+                inverse_order[src] = np.arange(dst_start,
+                                               dst_end,
+                                               dtype=np.int64)
+                rank_offsets[rank] += chunk_len
+        req_start += num_tokens
+
+    if total_num_tokens and np.any(inverse_order < 0):
+        raise ValueError("PCP token packing did not cover all tokens.")
+    return token_order, inverse_order
+
+
+def _apply_pcp_rank_major_token_order(
+    input_ids_cpu: np.ndarray,
+    positions_cpu: np.ndarray,
+    num_scheduled_tokens_per_req: list[int] | np.ndarray,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+    mrope_positions_cpu: np.ndarray | None = None,
+    token_start_offsets_per_req: list[int] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Reorder per-DP token arrays into PCP rank-major chunk order."""
+    total_num_tokens = int(np.sum(num_scheduled_tokens_per_req))
+    token_order, inverse_order = _build_pcp_rank_major_token_order(
+        num_scheduled_tokens_per_req,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+        token_start_offsets_per_req=token_start_offsets_per_req,
+    )
+    valid = token_order >= 0
+    original_input_ids = input_ids_cpu[:total_num_tokens].copy()
+    original_positions = positions_cpu[:total_num_tokens].copy()
+    input_ids_cpu[:] = 0
+    positions_cpu[:] = 0
+    input_ids_cpu[valid] = original_input_ids[token_order[valid]]
+    positions_cpu[valid] = original_positions[token_order[valid]]
+    if mrope_positions_cpu is not None:
+        original_mrope = mrope_positions_cpu[:, :total_num_tokens].copy()
+        mrope_positions_cpu[:, :] = 0
+        mrope_positions_cpu[:, valid] = original_mrope[:, token_order[valid]]
+    return inverse_order
+
+
+def _build_pcp_logits_indices(
+    num_scheduled_tokens_per_req: list[int] | np.ndarray,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+    token_offset: int = 0,
+    token_start_offsets_per_req: list[int] | np.ndarray | None = None,
+) -> np.ndarray:
+    """Return global packed indices for each request's last query token."""
+    _, inverse_order = _build_pcp_rank_major_token_order(
+        num_scheduled_tokens_per_req,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+        token_start_offsets_per_req=token_start_offsets_per_req,
+    )
+    if len(num_scheduled_tokens_per_req) == 0:
+        return np.empty((0, ), dtype=np.int64)
+    local_request_ends = np.cumsum(num_scheduled_tokens_per_req,
+                                   dtype=np.int64) - 1
+    return inverse_order[local_request_ends] + token_offset
+
+
+@dataclass(frozen=True)
+class _PCPAttentionMetadataHost:
+    kv_lens: np.ndarray
+    page_indices: np.ndarray
+    query_start_loc: np.ndarray
+    request_distribution: np.ndarray
+    q_start_offsets: np.ndarray
+    cu_k_lens: np.ndarray
+    slot_ids: np.ndarray
+
+
+def _pcp_chunks_per_seq(max_num_tokens: int, pcp_size: int,
+                        interleave_size: int) -> int:
+    if interleave_size <= 0:
+        raise ValueError("cp_kv_cache_interleave_size must be positive.")
+    return max(1, cdiv(max_num_tokens, pcp_size * interleave_size))
+
+
+def _build_pcp_local_slot_ids(
+    q_lens: np.ndarray,
+    seq_lens: np.ndarray,
+    block_tables: np.ndarray,
+    block_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+) -> np.ndarray:
+    """Build rank-major local cache slot ids for PCP prefill K/V writes."""
+    if block_size <= 0:
+        raise ValueError(f"Expected positive block_size, got {block_size}.")
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    slot_ids = np.full(padded_num_tokens, -1, dtype=np.int32)
+    rank_offsets = np.zeros(pcp_size, dtype=np.int64)
+    virtual_block_size = block_size * pcp_size
+
+    for req_idx, q_len in enumerate(q_lens):
+        q_len = int(q_len)
+        seq_len = int(seq_lens[req_idx])
+        q_global_base = seq_len - q_len
+        if q_global_base < 0:
+            raise ValueError("seq_lens_per_req must be >= "
+                             "num_scheduled_tokens_per_req.")
+        for pcp_rank in range(pcp_size):
+            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
+                    q_len, q_global_base, pcp_rank, pcp_size,
+                    interleave_size):
+                positions = np.arange(chunk_start, chunk_end, dtype=np.int64)
+                block_indices = positions // virtual_block_size
+                virtual_offsets = positions - block_indices * virtual_block_size
+                is_local = ((virtual_offsets // interleave_size) %
+                            pcp_size) == pcp_rank
+                if not np.all(is_local):
+                    raise ValueError("PCP slot mapping produced a non-local "
+                                     "token for its packed rank.")
+                local_offsets = (
+                    (virtual_offsets //
+                     (pcp_size * interleave_size)) * interleave_size +
+                    (virtual_offsets % interleave_size))
+                block_numbers = block_tables[req_idx,
+                                             block_indices].astype(np.int32)
+                local_slots = (block_numbers * block_size +
+                               local_offsets).astype(np.int32)
+
+                dst_start = (pcp_rank * local_padded_num_tokens +
+                             rank_offsets[pcp_rank])
+                dst_end = dst_start + local_slots.shape[0]
+                if dst_end > (pcp_rank + 1) * local_padded_num_tokens:
+                    raise ValueError(
+                        "PCP local slot count exceeds padded local capacity.")
+                slot_ids[dst_start:dst_end] = local_slots
+                rank_offsets[pcp_rank] += local_slots.shape[0]
+
+    return slot_ids
+
+
+def _build_pcp_decode_attention_metadata(
+    seq_lens_per_req: list[int] | np.ndarray,
+    block_tables: np.ndarray,
+    block_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+    max_num_reqs_per_dp_rank: int,
+    num_scheduled_tokens_per_req: list[int] | np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Build runner-owned replicated-Q/local-KV metadata for PCP materialize."""
+    if block_size <= 0:
+        raise ValueError("PCP decode metadata requires block_size > 0.")
+    if pcp_size <= 1:
+        raise ValueError("PCP decode metadata requires pcp_size > 1.")
+    if interleave_size <= 0:
+        raise ValueError(
+            "PCP decode metadata requires interleave_size > 0.")
+    if block_size % interleave_size != 0:
+        raise ValueError(
+            "PCP decode metadata requires block_size % interleave_size == 0.")
+    seq_lens = np.asarray(seq_lens_per_req, dtype=np.int32)
+    if seq_lens.size > max_num_reqs_per_dp_rank:
+        raise ValueError(
+            "active request count exceeds max_num_reqs_per_dp_rank.")
+    if num_scheduled_tokens_per_req is None:
+        q_lens = np.ones(seq_lens.size, dtype=np.int32)
+    else:
+        q_lens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int32)
+        if q_lens.size != seq_lens.size:
+            raise ValueError("num_scheduled_tokens_per_req and "
+                             "seq_lens_per_req must have the same number of "
+                             "active requests.")
+        if np.any(q_lens <= 0):
+            raise ValueError("num_scheduled_tokens_per_req must be positive.")
+        if np.any(seq_lens < q_lens):
+            raise ValueError("seq_lens_per_req must be >= "
+                             "num_scheduled_tokens_per_req.")
+
+    seq_lens_full = np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32)
+    q_lens_full = np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32)
+    seq_lens_full[:seq_lens.size] = seq_lens
+    q_lens_full[:q_lens.size] = q_lens
+
+    block_tables = np.asarray(block_tables, dtype=np.int32)
+    if block_tables.ndim == 1:
+        if block_tables.size % max_num_reqs_per_dp_rank != 0:
+            raise ValueError("flat block_tables size must be divisible by "
+                             "max_num_reqs_per_dp_rank.")
+        pages_per_seq = block_tables.size // max_num_reqs_per_dp_rank
+        block_tables = block_tables.reshape(max_num_reqs_per_dp_rank,
+                                            pages_per_seq)
+    elif block_tables.ndim == 2:
+        if block_tables.shape[0] != max_num_reqs_per_dp_rank:
+            raise ValueError("block_tables first dimension must equal "
+                             "max_num_reqs_per_dp_rank.")
+        pages_per_seq = block_tables.shape[1]
+    else:
+        raise ValueError("block_tables must be rank 1 or 2.")
+    max_capacity_tokens = pages_per_seq * block_size
+    if np.any(seq_lens > max_capacity_tokens):
+        raise ValueError(
+            "seq_lens_per_req exceeds PCP decode block table capacity.")
+    virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
+    source_block_tables = block_tables[:, :virtual_blocks_per_req]
+
+    rank_slot_ids = []
+    virtual_block_size = block_size * pcp_size
+    for pcp_rank in range(pcp_size):
+        rank_slots = np.full(padded_num_tokens, -1, dtype=np.int32)
+        token_offset = 0
+        for req_idx, q_len in enumerate(q_lens_full):
+            q_len = int(q_len)
+            if q_len <= 0:
+                continue
+            q_global_base = int(seq_lens_full[req_idx] - q_len)
+            for local_pos in range(q_len):
+                dst_index = token_offset + local_pos
+                position = q_global_base + local_pos
+                block_index = position // virtual_block_size
+                virtual_offset = position - block_index * virtual_block_size
+                owner_rank = (virtual_offset // interleave_size) % pcp_size
+                if owner_rank != pcp_rank:
+                    continue
+                local_offset = (
+                    (virtual_offset //
+                     (pcp_size * interleave_size)) * interleave_size +
+                    (virtual_offset % interleave_size))
+                block_number = block_tables[req_idx, block_index]
+                rank_slots[dst_index] = np.int32(block_number * block_size +
+                                                 local_offset)
+            token_offset += q_len
+        rank_slot_ids.append(rank_slots)
+
+    return {
+        "slot_ids": np.concatenate(rank_slot_ids).astype(np.int32),
+        "source_block_tables": source_block_tables.astype(np.int32),
+    }
+
+
+def _build_pcp_attention_metadata(
+    num_scheduled_tokens_per_req: list[int] | np.ndarray,
+    seq_lens_per_req: list[int] | np.ndarray,
+    block_tables: np.ndarray,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+    max_num_reqs_per_dp_rank: int,
+    block_size: int,
+) -> _PCPAttentionMetadataHost:
+    """Build runner-owned local-Q/full-KV metadata for one DP rank."""
+    if pcp_size <= 1:
+        raise ValueError("PCP attention metadata requires pcp_size > 1.")
+    if padded_num_tokens % pcp_size != 0:
+        raise ValueError(
+            f"{padded_num_tokens=} must be divisible by {pcp_size=}.")
+
+    q_lens = np.asarray(num_scheduled_tokens_per_req, dtype=np.int32)
+    seq_lens = np.asarray(seq_lens_per_req, dtype=np.int32)
+    if q_lens.size != seq_lens.size:
+        raise ValueError("num_scheduled_tokens_per_req and seq_lens_per_req "
+                         "must have the same number of active requests.")
+    if np.any(seq_lens < q_lens):
+        raise ValueError("seq_lens_per_req must be >= "
+                         "num_scheduled_tokens_per_req.")
+    if q_lens.size > max_num_reqs_per_dp_rank:
+        raise ValueError(
+            "active request count exceeds max_num_reqs_per_dp_rank.")
+
+    q_lens_full = np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32)
+    kv_lens_full = np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32)
+    q_lens_full[:q_lens.size] = q_lens
+    kv_lens_full[:seq_lens.size] = seq_lens
+
+    block_tables = np.asarray(block_tables, dtype=np.int32)
+    if block_tables.ndim == 1:
+        if block_tables.size % max_num_reqs_per_dp_rank != 0:
+            raise ValueError("flat block_tables size must be divisible by "
+                             "max_num_reqs_per_dp_rank.")
+        pages_per_seq = block_tables.size // max_num_reqs_per_dp_rank
+        block_tables = block_tables.reshape(max_num_reqs_per_dp_rank,
+                                            pages_per_seq)
+    elif block_tables.ndim == 2:
+        if block_tables.shape[0] != max_num_reqs_per_dp_rank:
+            raise ValueError("block_tables first dimension must equal "
+                             "max_num_reqs_per_dp_rank.")
+        pages_per_seq = block_tables.shape[1]
+    else:
+        raise ValueError("block_tables must be rank 1 or 2.")
+
+    cycle = pcp_size * interleave_size
+    q_global_base = kv_lens_full - q_lens_full
+    chunks_per_seq = _pcp_chunks_per_seq(padded_num_tokens, pcp_size,
+                                         interleave_size)
+    if np.any((q_global_base[:q_lens.size] % cycle) != 0):
+        chunks_per_seq += 1
+    k_start_offsets = np.pad(np.cumsum(kv_lens_full, dtype=np.int32),
+                             (1, 0))[:-1]
+    total_kv_len = np.array([np.sum(kv_lens_full, dtype=np.int32)],
+                            dtype=np.int32)
+    pseudo_seq_count = max_num_reqs_per_dp_rank * chunks_per_seq
+
+    rank_kv_lens = []
+    rank_page_indices = []
+    rank_query_start_loc = []
+    rank_request_distribution = []
+    rank_q_start_offsets = []
+    rank_cu_k_lens = []
+    for pcp_rank in range(pcp_size):
+        local_q_lens = np.zeros((max_num_reqs_per_dp_rank, chunks_per_seq),
+                                dtype=np.int32)
+        q_start_offsets = np.zeros_like(local_q_lens)
+        for req_idx in range(max_num_reqs_per_dp_rank):
+            chunk_idx = 0
+            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
+                    int(q_lens_full[req_idx]), int(q_global_base[req_idx]),
+                    pcp_rank, pcp_size, interleave_size):
+                if chunk_idx >= chunks_per_seq:
+                    raise ValueError("PCP metadata chunk capacity exceeded.")
+                local_q_lens[req_idx, chunk_idx] = chunk_end - chunk_start
+                q_start_offsets[req_idx, chunk_idx] = chunk_start
+                chunk_idx += 1
+        if q_lens.size and int(local_q_lens.sum()) == 0:
+            # Continuation chunks can be shorter than a PCP interleave cycle,
+            # leaving some PCP ranks with no local queries. The RPA prefill
+            # kernel expects at least one query row per shard; use a padding
+            # query that is never selected as logits and has slot_id=-1.
+            local_q_lens[0, 0] = 1
+            q_start_offsets[0, 0] = 0
+
+        # TODO(xiaohao.yxh): This models every interleaved chunk as a pseudo
+        # sequence. Small interleave sizes can create many tiny RPA sequences;
+        # replace this with native multi-chunk scheduling inside the kernel.
+        flat_local_q_lens = local_q_lens.reshape(-1)
+        rank_query_start_loc.append(
+            np.pad(np.cumsum(flat_local_q_lens, dtype=np.int32),
+                   (1, 0)).astype(np.int32))
+
+        rank_q_start_offsets.append(
+            np.where(local_q_lens > 0, q_start_offsets, 0).reshape(-1).astype(
+                np.int32))
+        rank_kv_lens.append(
+            np.where(local_q_lens > 0, kv_lens_full[:, None],
+                     0).reshape(-1).astype(np.int32))
+        cu_k_lens = np.where(local_q_lens > 0, k_start_offsets[:, None],
+                             0).reshape(-1).astype(np.int32)
+        rank_cu_k_lens.append(np.concatenate([cu_k_lens, total_kv_len]))
+        rank_page_indices.append(
+            np.broadcast_to(
+                block_tables[:, None, :],
+                (max_num_reqs_per_dp_rank, chunks_per_seq, pages_per_seq),
+            ).reshape(-1).astype(np.int32))
+        rank_request_distribution.append(
+            np.array([0, 0, pseudo_seq_count], dtype=np.int32))
+
+    return _PCPAttentionMetadataHost(
+        kv_lens=np.concatenate(rank_kv_lens),
+        page_indices=np.concatenate(rank_page_indices),
+        query_start_loc=np.concatenate(rank_query_start_loc),
+        request_distribution=np.concatenate(rank_request_distribution),
+        q_start_offsets=np.concatenate(rank_q_start_offsets),
+        cu_k_lens=np.concatenate(rank_cu_k_lens),
+        slot_ids=_build_pcp_local_slot_ids(
+            q_lens_full,
+            kv_lens_full,
+            block_tables,
+            block_size,
+            pcp_size,
+            interleave_size,
+            padded_num_tokens,
+        ),
+    )
+
+
+def _merge_pcp_attention_metadata(
+    metadata_per_dp: list[_PCPAttentionMetadataHost],
+) -> _PCPAttentionMetadataHost:
+    return _PCPAttentionMetadataHost(
+        kv_lens=np.concatenate([m.kv_lens for m in metadata_per_dp]),
+        page_indices=np.concatenate([m.page_indices for m in metadata_per_dp]),
+        query_start_loc=np.concatenate(
+            [m.query_start_loc for m in metadata_per_dp]),
+        request_distribution=np.concatenate(
+            [m.request_distribution for m in metadata_per_dp]),
+        q_start_offsets=np.concatenate(
+            [m.q_start_offsets for m in metadata_per_dp]),
+        cu_k_lens=np.concatenate([m.cu_k_lens for m in metadata_per_dp]),
+        slot_ids=np.concatenate([m.slot_ids for m in metadata_per_dp]),
+    )
+
+
 class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
     def __init__(
@@ -388,6 +1021,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding_config.expert_size,
             sharding_config.tp_size,
             sharding_config.decode_cp_size,
+            sharding_config.prefill_cp_size,
         )
 
         # Attempt to create a physically optimized mesh. Fall back to a simple
@@ -418,8 +1052,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sharding_config.expert_size,
             sharding_config.tp_size,
             sharding_config.decode_cp_size,
+            sharding_config.prefill_cp_size,
         )
-        dcn_mesh_shape = (num_slices, 1, 1, 1, 1, 1)
+        dcn_mesh_shape = (num_slices, 1, 1, 1, 1, 1, 1)
 
         # Attempt to create a physically optimized hybrid mesh (ICI + DCN).
         # Fall back to a logical reshape for non-power-of-two device counts
@@ -1059,8 +1694,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
 
         full_hidden_states = hidden_states
-        hidden_states = self._select_from_array_fn(hidden_states,
-                                                   logits_indices)
+        if _logits_indices_require_global_gather(self.vllm_config,
+                                                 attn_metadata):
+            hidden_states = hidden_states[logits_indices]
+        else:
+            hidden_states = self._select_from_array_fn(hidden_states,
+                                                       logits_indices)
         logits = self.compute_logits_fn(
             self.state_leaves,
             hidden_states,
@@ -1381,7 +2020,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logprobs = compute_logprobs(logits)
         return gather_logprobs(logprobs, next_tokens, max_logprobs)
 
-    def _prepare_input_metadata(self, scheduler_output: "VllmSchedulerOutput"):
+    def _prepare_input_metadata(self,
+                                scheduler_output: "VllmSchedulerOutput",
+                                use_pcp: bool | None = None):
 
         dp_size = self.dp_size
         num_reqs = self.input_batch.num_reqs
@@ -1413,10 +2054,40 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Find maximum number of scheduled tokens across DP ranks
         max_num_scheduled_tokens_across_dp = max(
             num_scheduled_tokens_per_dp_rank.values())
+        pcp_size, interleave_size = _get_pcp_parallel_config(self.vllm_config)
+        if use_pcp is None:
+            use_pcp = _batch_uses_pcp_prefill(self.vllm_config,
+                                              self.input_batch,
+                                              scheduler_output, num_reqs)
+        if use_pcp and interleave_size <= 0:
+            raise ValueError(
+                "PCP runner path requires cp_kv_cache_interleave_size > 0.")
+        if use_pcp:
+            max_local_tokens_across_pcp = 0
+            for dp_rank in range(dp_size):
+                req_indices = np.asarray(req_indices_dp[dp_rank],
+                                         dtype=np.int64)
+                token_start_offsets = (
+                    self.input_batch.num_computed_tokens_cpu[req_indices]
+                    if req_indices.size else np.array([], dtype=np.int32))
+                local_counts = _pcp_local_token_counts(
+                    scheduled_tokens_per_dp_rank[dp_rank],
+                    pcp_size,
+                    interleave_size,
+                    token_start_offsets_per_req=token_start_offsets,
+                )
+                max_local_tokens_across_pcp = max(max_local_tokens_across_pcp,
+                                                  int(local_counts.max()))
+            max_num_scheduled_tokens_across_dp = max(
+                max_num_scheduled_tokens_across_dp,
+                max_local_tokens_across_pcp * pcp_size)
 
         padded_num_scheduled_tokens_per_dp_rank = runner_utils.get_padded_token_len(
             self.num_tokens_paddings_per_dp,
             max_num_scheduled_tokens_across_dp)
+        if use_pcp:
+            padded_num_scheduled_tokens_per_dp_rank = common_utils.align_to(
+                padded_num_scheduled_tokens_per_dp_rank, pcp_size)
 
         padded_total_num_scheduled_tokens = (
             padded_num_scheduled_tokens_per_dp_rank * dp_size)
@@ -1617,8 +2288,46 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if self.speculative_config and dp_size > 1:
             assert "Spec decoding not yet support when dp > 1"
 
-        data_parallel_attn_sharding = NamedSharding(
+        pcp_size, cp_kv_cache_interleave_size = _get_pcp_parallel_config(
+            self.vllm_config)
+        use_pcp = _batch_uses_pcp_prefill(self.vllm_config, self.input_batch,
+                                          scheduler_output, num_reqs)
+        use_pcp_decode = _batch_uses_pcp_decode(
+            self.vllm_config, self.input_batch, scheduler_output, num_reqs)
+        scheduled_counts = [
+            scheduler_output.num_scheduled_tokens[req_id]
+            for req_id in self.input_batch.req_ids[:num_reqs]
+        ]
+        positive_scheduled_counts = [n for n in scheduled_counts if n > 0]
+        if (pcp_size > 1 and positive_scheduled_counts
+                and _batch_has_unsupported_pcp_mix(self.input_batch,
+                                                   scheduler_output,
+                                                   num_reqs)):
+            raise NotImplementedError(
+                "PCP runner path does not support mixed prompt/decode "
+                "batches or prompt/decode boundary-crossing schedules yet.")
+        if use_pcp or use_pcp_decode:
+            if self.parallel_config.decode_context_parallel_size > 1:
+                raise NotImplementedError(
+                    "PCP runner path does not support DCP yet.")
+            if self.speculative_config is not None:
+                raise NotImplementedError(
+                    "PCP runner path does not support speculative decoding yet."
+                )
+            if self.scheduler_config.async_scheduling:
+                raise NotImplementedError(
+                    "PCP runner path does not support async scheduling yet.")
+            if cp_kv_cache_interleave_size <= 0:
+                raise ValueError(
+                    "PCP runner path requires cp_kv_cache_interleave_size > 0."
+                )
+
+        token_data_sharding = NamedSharding(
             self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+        metadata_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.BATCH))
+        source_block_tables_sharding = NamedSharding(
+            self.mesh, PartitionSpec(ShardingAxisName.BATCH, None))
 
         (req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
          scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
@@ -1626,7 +2335,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
          attn_padded_num_reqs, padded_total_num_scheduled_tokens,
          padded_num_reqs_per_dp_rank, logits_indices_selector,
          max_num_reqs_per_dp_rank
-         ) = self._prepare_input_metadata(scheduler_output)
+         ) = self._prepare_input_metadata(scheduler_output, use_pcp=use_pcp)
         # Multi-modal support
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1689,6 +2398,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices_view = self.device_buffer.get_view(logits_indices_shape,
                                                           key="logits_indices")
 
+        pcp_inverse_order_by_dp_rank: dict[int, np.ndarray] = {}
+
         # Populates input_ids and positions
         for dp_rank in range(dp_size):
             if num_req_per_dp_rank[dp_rank] == 0:
@@ -1707,7 +2418,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Get request indices.
             # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
             # For each scheduled token, what are the corresponding req index.
-            req_indices = np.repeat(req_indices_dp[dp_rank],
+            req_indices_per_req = np.asarray(req_indices_dp[dp_rank],
+                                             dtype=np.int64)
+            req_indices = np.repeat(req_indices_per_req,
                                     num_scheduled_tokens_per_req)
             # Get batched arange.
             # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -1734,7 +2447,41 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 out=input_ids_cpu[:total_num_scheduled_tokens],
             )
 
-            input_ids_cpu[total_num_scheduled_tokens:] = 0
+            if use_pcp:
+                if any(n <= 0 for n in num_scheduled_tokens_per_req):
+                    raise NotImplementedError(
+                        "PCP runner path requires scheduled prompt tokens.")
+                token_start_offsets = self.input_batch.num_computed_tokens_cpu[
+                    req_indices_per_req]
+                prompt_lens = self.input_batch.num_prompt_tokens[
+                    req_indices_per_req]
+                if np.any(token_start_offsets +
+                          np.asarray(num_scheduled_tokens_per_req,
+                                     dtype=np.int32) > prompt_lens):
+                    raise NotImplementedError(
+                        "PCP runner path currently supports prompt-only "
+                        "prefill chunks.")
+                mrope_slice = None
+                if self.uses_mrope:
+                    mrope_start = token_offset
+                    mrope_end = token_offset + padded_num_scheduled_tokens_per_dp_rank
+                    mrope_slice = self.mrope_positions_cpu[:, mrope_start:
+                                                           mrope_end]
+                # This helper rewrites the full padded per-DP slice and clears
+                # padding entries before placing valid rank-major PCP tokens.
+                pcp_inverse_order_by_dp_rank[
+                    dp_rank] = _apply_pcp_rank_major_token_order(
+                        input_ids_cpu,
+                        positions_cpu,
+                        num_scheduled_tokens_per_req,
+                        pcp_size,
+                        cp_kv_cache_interleave_size,
+                        padded_num_scheduled_tokens_per_dp_rank,
+                        mrope_slice,
+                        token_start_offsets_per_req=token_start_offsets,
+                    )
+            else:
+                input_ids_cpu[total_num_scheduled_tokens:] = 0
 
         # Prepare the attention metadata (query_start_loc_cpu, seq_lens_cpu)
         for dp_rank in range(dp_size):
@@ -1776,10 +2523,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             logits_indices_cpu = logits_indices_view[
                 req_offset:req_offset + padded_num_reqs_per_dp_rank]
-            logits_indices_cpu[:_num_reqs] = (
-                query_start_loc_view[query_loc_req_offset +
-                                     1:query_loc_req_offset + _num_reqs + 1] -
-                1)
+            if use_pcp and _num_reqs > 0:
+                token_offset = padded_num_scheduled_tokens_per_dp_rank * dp_rank
+                local_request_ends = np.cumsum(
+                    scheduled_tokens_per_dp_rank[dp_rank],
+                    dtype=np.int64) - 1
+                logits_indices_cpu[:_num_reqs] = (
+                    pcp_inverse_order_by_dp_rank[dp_rank][local_request_ends] +
+                    token_offset)
+            else:
+                local_logits_indices = (
+                    query_start_loc_view[query_loc_req_offset +
+                                         1:query_loc_req_offset + _num_reqs +
+                                         1] - 1)
+                if pcp_size > 1:
+                    local_logits_indices = (
+                        local_logits_indices +
+                        padded_num_scheduled_tokens_per_dp_rank * dp_rank)
+                logits_indices_cpu[:_num_reqs] = local_logits_indices
             logits_indices_cpu[_num_reqs:] = -1
 
             # Calculate batch composition statistics for active hardware profilers
@@ -1802,8 +2563,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         _request_distribution = []
         for dp_rank in range(dp_size):
             _num_reqs = num_req_per_dp_rank[dp_rank]
-            # The batch has been reordered by _reorder_batch so decode requests come first
-            # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
+            # The batch has been reordered by _reorder_batch so single-token
+            # requests come first. They use decode-shaped RPA even if the token
+            # is a prompt continuation.
             num_decode_in_dp_rank = 0
             for req_id in req_ids_dp[dp_rank]:
                 if scheduler_output.num_scheduled_tokens[req_id] == 1:
@@ -1831,7 +2593,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.mesh,
             self.input_batch,
             padded_num_reqs,
-            sharding=data_parallel_attn_sharding,
+            sharding=metadata_sharding,
         )
 
         if self.uses_mrope:
@@ -1846,7 +2608,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             positions = device_array(self.mesh,
                                      positions,
-                                     sharding=data_parallel_attn_sharding)
+                                     sharding=token_data_sharding)
+
+        block_table_views_by_gid: dict[int, np.ndarray] = {}
 
         # Collect block tables host arrays loops zone presence zones legality
         def build_block_table_host(kv_cache_gid: int) -> None:
@@ -1855,6 +2619,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             block_tables_view = self.device_buffer.get_view(
                 (self.max_num_reqs, block_table_obj.max_num_blocks_per_req),
                 key=f"block_tables_gid_{kv_cache_gid}")
+            block_table_views_by_gid[kv_cache_gid] = block_tables_view
 
             # Zero out the view once for correct padding
             block_tables_view.fill(0)
@@ -1881,6 +2646,85 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups):
                 build_block_table_host(gid)
+
+        pcp_attention_metadata_by_gid: dict[int, dict[str, jax.Array]] = {}
+        if (use_pcp or use_pcp_decode) and block_table_views_by_gid:
+            for gid, block_tables_view in block_table_views_by_gid.items():
+                if use_pcp:
+                    metadata_per_dp = []
+                    for dp_rank in range(dp_size):
+                        req_offset = dp_rank * max_num_reqs_per_dp_rank
+                        _num_reqs = num_req_per_dp_rank[dp_rank]
+                        metadata_per_dp.append(
+                            _build_pcp_attention_metadata(
+                                scheduled_tokens_per_dp_rank[dp_rank],
+                                seq_lens_view[req_offset:req_offset +
+                                              _num_reqs].copy(),
+                                block_tables_view[req_offset:req_offset +
+                                                  max_num_reqs_per_dp_rank],
+                                pcp_size,
+                                cp_kv_cache_interleave_size,
+                                padded_num_scheduled_tokens_per_dp_rank,
+                                max_num_reqs_per_dp_rank,
+                                self.block_size,
+                            ))
+                    host_pcp_metadata = _merge_pcp_attention_metadata(
+                        metadata_per_dp)
+                    (pcp_kv_lens, pcp_page_indices, pcp_query_start_loc,
+                     pcp_request_distribution, pcp_q_start_offsets,
+                     pcp_cu_k_lens, pcp_slot_ids) = device_array(
+                         self.mesh, (host_pcp_metadata.kv_lens,
+                                     host_pcp_metadata.page_indices,
+                                     host_pcp_metadata.query_start_loc,
+                                     host_pcp_metadata.request_distribution,
+                                     host_pcp_metadata.q_start_offsets,
+                                     host_pcp_metadata.cu_k_lens,
+                                     host_pcp_metadata.slot_ids),
+                         sharding=token_data_sharding)
+                    pcp_attention_metadata_by_gid[gid] = {
+                        "pcp_kv_lens": pcp_kv_lens,
+                        "pcp_page_indices": pcp_page_indices,
+                        "pcp_query_start_loc": pcp_query_start_loc,
+                        "pcp_request_distribution": pcp_request_distribution,
+                        "pcp_q_start_offsets": pcp_q_start_offsets,
+                        "pcp_cu_k_lens": pcp_cu_k_lens,
+                        "pcp_slot_ids": pcp_slot_ids,
+                    }
+                else:
+                    metadata_per_dp = []
+                    for dp_rank in range(dp_size):
+                        req_offset = dp_rank * max_num_reqs_per_dp_rank
+                        _num_reqs = num_req_per_dp_rank[dp_rank]
+                        metadata_per_dp.append(
+                            _build_pcp_decode_attention_metadata(
+                                seq_lens_view[req_offset:req_offset +
+                                              _num_reqs].copy(),
+                                block_tables_view[req_offset:req_offset +
+                                                  max_num_reqs_per_dp_rank],
+                                self.block_size,
+                                pcp_size,
+                                cp_kv_cache_interleave_size,
+                                padded_num_scheduled_tokens_per_dp_rank,
+                                max_num_reqs_per_dp_rank,
+                                scheduled_tokens_per_dp_rank[dp_rank],
+                            ))
+                    host_slot_ids = np.concatenate(
+                        [m["slot_ids"] for m in metadata_per_dp])
+                    host_source_block_tables = np.concatenate(
+                        [m["source_block_tables"] for m in metadata_per_dp],
+                        axis=0)
+                    pcp_slot_ids = device_array(
+                        self.mesh,
+                        host_slot_ids,
+                        sharding=token_data_sharding)
+                    pcp_source_block_tables = device_array(
+                        self.mesh,
+                        host_source_block_tables,
+                        sharding=source_block_tables_sharding)
+                    pcp_attention_metadata_by_gid[gid] = {
+                        "pcp_slot_ids": pcp_slot_ids,
+                        "pcp_source_block_tables": pcp_source_block_tables,
+                    }
 
         metadata_blob, metadata_layout = self.device_buffer.build()
 
@@ -1909,16 +2753,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              dev_arrays_payload) = device_array(
                  self.mesh, (request_distribution, mamba_state_indices_cpu,
                              metadata_blob),
-                 sharding=data_parallel_attn_sharding)
+                 sharding=metadata_sharding)
         else:
             mamba_state_indices = None
             (request_distribution, dev_arrays_payload) = device_array(
                 self.mesh, (request_distribution, metadata_blob),
-                sharding=data_parallel_attn_sharding)
+                sharding=metadata_sharding)
 
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
         input_ids = metadata["input_ids"]
+        if use_pcp:
+            input_ids = jax.device_put(input_ids, token_data_sharding)
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
@@ -1930,7 +2776,28 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             seq_lens, positions = self._subtract_num_rejected_tokens(
                 seq_lens, positions, scheduled_tokens_per_dp_rank[0])
 
-        def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
+        # Build GDN reorder indices for PCP prefill. Each DP rank's token_order
+        # maps packed-rank-major position → original sequential position.
+        pcp_gdn_reorder_indices: jax.Array | None = None
+        if use_pcp and self.kv_cache_config.has_mamba_layers:
+            gdn_reorder_parts = []
+            for dp_rank in range(dp_size):
+                token_order, _ = _build_pcp_rank_major_token_order(
+                    scheduled_tokens_per_dp_rank[dp_rank],
+                    pcp_size,
+                    cp_kv_cache_interleave_size,
+                    padded_num_scheduled_tokens_per_dp_rank,
+                )
+                gdn_reorder_parts.append(token_order.astype(np.int32))
+            pcp_gdn_reorder_cpu = np.concatenate(gdn_reorder_parts)
+            pcp_gdn_reorder_indices = device_array(
+                self.mesh, pcp_gdn_reorder_cpu,
+                sharding=token_data_sharding)
+
+        def build_attn(block_tables: jax.Array | None,
+                       gid: int | None = None) -> AttentionMetadata:
+            pcp_metadata = (pcp_attention_metadata_by_gid.get(gid, {})
+                            if gid is not None else {})
             attention_metadata_gid = AttentionMetadata(
                 input_positions=positions,
                 block_tables=block_tables,
@@ -1938,6 +2805,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
+                pcp_kv_lens=pcp_metadata.get("pcp_kv_lens"),
+                pcp_page_indices=pcp_metadata.get("pcp_page_indices"),
+                pcp_query_start_loc=pcp_metadata.get("pcp_query_start_loc"),
+                pcp_request_distribution=pcp_metadata.get(
+                    "pcp_request_distribution"),
+                pcp_q_start_offsets=pcp_metadata.get("pcp_q_start_offsets"),
+                pcp_cu_k_lens=pcp_metadata.get("pcp_cu_k_lens"),
+                pcp_slot_ids=pcp_metadata.get("pcp_slot_ids"),
+                pcp_source_block_tables=pcp_metadata.get(
+                    "pcp_source_block_tables"),
+                pcp_gdn_reorder_indices=pcp_gdn_reorder_indices,
                 padded_num_reqs=attn_padded_num_reqs,
             )
 
@@ -1951,10 +2829,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
             block_tables = metadata.get(
                 "block_tables_gid_0") if not no_kv_cache else None
-            attention_metadata = build_attn(block_tables)
+            attention_metadata = build_attn(block_tables,
+                                            None if no_kv_cache else 0)
         else:
             attention_metadata = {
-                name: build_attn(metadata[f"block_tables_gid_{gid}"])
+                name: build_attn(metadata[f"block_tables_gid_{gid}"], gid)
                 for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names

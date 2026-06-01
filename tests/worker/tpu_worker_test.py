@@ -34,14 +34,17 @@ def mock_vllm_config():
     mock_cache_conf.gpu_memory_utilization = 0.9
     mock_cache_conf.num_gpu_blocks = 0
     mock_cache_conf.num_cpu_blocks = 0
+    mock_cache_conf.num_gpu_blocks_override = None
 
     mock_parallel_conf = MagicMock()
     mock_parallel_conf.tensor_parallel_size = 2
     mock_parallel_conf.data_parallel_size = 1
     mock_parallel_conf.pipeline_parallel_size = 1
+    mock_parallel_conf.prefill_context_parallel_size = 1
     mock_parallel_conf.nnodes = 1
     mock_parallel_conf.nnodes_within_dp = 1
     mock_parallel_conf.enable_elastic_ep = False
+    mock_parallel_conf.cpu_distributed_timeout_seconds = None
 
     mock_additional_config = {}
 
@@ -261,6 +264,7 @@ class TestTPUWorker:
     def test_determine_available_memory(self, mock_utils, mock_vllm_config):
         """Tests the available HBM memory calculation."""
         # Setup mock return for hbm_usage_bytes: [(used_bytes, limit_bytes), ...]
+        mock_utils.GBYTES = 1024**3
         mock_utils.hbm_usage_bytes.return_value = [
             (100 * 1024**3, 1000 * 1024**3), (200 * 1024**3, 1000 * 1024**3)
         ]
@@ -280,6 +284,50 @@ class TestTPUWorker:
         # Total free = 1800 - 300 = 1500 GiB
         expected_mem = 1500 * 1024**3
         assert available_mem == expected_mem
+
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory_keeps_aggregate_hbm_for_pcp_sharded_kv(
+            self, mock_utils, mock_vllm_config):
+        """PCP sharded KV sizing consumes aggregate worker HBM."""
+        gib = 1024**3
+        mock_utils.GBYTES = gib
+        mock_utils.hbm_usage_bytes.return_value = [(10 * gib, 100 * gib)] * 8
+        mock_vllm_config.parallel_config.prefill_context_parallel_size = 8
+        mock_devices = [f'tpu:{i}' for i in range(8)]
+        worker = TPUWorker(vllm_config=mock_vllm_config,
+                           local_rank=0,
+                           rank=0,
+                           distributed_init_method="test_method",
+                           devices=mock_devices)
+
+        available_mem = worker.determine_available_memory()
+
+        mock_utils.hbm_usage_bytes.assert_called_once_with(mock_devices)
+        # PCP cache is sharded across the worker devices. Keep aggregate HBM;
+        # KV cache page sizing encodes the KV_CACHE_BLOCK shard count so vLLM
+        # computes per-device local blocks from aggregate memory.
+        # limit: 8 * 100 GiB, cap: 800 * 0.9 = 720 GiB,
+        # used: 8 * 10 GiB, raw available: 640 GiB.
+        assert available_mem == 640 * gib
+
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory_override_does_not_change_hbm_probe(
+            self, mock_utils, mock_vllm_config):
+        gib = 1024**3
+        mock_utils.GBYTES = gib
+        mock_utils.hbm_usage_bytes.return_value = [(10 * gib, 100 * gib)] * 8
+        mock_vllm_config.parallel_config.prefill_context_parallel_size = 8
+        mock_vllm_config.cache_config.num_gpu_blocks_override = 128
+        mock_devices = [f'tpu:{i}' for i in range(8)]
+        worker = TPUWorker(vllm_config=mock_vllm_config,
+                           local_rank=0,
+                           rank=0,
+                           distributed_init_method="test_method",
+                           devices=mock_devices)
+
+        available_mem = worker.determine_available_memory()
+
+        assert available_mem == 640 * gib
 
     #
     # --- Core Logic Tests ---

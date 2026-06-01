@@ -45,10 +45,21 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tpu_inference import envs
+from tpu_inference.core.sched.pcp_scheduler import get_base_scheduler_cls
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import time_function
 
 logger = init_logger(__name__)
+
+
+def _get_per_rank_num_blocks(vllm_config: Any, num_blocks: int,
+                             dp_size: int) -> int:
+    """Return the KV block count that each child scheduler should see."""
+    sharding_config = getattr(vllm_config, "sharding_config", None)
+    if (getattr(sharding_config, "kv_cache_num_blocks_are_per_dp_rank", False)
+            is True):
+        return num_blocks
+    return num_blocks // dp_size
 
 
 class SchedulerCommand(Enum):
@@ -478,9 +489,11 @@ class DPScheduler(SchedulerInterface):
 
     def _create_per_rank_configs(self, kv_cache_config: KVCacheConfig) -> None:
         self.per_rank_kv_cache_configs: List[KVCacheConfig] = []
+        per_rank_num_blocks = _get_per_rank_num_blocks(
+            self.vllm_config, kv_cache_config.num_blocks, self.dp_size)
         for _ in range(self.dp_size):
             rank_kv_config = copy.deepcopy(kv_cache_config)
-            rank_kv_config.num_blocks = kv_cache_config.num_blocks // self.dp_size
+            rank_kv_config.num_blocks = per_rank_num_blocks
             self.per_rank_kv_cache_configs.append(rank_kv_config)
 
     def _send_command(self,
@@ -1380,6 +1393,7 @@ def update_vllm_config_for_dp_scheduler(vllm_config: Any) -> None:
         if vllm_config.scheduler_config.async_scheduling:
             vllm_config.scheduler_config._original_scheduler_cls = AsyncScheduler
         else:
-            vllm_config.scheduler_config._original_scheduler_cls = Scheduler
+            vllm_config.scheduler_config._original_scheduler_cls = (
+                get_base_scheduler_cls(vllm_config))
 
         vllm_config.scheduler_config.scheduler_cls = DPScheduler

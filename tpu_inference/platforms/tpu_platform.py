@@ -82,6 +82,28 @@ else:
 logger = init_logger(__name__)
 
 
+def _patch_torch_accelerator_empty_cache_for_jax_tpu() -> None:
+    """Avoid PyTorch accelerator cache cleanup on the JAX TPU backend."""
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is None or getattr(accelerator,
+                                      "_tpu_inference_empty_cache_noop",
+                                      False):
+        return
+    empty_cache = getattr(accelerator, "empty_cache", None)
+    if empty_cache is None:
+        return
+
+    def _noop_empty_cache(*args, **kwargs):
+        return None
+
+    _noop_empty_cache.__wrapped__ = empty_cache
+    accelerator.empty_cache = _noop_empty_cache
+    accelerator._tpu_inference_empty_cache_noop = True
+
+
+_patch_torch_accelerator_empty_cache_for_jax_tpu()
+
+
 class TpuPlatform(Platform):
     _enum = PlatformEnum.TPU
     device_name: str = "tpu"
@@ -248,6 +270,19 @@ class TpuPlatform(Platform):
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        if (isinstance(pcp_size, int) and pcp_size > 1
+                and getattr(scheduler_config, "async_scheduling", False)
+                is True):
+            raise ValueError(
+                "PCP runner path does not support async scheduling yet. "
+                "Set async_scheduling=False when using "
+                "prefill_context_parallel_size > 1.")
+        if isinstance(pcp_size, int) and pcp_size > 1:
+            from tpu_inference.core.sched.pcp_scheduler import \
+                update_vllm_config_for_pcp_scheduler
+            update_vllm_config_for_pcp_scheduler(vllm_config)
+
         parallel_config.worker_cls = \
                         "tpu_inference.worker.tpu_worker.TPUWorker"
 

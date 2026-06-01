@@ -26,8 +26,9 @@ from vllm.v1.outputs import LogprobsLists, ModelRunnerOutput
 from vllm.v1.request import Request
 
 from tpu_inference.core.sched.dp_scheduler import (
-    DPScheduler, DPSchedulerOutput, SchedulerCommand,
+    DPScheduler, DPSchedulerOutput, SchedulerCommand, _get_per_rank_num_blocks,
     update_vllm_config_for_dp_scheduler)
+from tpu_inference.core.sched.pcp_scheduler import PcpAwareScheduler
 
 
 def _make_mock_mp_context():
@@ -127,6 +128,31 @@ class TestDPScheduler:
                 # Verify processes were started
                 mock_process = mock_ctx.Process.return_value
                 assert mock_process.start.call_count == 2
+
+    def test_init_preserves_local_kv_blocks_when_reported_per_rank(
+        self,
+        mock_vllm_config,
+        mock_kv_cache_config,
+        mock_structured_output_manager,
+    ):
+        """Same-worker TPU DP receives already-local KV block counts."""
+        mock_vllm_config.sharding_config.kv_cache_num_blocks_are_per_dp_rank = True
+
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+
+        for rank_config in scheduler.per_rank_kv_cache_configs:
+            assert rank_config.num_blocks == mock_kv_cache_config.num_blocks
+
+    def test_get_per_rank_num_blocks_keeps_legacy_global_pool_semantics(
+            self, mock_vllm_config):
+        assert _get_per_rank_num_blocks(mock_vllm_config, 100, 2) == 50
+
+    def test_get_per_rank_num_blocks_keeps_tpu_local_pool_semantics(
+            self, mock_vllm_config):
+        mock_vllm_config.sharding_config.kv_cache_num_blocks_are_per_dp_rank = True
+        assert _get_per_rank_num_blocks(mock_vllm_config, 100, 2) == 100
 
     def test_init_with_prefix_caching_enabled(
         self,
@@ -987,6 +1013,7 @@ class TestUpdateVllmConfigForDPScheduler:
         """Test Config is updated when DP size > 1."""
         mock_config = MagicMock()
         mock_config.sharding_config.total_dp_size = 2
+        mock_config.parallel_config.prefill_context_parallel_size = 1
         mock_config.scheduler_config._original_scheduler_cls = None
         mock_config.scheduler_config.scheduler_cls = "vllm.v1.core.sched.scheduler.Scheduler"
         mock_config.scheduler_config.async_scheduling = False
@@ -997,10 +1024,27 @@ class TestUpdateVllmConfigForDPScheduler:
         assert mock_config.scheduler_config._original_scheduler_cls == Scheduler
         assert mock_config.scheduler_config.scheduler_cls == DPScheduler
 
+    def test_update_config_with_dp_and_pcp_uses_pcp_aware_inner_scheduler(
+            self):
+        """Test DP scheduler workers inherit PCP scheduling constraints."""
+        mock_config = MagicMock()
+        mock_config.sharding_config.total_dp_size = 2
+        mock_config.parallel_config.prefill_context_parallel_size = 2
+        mock_config.scheduler_config._original_scheduler_cls = None
+        mock_config.scheduler_config.scheduler_cls = "vllm.v1.core.sched.scheduler.Scheduler"
+        mock_config.scheduler_config.async_scheduling = False
+
+        update_vllm_config_for_dp_scheduler(mock_config)
+
+        assert mock_config.scheduler_config._original_scheduler_cls == (
+            PcpAwareScheduler)
+        assert mock_config.scheduler_config.scheduler_cls == DPScheduler
+
     def test_update_config_with_dp_size_one(self):
         """Test that config is NOT updated when DP size == 1."""
         mock_config = MagicMock()
         mock_config.sharding_config.total_dp_size = 1
+        mock_config.parallel_config.prefill_context_parallel_size = 1
         original_scheduler_cls = "vllm.v1.core.sched.scheduler.Scheduler"
         mock_config.scheduler_config.scheduler_cls = original_scheduler_cls
 
