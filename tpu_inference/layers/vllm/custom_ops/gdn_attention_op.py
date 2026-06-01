@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -24,8 +26,9 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
     QwenGatedDeltaNetAttention
 
 from tpu_inference import envs
-from tpu_inference.layers.common.gdn_attention import (GdnAttentionConfig,
-                                                       run_jax_gdn_attention)
+from tpu_inference.layers.common.gdn_attention import (
+    GdnAttentionConfig, run_jax_gdn_attention,
+    run_jax_gdn_attention_pcp_prefill)
 from tpu_inference.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -37,6 +40,92 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import \
 from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
+
+
+def _gdn_trace_stage_prefix(layer_prefix: str) -> str:
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_prefix)
+    if match:
+        return f"layer.{int(match.group(1)):02d}.linear_attention.gdn"
+    return f"{layer_prefix}.gdn"
+
+
+def _trace_gdn_tensor(layer_prefix: str, stage: str,
+                      value: torch.Tensor) -> torch.Tensor:
+    try:
+        from tpu_inference.models.vllm.experimental.qwen3_layer_trace import (
+            trace_torch_tensor)
+
+        trace_torch_tensor(f"{_gdn_trace_stage_prefix(layer_prefix)}.{stage}",
+                           value)
+    except Exception as exc:  # pragma: no cover - tracing must be best effort.
+        logger.warning_once("Unable to trace GDN tensor %s: %s", stage, exc)
+    return value
+
+
+def _trace_gdn_jax_array(layer_prefix: str,
+                         stage: str,
+                         value,
+                         *,
+                         dtype: str = "") -> None:
+    try:
+        from tpu_inference.models.vllm.experimental.qwen3_layer_trace import (
+            trace_jax_array)
+
+        trace_jax_array(f"{_gdn_trace_stage_prefix(layer_prefix)}.{stage}",
+                        value,
+                        dtype=dtype)
+    except Exception as exc:  # pragma: no cover - tracing must be best effort.
+        logger.warning_once("Unable to trace GDN array %s: %s", stage, exc)
+
+
+def _jax_dtype_for_torch_dtype(torch_dtype: torch.dtype):
+    torch_to_jax_dtype = {
+        torch.bfloat16: jnp.bfloat16,
+        torch.float16: jnp.float16,
+        torch.float32: jnp.float32,
+        torch.float64: jnp.float64,
+        torch.int8: jnp.int8,
+        torch.int16: jnp.int16,
+        torch.int32: jnp.int32,
+        torch.int64: jnp.int64,
+    }
+    return torch_to_jax_dtype.get(torch_dtype)
+
+
+def _cast_jax_output_to_buffer_dtype(j_output, output_buffer: torch.Tensor):
+    """Cast JAX output to the destination TorchAX buffer dtype before copy_."""
+    if not hasattr(j_output, "astype"):
+        return j_output
+    target_dtype = _jax_dtype_for_torch_dtype(
+        getattr(output_buffer, "dtype", None))
+    if target_dtype is None:
+        try:
+            target_dtype = jax_view(output_buffer).dtype
+        except Exception:
+            return j_output
+    if getattr(j_output, "dtype", None) == target_dtype:
+        return j_output
+    return j_output.astype(target_dtype)
+
+
+def _cast_torchax_tensor_to_torch_dtype(tensor: torch.Tensor,
+                                        torch_dtype: torch.dtype):
+    target_dtype = _jax_dtype_for_torch_dtype(torch_dtype)
+    if target_dtype is None:
+        return tensor
+    try:
+        arr = jax_view(tensor)
+        # Some TorchAX/JAX fused paths can keep a bf16-typed value as an
+        # unrounded fp32 expression when all downstream users immediately
+        # upcast it again. Force a real round-trip at this boundary so PCP and
+        # non-PCP paths observe the same dtype semantics.
+        if target_dtype in (jnp.bfloat16, jnp.float16):
+            casted = arr.astype(jnp.float32).astype(target_dtype)
+        else:
+            casted = arr.astype(target_dtype)
+        return torch_view(jax.lax.optimization_barrier(casted))
+    except Exception:
+        return tensor
 
 
 def gdn_attention_core_tpu(
@@ -90,7 +179,7 @@ def gdn_attention_core_tpu(
     key_dim = n_kq * d_k
     value_dim = n_v * d_v
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
-    dp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA)
+    dp_size = get_mesh_shape_product(mesh, ShardingAxisName.BATCH)
 
     j_mixed_qkv = reorder_concatenated_tensor_for_sharding(
         j_mixed_qkv, [key_dim, key_dim, value_dim], tp_size, -1)
@@ -137,28 +226,58 @@ def gdn_attention_core_tpu(
     seq_lens_sliced = truncate_sharded_tensor(attn_metadata.seq_lens,
                                               padded_num_reqs_per_dp, dp_size)
 
-    (new_conv_state_extracted,
-     new_recurrent_state), j_output = run_jax_gdn_attention(
-         j_mixed_qkv,
-         j_b,
-         j_a,
-         conv_state_in,
-         recurrent_state,
-         j_conv_weight,
-         j_conv_bias,
-         j_A_log,
-         j_dt_bias,
-         state_indices_sliced,
-         query_start_loc_sliced,
-         attn_metadata.request_distribution,
-         seq_lens_sliced,
-         n_kq,
-         n_v,
-         d_k,
-         d_v,
-         kernel_size,
-         mesh=mesh,
-         config=config)
+    pcp_size = get_mesh_shape_product(mesh, ShardingAxisName.PREFILL_CONTEXT)
+    use_pcp_prefill = (pcp_size > 1
+                       and attn_metadata.pcp_gdn_reorder_indices is not None)
+
+    if use_pcp_prefill:
+        (new_conv_state_extracted,
+         new_recurrent_state), j_output = run_jax_gdn_attention_pcp_prefill(
+             j_mixed_qkv,
+             j_b,
+             j_a,
+             conv_state_in,
+             recurrent_state,
+             j_conv_weight,
+             j_conv_bias,
+             j_A_log,
+             j_dt_bias,
+             state_indices_sliced,
+             query_start_loc_sliced,
+             attn_metadata.request_distribution,
+             seq_lens_sliced,
+             attn_metadata.pcp_gdn_reorder_indices,
+             n_kq,
+             n_v,
+             d_k,
+             d_v,
+             kernel_size,
+             pcp_size=pcp_size,
+             mesh=mesh,
+             config=config)
+    else:
+        (new_conv_state_extracted,
+         new_recurrent_state), j_output = run_jax_gdn_attention(
+             j_mixed_qkv,
+             j_b,
+             j_a,
+             conv_state_in,
+             recurrent_state,
+             j_conv_weight,
+             j_conv_bias,
+             j_A_log,
+             j_dt_bias,
+             state_indices_sliced,
+             query_start_loc_sliced,
+             attn_metadata.request_distribution,
+             seq_lens_sliced,
+             n_kq,
+             n_v,
+             d_k,
+             d_v,
+             kernel_size,
+             mesh=mesh,
+             config=config)
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]
         new_conv_state = jnp.concatenate(
@@ -169,6 +288,13 @@ def gdn_attention_core_tpu(
     vllm_context.kv_caches[layer_idx] = (new_conv_state, new_recurrent_state)
 
     j_output_flat = j_output.reshape(core_attn_out.shape)
+    _trace_gdn_jax_array(layer_name, "core.j_output", j_output_flat)
+    j_output_flat = _cast_jax_output_to_buffer_dtype(j_output_flat,
+                                                     core_attn_out)
+    _trace_gdn_jax_array(layer_name,
+                         "core.j_output_cast",
+                         j_output_flat,
+                         dtype=str(core_attn_out.dtype))
     core_attn_out.copy_(torch_view(j_output_flat))
 
 
@@ -192,6 +318,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_model_wrapper_context = get_vllm_model_wrapper_context()
         mesh = vllm_model_wrapper_context.mesh
         num_tokens = hidden_states.size(0)
+        _trace_gdn_tensor(self.prefix, "input.hidden_states", hidden_states)
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
@@ -200,6 +327,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
             z, _ = self.in_proj_z(hidden_states)
+            mixed_qkv = _cast_torchax_tensor_to_torch_dtype(
+                mixed_qkv, hidden_states.dtype)
+            ba = _cast_torchax_tensor_to_torch_dtype(ba, hidden_states.dtype)
+            z = _cast_torchax_tensor_to_torch_dtype(z, hidden_states.dtype)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
@@ -207,6 +338,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         else:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _cast_torchax_tensor_to_torch_dtype(
+                mixed_qkvz, hidden_states.dtype)
+            ba = _cast_torchax_tensor_to_torch_dtype(ba, hidden_states.dtype)
+            _trace_gdn_tensor(self.prefix, "mixed_qkvz", mixed_qkvz)
 
             if self.gqa_interleaved_layout:
                 # Qwen3-Next: unpack the interleaved GQA layout
@@ -225,6 +360,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 b, a = ba.chunk(2, dim=-1)
                 b = b.contiguous()
                 a = a.contiguous()
+        _trace_gdn_tensor(self.prefix, "mixed_qkv", mixed_qkv)
+        _trace_gdn_tensor(self.prefix, "b", b)
+        _trace_gdn_tensor(self.prefix, "a", a)
+        _trace_gdn_tensor(self.prefix, "z", z)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -243,10 +382,17 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                                core_attn_out,
                                self.prefix,
                                mesh=mesh)
+        core_attn_out = _cast_torchax_tensor_to_torch_dtype(
+            core_attn_out, hidden_states.dtype)
+        _trace_gdn_tensor(self.prefix, "core_attn_out", core_attn_out)
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
         core_attn_out = self.norm(core_attn_out, z)
+        _trace_gdn_tensor(self.prefix, "norm.output", core_attn_out)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        _trace_gdn_tensor(self.prefix, "out_proj.input", core_attn_out)
+        projected, _ = self.out_proj(core_attn_out)
+        _trace_gdn_tensor(self.prefix, "out_proj.output", projected)
+        output[:num_tokens] = projected

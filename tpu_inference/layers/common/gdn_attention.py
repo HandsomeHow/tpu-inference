@@ -243,33 +243,33 @@ def run_jax_gdn_attention(
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
     in_specs = (
-        P(ShardingAxisName.ATTN_DATA,
+        P(ShardingAxisName.BATCH,
           ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
-        P(ShardingAxisName.ATTN_DATA, None,
+        P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD),  # j_b
+        P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD),  # j_a
+        P(ShardingAxisName.BATCH, None,
           ShardingAxisName.ATTN_HEAD),  # conv_state
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
+        P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD, None,
           None),  # recurrent_state
         P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
         P(ShardingAxisName.ATTN_HEAD)
         if j_conv_bias is not None else None,  # j_conv_bias
         P(ShardingAxisName.ATTN_HEAD),  # j_A_log
         P(ShardingAxisName.ATTN_HEAD),  # j_dt_bias
-        P(ShardingAxisName.ATTN_DATA),  # query_start_loc
-        P(ShardingAxisName.ATTN_DATA),  # state_indices
-        P(ShardingAxisName.ATTN_DATA),  # distribution
-        P(ShardingAxisName.ATTN_DATA),  # seq_lens
+        P(ShardingAxisName.BATCH),  # query_start_loc
+        P(ShardingAxisName.BATCH),  # state_indices
+        P(ShardingAxisName.BATCH),  # distribution
+        P(ShardingAxisName.BATCH),  # seq_lens
     )
 
     out_specs = (
         (
-            P(ShardingAxisName.ATTN_DATA, None,
+            P(ShardingAxisName.BATCH, None,
               ShardingAxisName.ATTN_HEAD),  # new_conv_state
-            P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
+            P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD, None,
               None),  # new_recurrent_state
         ),
-        P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # output
+        P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD),  # output
     )
 
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
@@ -306,6 +306,175 @@ def run_jax_gdn_attention(
         state_indices,
         distribution,
         seq_lens,
+    )
+
+    return (new_conv_state, new_recurrent_state), output
+
+
+def run_jax_gdn_attention_pcp_prefill(
+    j_mixed_qkv: jnp.ndarray,
+    j_b: jnp.ndarray,
+    j_a: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    j_conv_weight: jnp.ndarray,
+    j_conv_bias: Optional[jnp.ndarray],
+    j_A_log: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    reorder_indices: jnp.ndarray,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pcp_size: int,
+    mesh: jax.sharding.Mesh,
+    config: GdnAttentionConfig = GdnAttentionConfig(),
+) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """GDN attention for PCP prefill: AllGather + reorder + compute + scatter.
+
+    During PCP prefill, tokens are distributed across PCP ranks in rank-major
+    interleaved order. GDN has sequential state dependencies, so we must
+    reconstruct the full ordered sequence before running the recurrent scan.
+
+    Strategy: AllGather tokens across PCP -> reorder to original sequential
+    order -> run full GDN (redundant on all ranks) -> reorder output back ->
+    take local slice. All ranks produce identical state updates.
+
+    Args:
+        reorder_indices: (padded_num_tokens_per_dp,) int32 maps packed
+            rank-major position -> original sequential position. -1 = padding.
+        pcp_size: Number of PCP ranks.
+        Other args: same as run_jax_gdn_attention.
+    """
+    pcp_axis = ShardingAxisName.PREFILL_CONTEXT
+
+    # Token arrays include PCP in their sharding (ATTN_DATA = BATCH + pcp).
+    # State/metadata use BATCH only (replicated across PCP ranks).
+    in_specs = (
+        P(ShardingAxisName.ATTN_DATA,
+          ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv (pcp-split)
+        P(ShardingAxisName.ATTN_DATA,
+          ShardingAxisName.ATTN_HEAD),  # j_b (pcp-split)
+        P(ShardingAxisName.ATTN_DATA,
+          ShardingAxisName.ATTN_HEAD),  # j_a (pcp-split)
+        P(ShardingAxisName.BATCH, None,
+          ShardingAxisName.ATTN_HEAD),  # conv_state (pcp-replicated)
+        P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD,
+          None, None),  # recurrent_state (pcp-replicated)
+        P(ShardingAxisName.ATTN_HEAD, None, None),  # j_conv_weight
+        P(ShardingAxisName.ATTN_HEAD)
+        if j_conv_bias is not None else None,  # j_conv_bias
+        P(ShardingAxisName.ATTN_HEAD),  # j_A_log
+        P(ShardingAxisName.ATTN_HEAD),  # j_dt_bias
+        P(ShardingAxisName.BATCH),  # query_start_loc (pcp-replicated)
+        P(ShardingAxisName.BATCH),  # state_indices (pcp-replicated)
+        P(ShardingAxisName.BATCH),  # distribution (pcp-replicated)
+        P(ShardingAxisName.BATCH),  # seq_lens (pcp-replicated)
+        P(ShardingAxisName.ATTN_DATA),  # reorder_indices (pcp-split)
+    )
+
+    out_specs = (
+        (
+            P(ShardingAxisName.BATCH, None,
+              ShardingAxisName.ATTN_HEAD),  # new_conv_state
+            P(ShardingAxisName.BATCH, ShardingAxisName.ATTN_HEAD,
+              None, None),  # new_recurrent_state
+        ),
+        P(ShardingAxisName.ATTN_DATA,
+          ShardingAxisName.ATTN_HEAD),  # output (pcp-split)
+    )
+
+    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+
+    def _pcp_prefill_fn(
+        local_qkv, local_b, local_a,
+        conv_state_, recurrent_state_,
+        conv_weight_, conv_bias_,
+        A_log_, dt_bias_,
+        query_start_loc_, state_indices_, distribution_, seq_lens_,
+        local_reorder_indices,
+    ):
+        # AllGather token data across PCP ranks
+        full_qkv = jax.lax.all_gather(
+            local_qkv, axis_name=pcp_axis, axis=0, tiled=True)
+        full_b = jax.lax.all_gather(
+            local_b, axis_name=pcp_axis, axis=0, tiled=True)
+        full_a = jax.lax.all_gather(
+            local_a, axis_name=pcp_axis, axis=0, tiled=True)
+        full_reorder = jax.lax.all_gather(
+            local_reorder_indices, axis_name=pcp_axis, axis=0, tiled=True)
+
+        # Reorder from packed rank-major to original sequential order.
+        # full_reorder[i] = original position for packed position i, or -1.
+        valid_mask = full_reorder >= 0
+        scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
+        gather_indices = jnp.where(valid_mask, full_reorder, 0)
+
+        seq_qkv = jnp.zeros_like(full_qkv)
+        seq_b = jnp.zeros_like(full_b)
+        seq_a = jnp.zeros_like(full_a)
+
+        # Scatter packed -> sequential. Invalid padding entries use an
+        # out-of-bounds index and are dropped instead of overwriting token 0.
+        seq_qkv = seq_qkv.at[scatter_indices].set(full_qkv, mode="drop")
+        seq_b = seq_b.at[scatter_indices].set(full_b, mode="drop")
+        seq_a = seq_a.at[scatter_indices].set(full_a, mode="drop")
+
+        # Run full GDN on sequential order
+        (new_conv, new_rec), seq_output = run_jax_gdn_attention_local(
+            seq_qkv, seq_b, seq_a,
+            conv_state_, recurrent_state_,
+            conv_weight_, conv_bias_,
+            A_log_, dt_bias_,
+            query_start_loc_, state_indices_, distribution_, seq_lens_,
+            n_kq=n_kq // tp_size,
+            n_v=n_v // tp_size,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            config=config,
+        )
+
+        # Gather output back: sequential -> packed rank-major
+        full_output = seq_output[gather_indices]
+        full_output = jnp.where(valid_mask[:, None], full_output, 0.0)
+
+        # Take local slice for this PCP rank
+        local_tokens = full_output.shape[0] // pcp_size
+        rank = jax.lax.axis_index(pcp_axis)
+        local_output = jax.lax.dynamic_slice_in_dim(
+            full_output, rank * local_tokens, local_tokens, axis=0)
+
+        return (new_conv, new_rec), local_output
+
+    mapped_fn = jax.shard_map(
+        _pcp_prefill_fn,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )
+
+    (new_conv_state, new_recurrent_state), output = mapped_fn(
+        j_mixed_qkv,
+        j_b,
+        j_a,
+        conv_state,
+        recurrent_state,
+        j_conv_weight,
+        j_conv_bias,
+        j_A_log,
+        j_dt_bias,
+        query_start_loc,
+        state_indices,
+        distribution,
+        seq_lens,
+        reorder_indices,
     )
 
     return (new_conv_state, new_recurrent_state), output
