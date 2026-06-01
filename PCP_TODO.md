@@ -1,6 +1,6 @@
 # PCP TODO
 
-更新时间：2026-05-27
+更新时间：2026-06-01
 
 ## 当前已验证
 
@@ -17,6 +17,11 @@
 - batched RPA normal paged prefill 已给 `kv_cache_dtype=fp8` 保留额外 VMEM headroom，避免 baseline `RPAm-p256-b2-q512-k512` 在 XLA 编译阶段因 fp8 KV unpack spill 超过 64 MiB VMEM。实机 smoke：`Qwen3-0.6B, DP=1, TP=1, PCP=2, kv_cache_dtype=fp8, max_model_len=128, max_tokens=2, max_num_seqs=2` 通过，4 条 prompt token/text 与 `PCP=1` baseline 完全一致，首 token logprob diff 为 0。结果文件：`/mnt/data/xiaohao/workspace/llm/pcp_correctness_runs/Qwen3-0.6B_pcp2_tp1_dp1_20260527_201838.json`。
 - `Qwen3-0.6B` 当前代码实机 smoke：`DP=1, TP=1, PCP=8, max_model_len=512, max_tokens=8, max_num_seqs=4, no num_gpu_blocks_override` 通过，4 条 prompt token/text 与 `PCP=1` baseline 完全一致，首 token logprob 最大差异 `4.8e-7`。结果文件：`/mnt/data/xiaohao/workspace/llm/pcp_correctness_runs/Qwen3-0.6B_pcp8_tp1_dp1_20260527_233242.json`。
 - `Qwen3.5-397B-A17B-FP8` 配置中的 full-attention 大参数 UT 已覆盖：`32` Q heads、`2` KV heads、`head_dim=256`、`PCP=8`、512 token local-Q/full-KV prefill，`_jax_attn_func -> flash-attn -> batched RPA` 输出与 reference causal attention 对齐。测试：`tests/layers/vllm/backends/test_flash_attn.py::test_jax_attn_func_pcp_qwen35_full_attention_config_matches_reference`。
+- `Qwen3-0.6B` 当前 `feature/pcp_support` + vLLM PCP 依赖 commit 已验证 `SKIP_JAX_PRECOMPILE=0` 的 PCP=8 预编译路径：`TP=1, DP=1, PCP=8, chunked-prefill=512` 可以在 init 阶段完成 backbone bucket 预编译，正式 `generate` 后没有再次触发完整 `jit(step_fun)` backbone 编译。
+- `Qwen3-0.6B` 长 prompt prefill 首 token / logprob 已覆盖 `TP=1, DP=1, PCP=8, chunked-prefill=4K` 下 `2K/4K/8K/64K` 语义无关长 prompt。首 token top-1 稳定，概率差异主要发生在 top 候选接近的位置，未观察到概率质量跑到离谱 token。
+- `Qwen3-0.6B` 已验证 `data=2, TP=2, PCP=2, chunked-prefill=2K` 下 `1K/2K/4K/16K` prefill 首 token/logprob smoke。该组合实际 mesh 为 `data=2, attn_dp=1, model=2, pcp=2`；严格的 `attn_dp=2, final TP=2, PCP=2` 在 Qwen3-0.6B + BF16 + 当前自动 sharding 规则下 8 卡不会被拆出来。
+- `Qwen3-0.6B` 真实语义 decode smoke 已覆盖 `TP=1, DP=1, PCP=8, chunked-prefill=2K, max_tokens=256` 的 `4K/16K` prompt。4K 与 `PCP=1` 不 token-exact，但 quicksort 回答语义正常；16K 与 `PCP=1` 256 个输出 token 完全一致。结果文件：`/mnt/data/xiaohao/workspace/llm/pcp_correctness_runs/qwen3_06b_semantic_decode_pcp1_chunk2k_1780307239.json`、`/mnt/data/xiaohao/workspace/llm/pcp_correctness_runs/qwen3_06b_semantic_decode_pcp8_chunk2k_gmem015_1780307358.json`。
+- `Qwen3-0.6B` 重复 token prompt 的 decode 对比显示 `PCP=8` 不保证与 `PCP=1` token-exact：`1K/2K/4K` 分别在第 `2/6/2` 个 decode step 分叉，`16K` 在首 token 分叉。但分叉点的候选通常在双方 top-2/top-3 内，margin 很小；当前归类为可接受的数值非 bit-exact，而非功能 blocker。对比文件：`/mnt/data/xiaohao/workspace/llm/pcp_correctness_runs/compare_qwen3_06b_decode_baseline_pcp1_chunk2k_1780306332_vs_qwen3_06b_decode_pcp8_chunk2k_gmem015_1780306573.json`。
 
 ## P0：正确性和真实运行阻塞
 
@@ -67,6 +72,7 @@ regular_attn_sharding=P(('data', 'attn_dp', 'attn_dp_expert'), 'dcp', ('model', 
 后续需要做：
 
 - 将真实启动回归固化为可重复脚本或 e2e 测试，避免默认配置退化后只在手工测试里发现。
+- PCP decode materialize/all-gather 对 KV cache block 数敏感。`Qwen3-0.6B, PCP=8, max_model_len=18432, max_tokens=64` 在 `gpu_memory_utilization=0.5` 下曾因 `jit(_jax_attn_func)/shard_map/all_gather` 临时量触发 compile-time HBM OOM；降到 `0.15` 后可跑完。上线配置需要限制 KV cache 规模，或后续优化 decode all-gather/materialize 的临时内存。
 
 ### 3. 真实模型的 PCP + DP>1 generate correctness（已修复并验证多组 smoke）
 
@@ -83,7 +89,7 @@ regular_attn_sharding=P(('data', 'attn_dp', 'attn_dp_expert'), 'dcp', ('model', 
 
 后续需要做：
 
-- 增加更长 prompt、更长 decode token、更多 batch 形态，以及 prompt logprob/top-logprob 对比。
+- 已补充 `TP=1, DP=1, PCP=8` 的长 prompt、chunked-prefill、64/256 token decode、prompt logprob/top-logprob 对比；仍需补充更多 batch 形态和自动化回归。
 - 将真实启动回归固化为脚本或 e2e 测试。
 
 ### 4. 混合 prefill/decode batch 未支持（已在调度层规避）
@@ -106,7 +112,7 @@ regular_attn_sharding=P(('data', 'attn_dp', 'attn_dp_expert'), 'dcp', ('model', 
 注意：
 
 - scheduler 可能让部分 active request 在某轮没有 scheduled token。这种 `0/1` decode batch 不能按 mixed batch 拒绝，否则会挡住正常 generate。
-- partial/chunked prefill 仍未完整验证，后续需要单独处理。
+- partial/chunked prefill 已在 `Qwen3-0.6B` 的单请求长 prompt 场景中做过实机 smoke：`PCP=8, chunked-prefill=2K/4K` 覆盖到 `4K/16K/64K` prompt。仍缺多请求、不同长度混合和在线流量形态。
 - 当前方案是调度期规避 mixed，而不是实现真正的 mixed-mode PCP attention。代价是：当已有 running requests 时，新请求会等到 running 队列清空后再进入，不能做到 decode 与新 prefill 同步连续 batching。
 
 需要做：
@@ -158,7 +164,7 @@ PCP RPA does not support DCP yet.
 
 需要做：
 
-- `Qwen3-0.6B` 上继续扩展更长 prompt、更长 decode token 和更多 batch 形态。
+- `Qwen3-0.6B` 上已补充更长 prompt 和更长 decode token；仍需扩展更多 batch 形态、不同 prompt 长度混合和自动化回归。
 - 大模型上再跑 full attention 层和 MoE 组合的 correctness/perf smoke。
 - 特别检查 `RowParallelLinear` 之后的输出形状和后续 MoE/top-k 对局部 token 的依赖。
 
@@ -169,7 +175,7 @@ Phase 5 已删除 replicated full-KV 回填路径。当前 prefill/decode 都通
 后续仍需关注：
 
 - profile local scatter 本身在长 prefill 下的占比。
-- decode owner-only write + LSE merge 在真实 generate 上继续回归。
+- decode owner-only write / PCP materialize path 已在 `Qwen3-0.6B` 真实语义 generate 上做过 256 token smoke；后续仍需在更大模型和更多 batch 形态继续回归。
 
 ### 8. Decode logits gather 条件偏宽
 
@@ -231,11 +237,16 @@ PCP 下 page/block size 会随 `prefill_cp_size` 放大。短序列可能只使�
 
 ### 13. 数值测试覆盖还需要扩大
 
-已有测试覆盖了 core path，但还缺一些参数组合。
+已有测试覆盖了 core path，并补充了 `Qwen3-0.6B` 长 prompt prefill、真实语义 decode 和重复 token decode 对比。当前结论是 PCP 路径不承诺与 `PCP=1` bit-exact/token-exact；当 top 候选 margin 很小时可能发生 top-1 翻转，但真实语义输出目前未观察到明显质量问题。
 
-需要补：
+已补：
 
 - 更长 prompt、更长 decode token。
+- `TP=1, DP=1, PCP=8` 下 `4K/16K` 真实语义 prompt 256-token decode。
+- `TP=1, DP=1, PCP=8` 下重复 token prompt `1K/2K/4K/16K` 64-token decode 对比。
+
+仍需补：
+
 - 不同 `cp_kv_cache_interleave_size`。
 - 不同 batch size 和不同 prompt 长度混合。
 - `kv_cache_dtype=fp8` 的真实 generate correctness/perf 回归。
