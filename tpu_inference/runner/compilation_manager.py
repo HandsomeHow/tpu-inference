@@ -219,20 +219,34 @@ class CompilationManager:
         assert num_tokens is not None
 
         dp_size = self.runner.vllm_config.sharding_config.total_dp_size
-        dp_sharding = NamedSharding(
+        parallel_config = self.runner.vllm_config.parallel_config
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        cp_kv_cache_interleave_size = getattr(
+            parallel_config, "cp_kv_cache_interleave_size", 0)
+        use_pcp_precompile = (
+            pcp_size > 1 and cp_kv_cache_interleave_size > 0 and
+            len(self.runner.kv_cache_config.kv_cache_groups) > 0)
+
+        token_data_sharding = NamedSharding(
             self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+        metadata_sharding = NamedSharding(
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.BATCH
+                          if use_pcp_precompile else
+                          ShardingAxisName.ATTN_DATA, ))
 
         # Keep existing pattern for complex array operations
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
-                                             jnp.int32, dp_sharding)
+                                             jnp.int32, metadata_sharding)
         query_start_loc = self._create_dummy_tensor(
-            (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+            (self.runner.max_num_reqs + dp_size, ), jnp.int32,
+            metadata_sharding)
 
         # Keep existing pattern for specific value arrays
         request_distribution = np.array([0, 0, 0] * dp_size, dtype=np.int32)
         request_distribution = device_array(self.runner.mesh,
                                             request_distribution,
-                                            sharding=dp_sharding)
+                                            sharding=metadata_sharding)
         # Dummy mamba_state_indices for compile-cache pre-tracing. Only
         # populate for hybrid attn+mamba models — for pure-attention models we
         # pass None at runtime (see `_prepare_inputs`), and the precompile
@@ -242,22 +256,124 @@ class CompilationManager:
                                                np.zeros(
                                                    self.runner.max_num_reqs,
                                                    dtype=np.int32),
-                                               sharding=dp_sharding)
+                                               sharding=metadata_sharding)
         else:
             mamba_state_indices = None
+
+        host_block_tables_by_gid: dict[int, np.ndarray] = {}
+        device_block_tables_by_gid: dict[int, jax.Array] = {}
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_table_obj = self.runner.input_batch.block_table[kv_cache_gid]
             shape = (self.runner.max_num_reqs,
                      block_table_obj.max_num_blocks_per_req)
             block_tables = np.zeros(shape, dtype=np.int32)
+            host_block_tables_by_gid[kv_cache_gid] = block_tables
             block_tables = block_tables.reshape(-1)
             block_tables = device_array(self.runner.mesh,
                                         block_tables,
-                                        sharding=dp_sharding)
+                                        sharding=metadata_sharding)
+            device_block_tables_by_gid[kv_cache_gid] = block_tables
             return block_tables
 
-        def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
+        pcp_gdn_reorder_indices = None
+        pcp_attention_metadata_by_gid: dict[int, dict[str, jax.Array]] = {}
+
+        def build_pcp_metadata() -> None:
+            nonlocal pcp_gdn_reorder_indices
+            if not use_pcp_precompile:
+                return
+
+            from tpu_inference.runner.tpu_runner import (  # pylint: disable=import-outside-toplevel
+                _build_pcp_attention_metadata,
+                _build_pcp_rank_major_token_order,
+                _merge_pcp_attention_metadata,
+            )
+
+            padded_num_tokens_per_dp = num_tokens // dp_size
+            if padded_num_tokens_per_dp * dp_size != num_tokens:
+                raise ValueError(
+                    f"{num_tokens=} must be divisible by {dp_size=} for PCP "
+                    "precompile.")
+            if padded_num_tokens_per_dp % pcp_size != 0:
+                raise ValueError(
+                    f"{padded_num_tokens_per_dp=} must be divisible by "
+                    f"{pcp_size=} for PCP precompile.")
+
+            max_num_reqs_per_dp_rank = self.runner.max_num_reqs // dp_size
+            active_reqs_per_dp_rank = max(1, num_reqs // dp_size)
+            active_reqs_per_dp_rank = min(active_reqs_per_dp_rank,
+                                          max_num_reqs_per_dp_rank)
+            # Precompile bucket shapes are padded token shapes. Runtime PCP can
+            # raise small request lengths to a larger padded bucket so each PCP
+            # rank has enough local token capacity for an interleave chunk. Keep
+            # the dummy active length within one shard's local capacity; the
+            # metadata tensor shapes still come from the padded bucket.
+            dummy_active_tokens = max(1, padded_num_tokens_per_dp // pcp_size)
+            scheduled_tokens_per_req = [dummy_active_tokens]
+            scheduled_tokens_per_req.extend([0] *
+                                            (active_reqs_per_dp_rank - 1))
+            seq_lens_per_req = list(scheduled_tokens_per_req)
+
+            for gid, block_tables in host_block_tables_by_gid.items():
+                metadata_per_dp = []
+                for dp_rank in range(dp_size):
+                    req_offset = dp_rank * max_num_reqs_per_dp_rank
+                    metadata_per_dp.append(
+                        _build_pcp_attention_metadata(
+                            scheduled_tokens_per_req,
+                            seq_lens_per_req,
+                            block_tables[req_offset:req_offset +
+                                         max_num_reqs_per_dp_rank],
+                            pcp_size,
+                            cp_kv_cache_interleave_size,
+                            padded_num_tokens_per_dp,
+                            max_num_reqs_per_dp_rank,
+                            self.runner.block_size,
+                        ))
+                host_pcp_metadata = _merge_pcp_attention_metadata(
+                    metadata_per_dp)
+                (pcp_kv_lens, pcp_page_indices, pcp_query_start_loc,
+                 pcp_request_distribution, pcp_q_start_offsets,
+                 pcp_cu_k_lens, pcp_slot_ids) = device_array(
+                     self.runner.mesh,
+                     (host_pcp_metadata.kv_lens,
+                      host_pcp_metadata.page_indices,
+                      host_pcp_metadata.query_start_loc,
+                      host_pcp_metadata.request_distribution,
+                      host_pcp_metadata.q_start_offsets,
+                      host_pcp_metadata.cu_k_lens,
+                      host_pcp_metadata.slot_ids),
+                     sharding=token_data_sharding)
+                pcp_attention_metadata_by_gid[gid] = {
+                    "pcp_kv_lens": pcp_kv_lens,
+                    "pcp_page_indices": pcp_page_indices,
+                    "pcp_query_start_loc": pcp_query_start_loc,
+                    "pcp_request_distribution": pcp_request_distribution,
+                    "pcp_q_start_offsets": pcp_q_start_offsets,
+                    "pcp_cu_k_lens": pcp_cu_k_lens,
+                    "pcp_slot_ids": pcp_slot_ids,
+                }
+
+            if self.runner.kv_cache_config.has_mamba_layers:
+                reorder_indices = []
+                for _ in range(dp_size):
+                    token_order, _ = _build_pcp_rank_major_token_order(
+                        scheduled_tokens_per_req,
+                        pcp_size,
+                        cp_kv_cache_interleave_size,
+                        padded_num_tokens_per_dp,
+                    )
+                    reorder_indices.append(token_order.astype(np.int32))
+                pcp_gdn_reorder_indices = device_array(
+                    self.runner.mesh,
+                    np.concatenate(reorder_indices),
+                    sharding=token_data_sharding)
+
+        def build_attn(block_tables: jax.Array | None,
+                       gid: int | None = None) -> AttentionMetadata:
+            pcp_metadata = (pcp_attention_metadata_by_gid.get(gid, {})
+                            if gid is not None else {})
             attention_metadata_gid = AttentionMetadata(
                 input_positions=positions,
                 block_tables=block_tables,
@@ -265,6 +381,15 @@ class CompilationManager:
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
+                pcp_kv_lens=pcp_metadata.get("pcp_kv_lens"),
+                pcp_page_indices=pcp_metadata.get("pcp_page_indices"),
+                pcp_query_start_loc=pcp_metadata.get("pcp_query_start_loc"),
+                pcp_request_distribution=pcp_metadata.get(
+                    "pcp_request_distribution"),
+                pcp_q_start_offsets=pcp_metadata.get("pcp_q_start_offsets"),
+                pcp_cu_k_lens=pcp_metadata.get("pcp_cu_k_lens"),
+                pcp_slot_ids=pcp_metadata.get("pcp_slot_ids"),
+                pcp_gdn_reorder_indices=pcp_gdn_reorder_indices,
                 padded_num_reqs=num_reqs,
             )
             return attention_metadata_gid
@@ -274,10 +399,15 @@ class CompilationManager:
             # Pooling model will not using kv cache
             no_kv_cache = len(self.runner.kv_cache_config.kv_cache_groups) == 0
             block_tables = build_block_table(0) if not no_kv_cache else None
-            attention_metadata = build_attn(block_tables)
+            build_pcp_metadata()
+            attention_metadata = build_attn(block_tables,
+                                            None if no_kv_cache else 0)
         else:
+            for gid, _ in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+                build_block_table(gid)
+            build_pcp_metadata()
             attention_metadata = {
-                name: build_attn(build_block_table(gid))
+                name: build_attn(device_block_tables_by_gid[gid], gid)
                 for gid, kv_cache_group in enumerate(
                     self.runner.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
