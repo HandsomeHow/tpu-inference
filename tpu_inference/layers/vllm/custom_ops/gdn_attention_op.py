@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
 import jax
 import jax.numpy as jnp
 import torch
@@ -25,8 +27,10 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import \
 
 from tpu_inference import envs
 from tpu_inference.layers.common.gdn_attention import (
-    GdnAttentionConfig, run_jax_gdn_attention,
-    run_jax_gdn_attention_pcp_prefill)
+    GdnAttentionConfig,
+    run_jax_gdn_attention,
+    run_jax_gdn_attention_pcp_tp_prefill,
+)
 from tpu_inference.layers.common.ragged_gated_delta_rule_wrapper import \
     RaggedGatedDeltaRuleImpl
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -38,6 +42,13 @@ from tpu_inference.models.vllm.vllm_model_wrapper_context import \
 from tpu_inference.utils import get_mesh_shape_product
 
 logger = init_logger(__name__)
+
+
+def _gdn_trace_stage_prefix(layer_name: str) -> str:
+    match = re.search(r"layers\.(\d+)", layer_name)
+    if match is None:
+        return "linear_attention.gdn"
+    return f"layer.{match.group(1)}.linear_attention.gdn"
 
 
 def _jax_dtype_for_torch_dtype(torch_dtype: torch.dtype):
@@ -142,11 +153,24 @@ def gdn_attention_core_tpu(
     value_dim = n_v * d_v
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
     dp_size = get_mesh_shape_product(mesh, ShardingAxisName.BATCH)
+    pcp_size = get_mesh_shape_product(mesh, ShardingAxisName.PREFILL_CONTEXT)
+    use_pcp_prefill = (pcp_size > 1
+                       and attn_metadata.pcp_gdn_reorder_indices is not None)
+    effective_tp = tp_size * pcp_size if use_pcp_prefill else tp_size
+    assert n_kq % effective_tp == 0, (
+        f"n_kq={n_kq} must be divisible by effective_tp={effective_tp} "
+        f"(tp_size={tp_size}, pcp_size={pcp_size})")
+    assert n_v % effective_tp == 0, (
+        f"n_v={n_v} must be divisible by effective_tp={effective_tp} "
+        f"(tp_size={tp_size}, pcp_size={pcp_size})")
 
     j_mixed_qkv = reorder_concatenated_tensor_for_sharding(
-        j_mixed_qkv, [key_dim, key_dim, value_dim], tp_size, -1)
+        j_mixed_qkv, [key_dim, key_dim, value_dim], effective_tp, -1)
     j_conv_weight = reorder_concatenated_tensor_for_sharding(
-        j_conv_weight, [key_dim, key_dim, value_dim], tp_size, 0)
+        j_conv_weight, [key_dim, key_dim, value_dim], effective_tp, 0)
+    if j_conv_bias is not None:
+        j_conv_bias = reorder_concatenated_tensor_for_sharding(
+            j_conv_bias, [key_dim, key_dim, value_dim], effective_tp, 0)
 
     layer_idx = vllm_context.layer_name_to_kvcache_index[layer_name]
     conv_state, recurrent_state = vllm_context.kv_caches[layer_idx]
@@ -188,13 +212,9 @@ def gdn_attention_core_tpu(
     seq_lens_sliced = truncate_sharded_tensor(attn_metadata.seq_lens,
                                               padded_num_reqs_per_dp, dp_size)
 
-    pcp_size = get_mesh_shape_product(mesh, ShardingAxisName.PREFILL_CONTEXT)
-    use_pcp_prefill = (pcp_size > 1
-                       and attn_metadata.pcp_gdn_reorder_indices is not None)
-
     if use_pcp_prefill:
         (new_conv_state_extracted,
-         new_recurrent_state), j_output = run_jax_gdn_attention_pcp_prefill(
+         new_recurrent_state), j_output = run_jax_gdn_attention_pcp_tp_prefill(
              j_mixed_qkv,
              j_b,
              j_a,

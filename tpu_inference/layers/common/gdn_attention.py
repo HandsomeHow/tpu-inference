@@ -30,6 +30,8 @@ from tpu_inference.layers.common.ragged_conv1d_jax import \
 from tpu_inference.layers.common.ragged_gated_delta_rule_ref import \
     ragged_gated_delta_rule as ragged_gated_delta_rule_ref
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.utils import (
+    inverse_reorder_for_sharding, reorder_concatenated_tensor_for_sharding)
 from tpu_inference.utils import get_mesh_shape_product
 
 
@@ -311,7 +313,20 @@ def run_jax_gdn_attention(
     return (new_conv_state, new_recurrent_state), output
 
 
-def run_jax_gdn_attention_pcp_prefill(
+def _slice_dim(tensor: jnp.ndarray, slice_index: jnp.ndarray | int,
+               num_slices: int, axis: int) -> jnp.ndarray:
+    if axis < 0:
+        axis += tensor.ndim
+    assert tensor.shape[axis] % num_slices == 0
+    slice_size = tensor.shape[axis] // num_slices
+    start_index = slice_index * slice_size
+    return jax.lax.dynamic_slice_in_dim(tensor,
+                                        start_index,
+                                        slice_size,
+                                        axis=axis)
+
+
+def run_jax_gdn_attention_pcp_tp_prefill(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
     j_a: jnp.ndarray,
@@ -335,15 +350,16 @@ def run_jax_gdn_attention_pcp_prefill(
     mesh: jax.sharding.Mesh,
     config: GdnAttentionConfig = GdnAttentionConfig(),
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """GDN attention for PCP prefill: AllGather + reorder + compute + scatter.
+    """GDN PCP prefill with PCP ranks acting as extra head shards.
 
     During PCP prefill, tokens are distributed across PCP ranks in rank-major
     interleaved order. GDN has sequential state dependencies, so we must
     reconstruct the full ordered sequence before running the recurrent scan.
 
     Strategy: AllGather tokens across PCP -> reorder to original sequential
-    order -> run full GDN (redundant on all ranks) -> reorder output back ->
-    take local slice. All ranks produce identical state updates.
+    order -> slice this PCP rank's head shard -> run local GDN -> gather output
+    and state heads back to TP-local full-head layout -> reorder output back ->
+    take local token slice.
 
     Args:
         reorder_indices: (padded_num_tokens_per_dp,) int32 maps packed
@@ -390,6 +406,15 @@ def run_jax_gdn_attention_pcp_prefill(
     )
 
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+    effective_tp = tp_size * pcp_size
+    assert n_kq % effective_tp == 0, (
+        f"n_kq={n_kq} must be divisible by effective_tp={effective_tp}")
+    assert n_v % effective_tp == 0, (
+        f"n_v={n_v} must be divisible by effective_tp={effective_tp}")
+    local_n_kq = n_kq // effective_tp
+    local_n_v = n_v // effective_tp
+    local_key_dim = n_kq * d_k // tp_size
+    local_value_dim = n_v * d_v // tp_size
 
     def _pcp_prefill_fn(
         local_qkv, local_b, local_a,
@@ -425,19 +450,59 @@ def run_jax_gdn_attention_pcp_prefill(
         seq_b = seq_b.at[scatter_indices].set(full_b, mode="drop")
         seq_a = seq_a.at[scatter_indices].set(full_a, mode="drop")
 
-        # Run full GDN on sequential order
-        (new_conv, new_rec), seq_output = run_jax_gdn_attention_local(
-            seq_qkv, seq_b, seq_a,
-            conv_state_, recurrent_state_,
-            conv_weight_, conv_bias_,
-            A_log_, dt_bias_,
-            query_start_loc_, state_indices_, distribution_, seq_lens_,
-            n_kq=n_kq // tp_size,
-            n_v=n_v // tp_size,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            config=config,
+        rank = jax.lax.axis_index(pcp_axis)
+        qkv_shard = _slice_dim(seq_qkv, rank, pcp_size, axis=-1)
+        b_shard = _slice_dim(seq_b, rank, pcp_size, axis=-1)
+        a_shard = _slice_dim(seq_a, rank, pcp_size, axis=-1)
+        weight_shard = _slice_dim(conv_weight_, rank, pcp_size, axis=0)
+        bias_shard = (None if conv_bias_ is None else
+                      _slice_dim(conv_bias_, rank, pcp_size, axis=0))
+        A_shard = _slice_dim(A_log_, rank, pcp_size, axis=0)
+        dt_shard = _slice_dim(dt_bias_, rank, pcp_size, axis=0)
+
+        conv_state_interleaved = reorder_concatenated_tensor_for_sharding(
+            conv_state_,
+            [local_key_dim, local_key_dim, local_value_dim],
+            pcp_size,
+            -1,
+        )
+        conv_state_shard = _slice_dim(
+            conv_state_interleaved, rank, pcp_size, axis=-1)
+        recurrent_state_shard = _slice_dim(
+            recurrent_state_, rank, pcp_size, axis=1)
+
+        (new_conv_shard, new_rec_shard), seq_output_shard = (
+            run_jax_gdn_attention_local(
+                qkv_shard, b_shard, a_shard,
+                conv_state_shard, recurrent_state_shard,
+                weight_shard, bias_shard,
+                A_shard, dt_shard,
+                query_start_loc_, state_indices_, distribution_, seq_lens_,
+                n_kq=local_n_kq,
+                n_v=local_n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                config=config,
+            ))
+
+        seq_output = jax.lax.all_gather(seq_output_shard,
+                                        axis_name=pcp_axis,
+                                        axis=-1,
+                                        tiled=True)
+        new_conv_gathered = jax.lax.all_gather(new_conv_shard,
+                                               axis_name=pcp_axis,
+                                               axis=-1,
+                                               tiled=True)
+        new_rec = jax.lax.all_gather(new_rec_shard,
+                                     axis_name=pcp_axis,
+                                     axis=1,
+                                     tiled=True)
+        new_conv = inverse_reorder_for_sharding(
+            new_conv_gathered,
+            [local_key_dim, local_key_dim, local_value_dim],
+            pcp_size,
+            -1,
         )
 
         # Gather output back: sequential -> packed rank-major
@@ -446,7 +511,6 @@ def run_jax_gdn_attention_pcp_prefill(
 
         # Take local slice for this PCP rank
         local_tokens = full_output.shape[0] // pcp_size
-        rank = jax.lax.axis_index(pcp_axis)
         local_output = jax.lax.dynamic_slice_in_dim(
             full_output, rank * local_tokens, local_tokens, axis=0)
 
@@ -478,3 +542,53 @@ def run_jax_gdn_attention_pcp_prefill(
     )
 
     return (new_conv_state, new_recurrent_state), output
+
+
+def run_jax_gdn_attention_pcp_prefill(
+    j_mixed_qkv: jnp.ndarray,
+    j_b: jnp.ndarray,
+    j_a: jnp.ndarray,
+    conv_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    j_conv_weight: jnp.ndarray,
+    j_conv_bias: Optional[jnp.ndarray],
+    j_A_log: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    reorder_indices: jnp.ndarray,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pcp_size: int,
+    mesh: jax.sharding.Mesh,
+    config: GdnAttentionConfig = GdnAttentionConfig(),
+) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    return run_jax_gdn_attention_pcp_tp_prefill(
+        j_mixed_qkv,
+        j_b,
+        j_a,
+        conv_state,
+        recurrent_state,
+        j_conv_weight,
+        j_conv_bias,
+        j_A_log,
+        j_dt_bias,
+        state_indices,
+        query_start_loc,
+        distribution,
+        seq_lens,
+        reorder_indices,
+        n_kq,
+        n_v,
+        d_k,
+        d_v,
+        kernel_size,
+        pcp_size,
+        mesh,
+        config,
+    )

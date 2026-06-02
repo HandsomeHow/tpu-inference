@@ -433,7 +433,7 @@ class TestGdnAttentionCoreRouting:
         monkeypatch.setattr(gdn_attention_op, "get_mesh_shape_product",
                             fake_get_mesh_shape_product)
         monkeypatch.setattr(gdn_attention_op,
-                            "run_jax_gdn_attention_pcp_prefill", fake_pcp)
+                            "run_jax_gdn_attention_pcp_tp_prefill", fake_pcp)
         monkeypatch.setattr(gdn_attention_op, "run_jax_gdn_attention",
                             fake_standard)
 

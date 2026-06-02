@@ -23,8 +23,12 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from tpu_inference import envs
-from tpu_inference.layers.common.utils import (general_device_put,
-                                               truncate_sharded_tensor)
+from tpu_inference.layers.common.utils import (
+    general_device_put,
+    inverse_reorder_for_sharding,
+    reorder_concatenated_tensor_for_sharding,
+    truncate_sharded_tensor,
+)
 
 
 class UtilsTest(jtu.JaxTestCase):
@@ -108,6 +112,26 @@ class UtilsTest(jtu.JaxTestCase):
 
         self.assertEqual(result.shape, (2, 12))
         self.assertAllClose(result, expected)
+
+    def test_inverse_reorder_for_sharding_last_dim(self):
+        t = jnp.arange(2 * 24).reshape(2, 24)
+        split_sizes = [12, 8, 4]
+        reordered = reorder_concatenated_tensor_for_sharding(
+            t, split_sizes, 4, -1)
+        restored = inverse_reorder_for_sharding(reordered, split_sizes, 4, -1)
+
+        self.assertEqual(restored.shape, t.shape)
+        self.assertAllClose(restored, t)
+
+    def test_inverse_reorder_for_sharding_first_dim(self):
+        t = jnp.arange(24 * 2).reshape(24, 2)
+        split_sizes = [12, 8, 4]
+        reordered = reorder_concatenated_tensor_for_sharding(
+            t, split_sizes, 4, 0)
+        restored = inverse_reorder_for_sharding(reordered, split_sizes, 4, 0)
+
+        self.assertEqual(restored.shape, t.shape)
+        self.assertAllClose(restored, t)
 
 
 if __name__ == "__main__":

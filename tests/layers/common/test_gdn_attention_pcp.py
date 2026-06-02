@@ -11,12 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for GDN attention PCP prefill path correctness.
-
-Verifies that run_jax_gdn_attention_pcp_prefill (AllGather + reorder +
-compute + scatter) produces the same output and state as the non-PCP
-baseline (run_jax_gdn_attention_local).
-"""
+"""Tests for GDN attention PCP prefill path correctness."""
 
 import numpy as np
 import pytest
@@ -30,11 +25,14 @@ from tpu_inference.layers.common.gdn_attention import (
     RaggedGatedDeltaRuleImpl,
     run_jax_gdn_attention,
     run_jax_gdn_attention_local,
-    run_jax_gdn_attention_pcp_prefill,
+    run_jax_gdn_attention_pcp_tp_prefill,
 )
 from tpu_inference.layers.common.sharding import (
     MESH_AXIS_NAMES,
     ShardingAxisNameBase,
+)
+from tpu_inference.layers.common.utils import (
+    reorder_concatenated_tensor_for_sharding,
 )
 from tpu_inference.runner.tpu_runner import (
     _build_pcp_rank_major_token_order,
@@ -83,7 +81,7 @@ class TestGdnAttentionPcpPrefill:
             pytest.skip(f"Need {pcp_size} devices, have {num_devices}")
 
         # Model hyperparameters (small for fast testing)
-        n_kq = 2
+        n_kq = 4
         n_v = 4
         d_k = 64
         d_v = 64
@@ -177,14 +175,23 @@ class TestGdnAttentionPcpPrefill:
         packed_b = packed_b.at[valid_indices].set(b_padded[src_indices])
         packed_a = packed_a.at[valid_indices].set(a_padded[src_indices])
 
+        effective_tp = pcp_size
+        packed_qkv = reorder_concatenated_tensor_for_sharding(
+            packed_qkv, [n_kq * d_k, n_kq * d_k, n_v * d_v],
+            effective_tp, -1)
+        conv_weight_pcp = reorder_concatenated_tensor_for_sharding(
+            conv_weight, [n_kq * d_k, n_kq * d_k, n_v * d_v],
+            effective_tp, 0)
+        conv_bias_pcp = reorder_concatenated_tensor_for_sharding(
+            conv_bias, [n_kq * d_k, n_kq * d_k, n_v * d_v],
+            effective_tp, 0)
+
         # Apply shardings matching what the model forward would produce.
         # Use ShardingAxisNameBase directly (multi-axis mode with pcp).
         token_sharding = NamedSharding(
             mesh, P(ShardingAxisNameBase.ATTN_DATA))
         state_sharding = NamedSharding(
             mesh, P(ShardingAxisNameBase.BATCH))
-        head_sharding = NamedSharding(mesh, P(ShardingAxisNameBase.ATTN_HEAD))
-
         packed_qkv_dev = jax.device_put(
             packed_qkv,
             NamedSharding(mesh, P(ShardingAxisNameBase.ATTN_DATA,
@@ -207,11 +214,11 @@ class TestGdnAttentionPcpPrefill:
                                   ShardingAxisNameBase.ATTN_HEAD,
                                   None, None)))
         conv_weight_dev = jax.device_put(
-            conv_weight,
+            conv_weight_pcp,
             NamedSharding(mesh, P(ShardingAxisNameBase.ATTN_HEAD,
                                   None, None)))
         conv_bias_dev = jax.device_put(
-            conv_bias,
+            conv_bias_pcp,
             NamedSharding(mesh, P(ShardingAxisNameBase.ATTN_HEAD)))
         A_log_dev = jax.device_put(
             A_log, NamedSharding(mesh, P(ShardingAxisNameBase.ATTN_HEAD)))
@@ -230,7 +237,7 @@ class TestGdnAttentionPcpPrefill:
 
         try:
             (pcp_conv, pcp_rec), pcp_output = jax.jit(
-                run_jax_gdn_attention_pcp_prefill,
+                run_jax_gdn_attention_pcp_tp_prefill,
                 static_argnames=["n_kq", "n_v", "d_k", "d_v",
                                  "kernel_size", "pcp_size", "mesh",
                                  "config"],
