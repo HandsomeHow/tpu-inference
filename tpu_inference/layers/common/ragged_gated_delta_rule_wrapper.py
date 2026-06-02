@@ -32,6 +32,7 @@ class RaggedGatedDeltaRuleConfig:
     prefill_impl: str = 'jax'
     decode_impl: str = 'jax'
     use_qk_norm_in_gdn: bool = True
+    prefill_only_kernel: bool = False
 
 
 class RaggedGatedDeltaRuleImpl(enum.Enum):
@@ -61,10 +62,14 @@ class RaggedGatedDeltaRuleImpl(enum.Enum):
         else:
             return 'fused'
 
-    def to_config(self) -> RaggedGatedDeltaRuleConfig:
+    def to_config(self,
+                  *,
+                  prefill_only_kernel: bool = False
+                  ) -> RaggedGatedDeltaRuleConfig:
         return RaggedGatedDeltaRuleConfig(
             prefill_impl=self.prefill_impl,
             decode_impl=self.decode_impl,
+            prefill_only_kernel=prefill_only_kernel,
         )
 
 
@@ -254,6 +259,7 @@ def ragged_gated_delta_rule_wrapper(
                 BT=chunk_size,
                 use_qk_norm_in_gdn=config.use_qk_norm_in_gdn,
                 has_initial_state=has_initial_state,
+                prefill_only=config.prefill_only_kernel,
             )
 
         else:

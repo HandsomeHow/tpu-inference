@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
     RAGGED_GATED_DELTA_RULE_IMPL: str = "chunked_jax_pd"
+    GDN_PREFILL_ONLY_KERNEL: bool = False
     MOE_ALL_GATHER_ACTIVATION_DTYPE: str = ""
     TPU_OFFLOAD_SKIP_JAX_PRECOMPILE: bool = False
     TPU_OFFLOAD_DECODE_SAVE: bool = False
@@ -316,6 +317,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "chunked_kernel_p_recurrent_kernel_d"
         ],
     ),
+    # Force the recurrent GDN prefill kernel variant that does not allocate
+    # decode scratch. This is only valid for prefill-only profiling/runs.
+    "GDN_PREFILL_ONLY_KERNEL":
+    env_bool("GDN_PREFILL_ONLY_KERNEL", default=False),
     "MOE_ALL_GATHER_ACTIVATION_DTYPE":
     lambda: os.getenv("MOE_ALL_GATHER_ACTIVATION_DTYPE", ""),
     # kv offload to dram: skip pre-compiling swap-related jax functions

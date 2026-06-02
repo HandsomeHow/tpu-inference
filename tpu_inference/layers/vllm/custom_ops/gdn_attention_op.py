@@ -197,7 +197,8 @@ def gdn_attention_core_tpu(
 
     config = GdnAttentionConfig(
         ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl(
-            envs.RAGGED_GATED_DELTA_RULE_IMPL))
+            envs.RAGGED_GATED_DELTA_RULE_IMPL),
+        prefill_only_kernel=envs.GDN_PREFILL_ONLY_KERNEL)
     logger.info_once(f"GDN Attention Config: {config}")
 
     padded_num_reqs_per_dp = attn_metadata.padded_num_reqs // dp_size

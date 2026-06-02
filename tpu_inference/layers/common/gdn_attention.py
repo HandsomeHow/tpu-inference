@@ -48,6 +48,7 @@ class GdnAttentionConfig:
     ragged_conv1d_impl: RaggedConv1dImpl = RaggedConv1dImpl.JAX
     ragged_gated_delta_rule_impl: RaggedGatedDeltaRuleImpl = (
         RaggedGatedDeltaRuleImpl.CHUNKED_KERNEL_PD)
+    prefill_only_kernel: bool = False
 
 
 def run_jax_gdn_attention_local(
@@ -158,7 +159,8 @@ def run_jax_gdn_attention_local(
             distribution,
         )
     else:
-        wrapper_config = config.ragged_gated_delta_rule_impl.to_config()
+        wrapper_config = config.ragged_gated_delta_rule_impl.to_config(
+            prefill_only_kernel=config.prefill_only_kernel)
         new_recurrent_state, output = ragged_gated_delta_rule_wrapper.ragged_gated_delta_rule_wrapper(
             mixed_qkv=out_mixed_qkv,
             b=b,

@@ -137,6 +137,8 @@ def inner_kernel(
     prefill_semaphore,
     # Number of decode tokens (requests) in the batch
     decode_tokens,
+    # Whether this kernel is used only for prefill batches. Static.
+    prefill_only: bool,
 ):
     """Inner kernel for recurrent scan processing both prefill and decode.
 
@@ -166,206 +168,213 @@ def inner_kernel(
         norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True) + eps)
         return x / norm
 
-    # 2. Decode Branch
-    # check current iteration had decode work
-    @pl.when(decode_valid > 0)
-    def decode_wrapper():
+    if not prefill_only:
+        # 2. Decode Branch
+        # check current iteration had decode work
+        @pl.when(decode_valid > 0)
+        def decode_wrapper():
 
-        def get_target_idx(b):
-            safe_req_id = jnp.minimum(decode_req_id + b,
-                                      state_indices.shape[0] - 1)
-            return state_indices[safe_req_id][...]
+            def get_target_idx(b):
+                safe_req_id = jnp.minimum(decode_req_id + b,
+                                          state_indices.shape[0] - 1)
+                return state_indices[safe_req_id][...]
 
-        def process_decode(b, _):
-            # token by token check if decode token or not
-            is_valid = b < decode_count
+            def process_decode(b, _):
+                # token by token check if decode token or not
+                is_valid = b < decode_count
 
-            @pl.when(is_valid)
-            def do_work():
-                target_idx = get_target_idx(b)
+                @pl.when(is_valid)
+                def do_work():
+                    target_idx = get_target_idx(b)
 
-                # Load state TODO: make async
-                copy_op = pltpu.make_async_copy(
-                    src_ref=recurrent_state_in.at[pl.ds(target_idx, 1)],
-                    dst_ref=state_commit_scratch,
-                    sem=decode_read_semaphores.at[0],
-                )
-                copy_op.start()
-                copy_op.wait()
-                decode_state_scratch[pl.ds(
-                    0, 1)] = state_commit_scratch[...].astype(jnp.float32)
-
-                key_dim = n_kq * d_k
-                b_aligned = (b // sublanesize) * sublanesize
-                # Workaround: Upcast to fp32 to avoid NaNs
-                qkv_block_data = decode_qkv_ref[
-                    pl.ds(b_aligned, sublanesize), :].astype(jnp.float32)
-                mask = (jnp.arange(sublanesize) == (b % sublanesize)).astype(
-                    qkv_block_data.dtype)[:, None]
-                qkv_row = jnp.sum(qkv_block_data * mask, axis=0, keepdims=True)
-                # Fused SiLU
-                qkv_row = jax.nn.silu(qkv_row)
-                q = qkv_row[:, :key_dim].reshape(n_kq, d_k)
-                k = qkv_row[:, key_dim:2 * key_dim].reshape(n_kq, d_k)
-                v = qkv_row[:, 2 * key_dim:].reshape(n_v, d_v)
-
-                if use_qk_norm_in_gdn:
-                    q = l2_normalize(q)
-                    k = l2_normalize(k)
-
-                # Head repetition
-                repeat_factor = n_v // n_kq
-                if repeat_factor > 1:
-                    q = jnp.repeat(q, repeat_factor, axis=0)
-                    k = jnp.repeat(k, repeat_factor, axis=0)
-
-                scale = d_k**-0.5
-                q = q * scale
-
-                b_aligned = (b // sublanesize) * sublanesize
-
-                g_block_new = decode_a_raw_ref[
-                    pl.ds(b_aligned, sublanesize), :]
-                beta_block_new = decode_b_raw_ref[
-                    pl.ds(b_aligned, sublanesize), :]
-
-                mask_new = (jnp.arange(sublanesize) == (
-                    b % sublanesize)).astype(g_block_new.dtype)[:, None]
-
-                curr_g_slice_new = jnp.sum(g_block_new * mask_new,
-                                           axis=0,
-                                           keepdims=True)
-                curr_beta_slice_new = jnp.sum(beta_block_new * mask_new,
-                                              axis=0,
-                                              keepdims=True)
-
-                a_raw_new = curr_g_slice_new[:, :n_v].reshape(n_v).astype(
-                    jnp.float32)
-                b_raw_new = (curr_beta_slice_new[:, :n_v].reshape(n_v).astype(
-                    jnp.float32))
-
-                # Compute gate
-                curr_beta = jax.nn.sigmoid(b_raw_new)
-                curr_g = -jnp.exp(a_log_ref[...].astype(
-                    jnp.float32)) * jax.nn.softplus(
-                        a_raw_new + dt_bias_ref[...].astype(jnp.float32))
-                curr_g = jnp.maximum(curr_g, -100.0)
-                decay = jnp.exp(curr_g)
-
-                current_state = decode_state_scratch[0]
-
-                # TODO: compare MXU vs VPU, MXU doesn't support FP32, VPU does
-                # (n_v, d_k, 1) * (n_v, 1, d_v) -> (n_v, d_k, d_v)
-                out_list = []
-                new_state_list = []
-                for h in range(n_v):
-                    q_h = q[h:h + 1, :]  # (1, d_k)
-                    k_h = k[h:h + 1, :]  # (1, d_k)
-                    v_h = v[h:h + 1, :]  # (1, d_v)
-
-                    state_h = current_state[h]  # (d_k, d_v)
-
-                    k_state_h = pl.dot(
-                        k_h, state_h,
-                        precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
-
-                    # v_diff_h = v_h - decay[h].astype(jnp.float32) * k_state_h
-                    decay_k_state = jnp.where(
-                        jnp.isinf(k_state_h),
-                        0.0,
-                        decay[h].astype(jnp.float32) * k_state_h,
+                    # Load state TODO: make async
+                    copy_op = pltpu.make_async_copy(
+                        src_ref=recurrent_state_in.at[pl.ds(target_idx, 1)],
+                        dst_ref=state_commit_scratch,
+                        sem=decode_read_semaphores.at[0],
                     )
-                    v_diff_h = v_h - decay_k_state
-                    v_new_h = curr_beta[h].astype(jnp.float32) * v_diff_h
+                    copy_op.start()
+                    copy_op.wait()
+                    decode_state_scratch[pl.ds(
+                        0, 1)] = state_commit_scratch[...].astype(jnp.float32)
 
-                    q_state_h = pl.dot(
-                        q_h, state_h,
-                        precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+                    key_dim = n_kq * d_k
+                    b_aligned = (b // sublanesize) * sublanesize
+                    # Workaround: Upcast to fp32 to avoid NaNs
+                    qkv_block_data = decode_qkv_ref[
+                        pl.ds(b_aligned, sublanesize), :].astype(jnp.float32)
+                    mask = (jnp.arange(sublanesize) == (
+                        b % sublanesize)).astype(qkv_block_data.dtype)[:, None]
+                    qkv_row = jnp.sum(qkv_block_data * mask,
+                                      axis=0,
+                                      keepdims=True)
+                    # Fused SiLU
+                    qkv_row = jax.nn.silu(qkv_row)
+                    q = qkv_row[:, :key_dim].reshape(n_kq, d_k)
+                    k = qkv_row[:, key_dim:2 * key_dim].reshape(n_kq, d_k)
+                    v = qkv_row[:, 2 * key_dim:].reshape(n_v, d_v)
 
-                    q_k_h = jnp.sum(q_h * k_h, axis=-1,
-                                    keepdims=True)  # (1, 1)
+                    if use_qk_norm_in_gdn:
+                        q = l2_normalize(q)
+                        k = l2_normalize(k)
 
-                    # Defensive code to handle NaNs and infs in state,
-                    # Saw similar issue while trying newton schulz
-                    # which can happen due to large decay or long sequences.
-                    # TODO: analyze perf impact and risk of removing this.
-                    decay_q_state = jnp.where(jnp.isinf(q_state_h), 0.0,
-                                              decay[h] * q_state_h)
-                    out_h = decay_q_state + q_k_h * v_new_h
-                    out_list.append(out_h)
+                    # Head repetition
+                    repeat_factor = n_v // n_kq
+                    if repeat_factor > 1:
+                        q = jnp.repeat(q, repeat_factor, axis=0)
+                        k = jnp.repeat(k, repeat_factor, axis=0)
 
-                    k_v_new_h = pl.dot(k_h,
-                                       v_new_h,
-                                       trans_a=True,
-                                       precision=jax.lax.Precision.HIGHEST
-                                       )  # (d_k, 1) @ (1, d_v) -> (d_k, d_v)
-                    # Defensive code to handle NaNs and infs in state,
-                    # which can happen due to large decay or long sequences.
-                    # In such cases, we reset the state contribution to zero and rely solely on the new value
-                    # TODO: analyze perf impact and risk of removing this.
-                    decay_state = jnp.where(jnp.isinf(state_h), 0.0,
-                                            state_h * decay[h])
-                    new_state_h = decay_state + k_v_new_h
-                    new_state_list.append(new_state_h)
+                    scale = d_k**-0.5
+                    q = q * scale
 
-                out = jnp.concatenate(out_list, axis=0)  # (n_v, d_v)
-                new_state = jnp.stack(new_state_list,
-                                      axis=0)  # (n_v, d_k, d_v)
+                    b_aligned = (b // sublanesize) * sublanesize
 
-                # TODO: remove VPU path if MXU is certified path
-                # decay_exp = decay[..., None]  # (n_v, 1)
+                    g_block_new = decode_a_raw_ref[
+                        pl.ds(b_aligned, sublanesize), :]
+                    beta_block_new = decode_b_raw_ref[
+                        pl.ds(b_aligned, sublanesize), :]
 
-                # k_state = jnp.sum(k[..., None] * current_state, axis=1)  # (n_v, d_v)
-                # v_diff = v - decay_exp * k_state
-                # v_new = curr_beta[..., None] * v_diff  # (n_v, d_v)
+                    mask_new = (jnp.arange(sublanesize) == (
+                        b % sublanesize)).astype(g_block_new.dtype)[:, None]
 
-                # q_state = jnp.sum(q[..., None] * current_state, axis=1)  # (n_v, d_v)
-                # q_k = jnp.sum(q * k, axis=-1, keepdims=True)  # (n_v, 1)
+                    curr_g_slice_new = jnp.sum(g_block_new * mask_new,
+                                               axis=0,
+                                               keepdims=True)
+                    curr_beta_slice_new = jnp.sum(beta_block_new * mask_new,
+                                                  axis=0,
+                                                  keepdims=True)
 
-                # out = decay_exp * q_state + q_k * v_new  # (n_v, d_v)
-                # k_v_new = k[..., None] * v_new[:, None, :]
-                # new_state = current_state * decay_exp[..., None] + k_v_new
+                    a_raw_new = curr_g_slice_new[:, :n_v].reshape(n_v).astype(
+                        jnp.float32)
+                    b_raw_new = (
+                        curr_beta_slice_new[:, :n_v].reshape(n_v).astype(
+                            jnp.float32))
 
-                decode_state_scratch[pl.ds(
-                    0, 1)] = new_state[None, ...].astype(current_state.dtype)
+                    # Compute gate
+                    curr_beta = jax.nn.sigmoid(b_raw_new)
+                    curr_g = -jnp.exp(a_log_ref[...].astype(
+                        jnp.float32)) * jax.nn.softplus(
+                            a_raw_new + dt_bias_ref[...].astype(jnp.float32))
+                    curr_g = jnp.maximum(curr_g, -100.0)
+                    decay = jnp.exp(curr_g)
 
-                # Accumulate output in scratchpad
-                current_output = decode_output_scratch[...]
-                mask = (jnp.arange(BT) == b).astype(current_output.dtype)[:,
-                                                                          None]
-                new_output = jnp.where(
-                    mask,
-                    out.reshape(1, n_v * d_v),
-                    current_output,
-                )
-                decode_output_scratch[...] = new_output.astype(
-                    current_output.dtype)
+                    current_state = decode_state_scratch[0]
 
-                # Store state (Synchronous)
-                state_commit_scratch[0] = decode_state_scratch[0].astype(
-                    state_commit_scratch.dtype)
-                copy_op = pltpu.make_async_copy(
-                    src_ref=state_commit_scratch,
-                    dst_ref=recurrent_state_out.at[pl.ds(target_idx, 1)],
-                    sem=decode_write_semaphore.at[0],
-                )
-                copy_op.start()
-                copy_op.wait()
+                    # TODO: compare MXU vs VPU, MXU doesn't support FP32, VPU does
+                    # (n_v, d_k, 1) * (n_v, 1, d_v) -> (n_v, d_k, d_v)
+                    out_list = []
+                    new_state_list = []
+                    for h in range(n_v):
+                        q_h = q[h:h + 1, :]  # (1, d_k)
+                        k_h = k[h:h + 1, :]  # (1, d_k)
+                        v_h = v[h:h + 1, :]  # (1, d_v)
+
+                        state_h = current_state[h]  # (d_k, d_v)
+
+                        k_state_h = pl.dot(
+                            k_h, state_h,
+                            precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+
+                        # v_diff_h = v_h - decay[h].astype(jnp.float32) * k_state_h
+                        decay_k_state = jnp.where(
+                            jnp.isinf(k_state_h),
+                            0.0,
+                            decay[h].astype(jnp.float32) * k_state_h,
+                        )
+                        v_diff_h = v_h - decay_k_state
+                        v_new_h = curr_beta[h].astype(jnp.float32) * v_diff_h
+
+                        q_state_h = pl.dot(
+                            q_h, state_h,
+                            precision=jax.lax.Precision.HIGHEST)  # (1, d_v)
+
+                        q_k_h = jnp.sum(q_h * k_h, axis=-1,
+                                        keepdims=True)  # (1, 1)
+
+                        # Defensive code to handle NaNs and infs in state,
+                        # Saw similar issue while trying newton schulz
+                        # which can happen due to large decay or long sequences.
+                        # TODO: analyze perf impact and risk of removing this.
+                        decay_q_state = jnp.where(jnp.isinf(q_state_h), 0.0,
+                                                  decay[h] * q_state_h)
+                        out_h = decay_q_state + q_k_h * v_new_h
+                        out_list.append(out_h)
+
+                        k_v_new_h = pl.dot(
+                            k_h,
+                            v_new_h,
+                            trans_a=True,
+                            precision=jax.lax.Precision.HIGHEST,
+                        )  # (d_k, 1) @ (1, d_v) -> (d_k, d_v)
+                        # Defensive code to handle NaNs and infs in state,
+                        # which can happen due to large decay or long sequences.
+                        # In such cases, we reset the state contribution to zero and rely solely on the new value
+                        # TODO: analyze perf impact and risk of removing this.
+                        decay_state = jnp.where(jnp.isinf(state_h), 0.0,
+                                                state_h * decay[h])
+                        new_state_h = decay_state + k_v_new_h
+                        new_state_list.append(new_state_h)
+
+                    out = jnp.concatenate(out_list, axis=0)  # (n_v, d_v)
+                    new_state = jnp.stack(new_state_list,
+                                          axis=0)  # (n_v, d_k, d_v)
+
+                    # TODO: remove VPU path if MXU is certified path
+                    # decay_exp = decay[..., None]  # (n_v, 1)
+
+                    # k_state = jnp.sum(k[..., None] * current_state, axis=1)  # (n_v, d_v)
+                    # v_diff = v - decay_exp * k_state
+                    # v_new = curr_beta[..., None] * v_diff  # (n_v, d_v)
+
+                    # q_state = jnp.sum(q[..., None] * current_state, axis=1)  # (n_v, d_v)
+                    # q_k = jnp.sum(q * k, axis=-1, keepdims=True)  # (n_v, 1)
+
+                    # out = decay_exp * q_state + q_k * v_new  # (n_v, d_v)
+                    # k_v_new = k[..., None] * v_new[:, None, :]
+                    # new_state = current_state * decay_exp[..., None] + k_v_new
+
+                    decode_state_scratch[pl.ds(
+                        0, 1)] = new_state[None,
+                                           ...].astype(current_state.dtype)
+
+                    # Accumulate output in scratchpad
+                    current_output = decode_output_scratch[...]
+                    mask = (jnp.arange(BT) == b).astype(
+                        current_output.dtype)[:, None]
+                    new_output = jnp.where(
+                        mask,
+                        out.reshape(1, n_v * d_v),
+                        current_output,
+                    )
+                    decode_output_scratch[...] = new_output.astype(
+                        current_output.dtype)
+
+                    # Store state (Synchronous)
+                    state_commit_scratch[0] = decode_state_scratch[0].astype(
+                        state_commit_scratch.dtype)
+                    copy_op = pltpu.make_async_copy(
+                        src_ref=state_commit_scratch,
+                        dst_ref=recurrent_state_out.at[pl.ds(target_idx, 1)],
+                        sem=decode_write_semaphore.at[0],
+                    )
+                    copy_op.start()
+                    copy_op.wait()
+
+                    return None
 
                 return None
 
+            # loop over bt, could be for loop, BT is static anyway, unroll
+            jax.lax.fori_loop(0, BT, process_decode, None)
+
+            # Mask and write accumulated outputs to HBM
+            mask = (jnp.arange(BT)
+                    < decode_count).astype(decode_output_scratch.dtype)[:,
+                                                                        None]
+            decode_output_scratch_masked = decode_output_scratch[...] * mask
+            decode_output_ref[...] = decode_output_scratch_masked
+
             return None
-
-        # loop over bt, could be for loop, BT is static anyway, unroll
-        jax.lax.fori_loop(0, BT, process_decode, None)
-
-        # Mask and write accumulated outputs to HBM
-        mask = (jnp.arange(BT)
-                < decode_count).astype(decode_output_scratch.dtype)[:, None]
-        decode_output_scratch_masked = decode_output_scratch[...] * mask
-        decode_output_ref[...] = decode_output_scratch_masked
-
-        return None
 
     # Prefill Branch
     # Process prefill if there is valid prefill work in this step
@@ -829,6 +838,68 @@ def inner_kernel(
     jax.lax.cond(needs_stitching, do_stitch, lambda: None)
 
 
+def inner_kernel_prefill_only(
+    prefill_qkv_ref,
+    prefill_a_raw_ref,
+    prefill_b_raw_ref,
+    a_log_ref,
+    dt_bias_ref,
+    prefill_output_ref,
+    schedule_table,
+    state_indices,
+    has_initial_state,
+    *,
+    recurrent_state_in,
+    recurrent_state_out,
+    C: int,
+    BT: int,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    use_qk_norm_in_gdn: bool,
+    sublanesize: int,
+    prefill_scratch,
+    state_commit_scratch,
+    prefill_semaphore,
+):
+    """Prefill-only wrapper that keeps decode refs out of emit_pipeline."""
+    return inner_kernel(
+        prefill_qkv_ref,
+        prefill_qkv_ref,
+        prefill_a_raw_ref,
+        prefill_a_raw_ref,
+        prefill_b_raw_ref,
+        prefill_b_raw_ref,
+        a_log_ref,
+        dt_bias_ref,
+        prefill_output_ref,
+        prefill_output_ref,
+        schedule_table,
+        state_indices,
+        has_initial_state,
+        recurrent_state_in=recurrent_state_in,
+        recurrent_state_out=recurrent_state_out,
+        C=C,
+        BT=BT,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+        sublanesize=sublanesize,
+        prefill_scratch=prefill_scratch,
+        decode_state_scratch=None,
+        state_commit_scratch=state_commit_scratch,
+        decode_output_scratch=None,
+        decode_read_semaphores=None,
+        decode_write_semaphore=None,
+        prefill_semaphore=prefill_semaphore,
+        decode_tokens=0,
+        prefill_only=True,
+    )
+
+
 def get_qkv_index_map_v2(
     step,
     schedule_table,
@@ -932,6 +1003,56 @@ def create_block_specs(
     ], [prefill_output_spec, decode_output_spec]
 
 
+def create_prefill_only_block_specs(
+    schedule_table,
+    chunk_size,
+    d,
+    n_v,
+    d_v,
+    alignment=16,
+    sink_offset=0,
+):
+    """Creates block specs for the prefill-only recurrent scan kernel."""
+
+    prefill_qkv_index_map = functools.partial(
+        get_qkv_index_map_v2,
+        schedule_table=schedule_table,
+        valid_col=0,
+        offset_col=1,
+        count_col=3,
+        alignment=alignment,
+        block_size=chunk_size,
+        sink_offset=sink_offset,
+    )
+
+    prefill_qkv_spec = pl.BlockSpec(
+        block_shape=(pl.BoundedSlice(chunk_size), d),
+        index_map=prefill_qkv_index_map,
+    )
+    prefill_output_spec = pl.BlockSpec(
+        block_shape=(pl.BoundedSlice(chunk_size), n_v * d_v),
+        index_map=prefill_qkv_index_map,
+    )
+    prefill_a_raw_spec = pl.BlockSpec(
+        block_shape=(pl.BoundedSlice(chunk_size), 128),
+        index_map=prefill_qkv_index_map,
+    )
+    prefill_b_raw_spec = pl.BlockSpec(
+        block_shape=(pl.BoundedSlice(chunk_size), 128),
+        index_map=prefill_qkv_index_map,
+    )
+    a_log_spec = pl.BlockSpec(block_shape=(n_v, ), index_map=lambda _: (0, ))
+    dt_bias_spec = pl.BlockSpec(block_shape=(n_v, ), index_map=lambda _: (0, ))
+
+    return [
+        prefill_qkv_spec,
+        prefill_a_raw_spec,
+        prefill_b_raw_spec,
+        a_log_spec,
+        dt_bias_spec,
+    ], [prefill_output_spec]
+
+
 def fused_kernel(
     mixed_qkv_ref,
     aliased_recurrent_state_ref,
@@ -955,6 +1076,7 @@ def fused_kernel(
     d_v: int,
     use_qk_norm_in_gdn: bool,
     sublanesize: int,
+    prefill_only: bool,
 ):
     """Fused kernel for recurrent scan."""
     decode_tokens = decode_tokens_ref[0]
@@ -974,6 +1096,16 @@ def fused_kernel(
         alignment=sublanesize,
         sink_offset=sink_offset,
     )
+    prefill_only_in_specs, prefill_only_out_specs = (
+        create_prefill_only_block_specs(
+            schedule_table_ref,
+            C,
+            d,
+            n_v,
+            d_v,
+            alignment=sublanesize,
+            sink_offset=sink_offset,
+        ))
 
     def _run_with_scratch(
         scratch_ref,
@@ -987,7 +1119,7 @@ def fused_kernel(
 
         pipeline_func = pltpu.emit_pipeline(
             body=functools.partial(
-                inner_kernel,
+                inner_kernel_prefill_only,
                 C=C,
                 BT=BT,
                 n_kq=n_kq,
@@ -1004,6 +1136,7 @@ def fused_kernel(
                 decode_write_semaphore=decode_write_sem,
                 prefill_semaphore=prefill_sem,
                 decode_tokens=decode_tokens,
+                prefill_only=prefill_only,
                 recurrent_state_in=aliased_recurrent_state_ref,
                 recurrent_state_out=recurrent_state_ref,
             ),
@@ -1028,20 +1161,70 @@ def fused_kernel(
             ],
         )
 
-    pl.run_scoped(
-        # TODO: Move this to outer pallas call and get rid of run_scoped
-        _run_with_scratch,
-        pltpu.VMEM((2, n_v, d_k, d_v),
-                   jnp.float32),  # prefill_scratch (double buffered)
-        pltpu.VMEM((1, n_v, d_k, d_v), jnp.float32),  # decode_state_scratch
-        pltpu.VMEM((1, n_v, d_k, d_v),
-                   recurrent_state_ref.dtype),  # state_commit_scratch
-        pltpu.VMEM((BT, n_v * d_v),
-                   mixed_qkv_ref.dtype),  # decode_output_scratch
-        pltpu.SemaphoreType.DMA((1, )),  # decode_read_semaphores
-        pltpu.SemaphoreType.DMA((1, )),  # decode_write_semaphore
-        pltpu.SemaphoreType.DMA((2, )),  # prefill_semaphore
-    )
+    def _run_prefill_only_with_scratch(
+        scratch_ref,
+        state_commit_scratch_ref,
+        prefill_sem,
+    ):
+        pipeline_func = pltpu.emit_pipeline(
+            body=functools.partial(
+                inner_kernel_prefill_only,
+                C=C,
+                BT=BT,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                use_qk_norm_in_gdn=use_qk_norm_in_gdn,
+                sublanesize=sublanesize,
+                prefill_scratch=scratch_ref,
+                state_commit_scratch=state_commit_scratch_ref,
+                prefill_semaphore=prefill_sem,
+                recurrent_state_in=aliased_recurrent_state_ref,
+                recurrent_state_out=recurrent_state_ref,
+            ),
+            grid=(total_blocks, ),
+            in_specs=prefill_only_in_specs,
+            out_specs=prefill_only_out_specs,
+        )
+
+        pipeline_func(
+            mixed_qkv_ref,
+            a_raw_ref,
+            b_raw_ref,
+            a_log_ref,
+            dt_bias_ref,
+            output_ref,
+            scratches=[
+                schedule_table_ref, state_indices_ref, has_initial_state_ref
+            ],
+        )
+
+    if prefill_only:
+        pl.run_scoped(
+            _run_prefill_only_with_scratch,
+            pltpu.VMEM((2, n_v, d_k, d_v),
+                       jnp.float32),  # prefill_scratch (double buffered)
+            pltpu.VMEM((1, n_v, d_k, d_v),
+                       recurrent_state_ref.dtype),  # state_commit_scratch
+            pltpu.SemaphoreType.DMA((2, )),  # prefill_semaphore
+        )
+    else:
+        pl.run_scoped(
+            # TODO: Move this to outer pallas call and get rid of run_scoped
+            _run_with_scratch,
+            pltpu.VMEM((2, n_v, d_k, d_v),
+                       jnp.float32),  # prefill_scratch (double buffered)
+            pltpu.VMEM((1, n_v, d_k, d_v),
+                       jnp.float32),  # decode_state_scratch
+            pltpu.VMEM((1, n_v, d_k, d_v),
+                       recurrent_state_ref.dtype),  # state_commit_scratch
+            pltpu.VMEM((BT, n_v * d_v),
+                       mixed_qkv_ref.dtype),  # decode_output_scratch
+            pltpu.SemaphoreType.DMA((1, )),  # decode_read_semaphores
+            pltpu.SemaphoreType.DMA((1, )),  # decode_write_semaphore
+            pltpu.SemaphoreType.DMA((2, )),  # prefill_semaphore
+        )
 
 
 @functools.partial(
@@ -1054,6 +1237,7 @@ def fused_kernel(
         "chunk_size",
         "BT",
         "use_qk_norm_in_gdn",
+        "prefill_only",
     ],
 )
 def recurrent_scan(
@@ -1075,6 +1259,7 @@ def recurrent_scan(
     BT: int = 128,
     use_qk_norm_in_gdn: bool = True,
     has_initial_state: jax.Array | None = None,
+    prefill_only: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused recurrent scan kernel for GDN on TPU v7.
 
@@ -1100,6 +1285,8 @@ def recurrent_scan(
     chunk_size: Block size for processing (default 128).
     BT: Block size for decode requests (default 128).
     use_qk_norm_in_gdn: Whether to use QK normalization.
+    prefill_only: Whether to emit the prefill-only kernel variant without
+      decode scratch allocation. Only use when the batch has no decode tokens.
 
   Returns:
     A tuple containing:
@@ -1177,6 +1364,7 @@ def recurrent_scan(
             d_v=d_v,
             use_qk_norm_in_gdn=use_qk_norm_in_gdn,
             sublanesize=sublanesize,
+            prefill_only=prefill_only,
         ),
         out_shape=(
             jax.ShapeDtypeStruct(recurrent_state.shape, recurrent_state.dtype),
