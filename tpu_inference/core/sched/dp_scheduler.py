@@ -600,9 +600,20 @@ class DPScheduler(SchedulerInterface):
         """Find the best DP rank for a new request based on load balancing.
 
         Two-tier strategy:
-        1. Prefix cache hit: assign to rank with best cache hit.
-        2. Otherwise: pick rank with the fewest pending prefill tokens.
+        1. Explicit data-parallel rank, if provided by the frontend.
+        2. Prefix cache hit: assign to rank with best cache hit.
+        3. Otherwise: pick rank with the fewest pending prefill tokens.
         """
+        explicit_rank = getattr(request, "tpu_internal_dp_rank", None)
+        if explicit_rank is None:
+            explicit_rank = getattr(request, "data_parallel_rank", None)
+        if explicit_rank is not None:
+            if not 0 <= explicit_rank < self.dp_size:
+                raise ValueError(
+                    f"data_parallel_rank {explicit_rank} is out of range "
+                    f"[0, {self.dp_size}).")
+            return explicit_rank
+
         # First, try to find a rank with prefix cache hit.
         if self.vllm_config.cache_config.enable_prefix_caching:
             for rank in range(self.dp_size):

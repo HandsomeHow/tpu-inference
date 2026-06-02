@@ -253,6 +253,26 @@ class TestDPScheduler:
         # Should prefer rank with better cache hit (rank 1 has 25 cached tokens)
         assert rank == 1
 
+    def test_find_best_rank_uses_explicit_data_parallel_rank(
+            self, mock_vllm_config, mock_kv_cache_config,
+            mock_structured_output_manager):
+        """Test request data_parallel_rank overrides scheduler routing."""
+        mock_vllm_config.cache_config.enable_prefix_caching = True
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.data_parallel_rank = 1
+        scheduler._send_command = MagicMock()
+        scheduler._get_rank_pending_prefill_tokens = MagicMock()
+
+        rank = scheduler._find_best_rank_for_request(mock_request)
+
+        assert rank == 1
+        scheduler._send_command.assert_not_called()
+        scheduler._get_rank_pending_prefill_tokens.assert_not_called()
+
     def test_find_best_rank_without_cache_hit(self, mock_vllm_config,
                                               mock_kv_cache_config,
                                               mock_structured_output_manager):
