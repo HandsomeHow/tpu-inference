@@ -48,8 +48,8 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import \
     KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
-import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
+import tpu_inference.envs as envs
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   MESH_AXIS_NAMES_2D,
@@ -344,9 +344,49 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
+        self._layer_name_to_kvcache_index_tuple: tuple[tuple[str, int],
+                                                       ...] | None = None
+        self._layer_name_to_kvcache_index_tuple_len = -1
+        self._layer_name_to_runtime_mapping_tuple = None
+        self._layer_name_to_runtime_mapping_tuple_len = -1
+        self._compact_attn_metadata = not envs.DISABLE_AIOS_EXP
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
+
+    def _get_layer_name_to_kvcache_index_tuple(self) -> tuple[tuple[str, int],
+                                                              ...]:
+        if (self._layer_name_to_kvcache_index_tuple is None
+                or self._layer_name_to_kvcache_index_tuple_len
+                != len(self.layer_name_to_kvcache_index)):
+            self._layer_name_to_kvcache_index_tuple = tuple(
+                self.layer_name_to_kvcache_index.items())
+            self._layer_name_to_kvcache_index_tuple_len = len(
+                self.layer_name_to_kvcache_index)
+        return self._layer_name_to_kvcache_index_tuple
+
+    def _get_layer_name_to_runtime_mapping_tuple(self):
+        if not self._compact_attn_metadata:
+            return self._get_layer_name_to_kvcache_index_tuple()
+        if (self._layer_name_to_runtime_mapping_tuple is not None and
+                self._layer_name_to_runtime_mapping_tuple_len
+                == len(self.layer_name_to_kvcache_index)):
+            return self._layer_name_to_runtime_mapping_tuple
+
+        attn_metadata_index_by_layer = {}
+        for gid, kv_cache_group in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+            for layer_name in kv_cache_group.layer_names:
+                attn_metadata_index_by_layer[layer_name] = gid
+
+        self._layer_name_to_runtime_mapping_tuple = tuple(
+            (layer_name, kv_cache_index,
+             attn_metadata_index_by_layer.get(layer_name, 0))
+            for layer_name, kv_cache_index in
+            self.layer_name_to_kvcache_index.items())
+        self._layer_name_to_runtime_mapping_tuple_len = len(
+            self.layer_name_to_kvcache_index)
+        return self._layer_name_to_runtime_mapping_tuple
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -1004,6 +1044,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     scheduler_output) as kv_connector_output:
                 # NOTE(Wenlong): It takes both `input_ids` and `inputs_embeds`,
                 # but one of them would be `None`
+                layer_name_to_kvcache_index = (
+                    self._get_layer_name_to_runtime_mapping_tuple())
                 (self.kv_caches, hidden_states, aux_hidden_states,
                  expert_indices) = self.model_fn(
                      self.state_leaves,
@@ -1012,7 +1054,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                      attn_metadata,
                      inputs_embeds,
                      input_positions,
-                     tuple(self.layer_name_to_kvcache_index.items()),
+                     layer_name_to_kvcache_index,
                      lora_metadata,
                      intermediate_tensors,
                      self.is_first_rank,
@@ -1953,12 +1995,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 "block_tables_gid_0") if not no_kv_cache else None
             attention_metadata = build_attn(block_tables)
         else:
-            attention_metadata = {
-                name: build_attn(metadata[f"block_tables_gid_{gid}"])
-                for gid, kv_cache_group in enumerate(
-                    self.kv_cache_config.kv_cache_groups)
-                for name in kv_cache_group.layer_names
-            }
+            if self._compact_attn_metadata:
+                attention_metadata = tuple(
+                    build_attn(metadata[f"block_tables_gid_{gid}"])
+                    for gid, _ in enumerate(
+                        self.kv_cache_config.kv_cache_groups))
+            else:
+                attention_metadata = {
+                    name: build_attn(metadata[f"block_tables_gid_{gid}"])
+                    for gid, kv_cache_group in enumerate(
+                        self.kv_cache_config.kv_cache_groups)
+                    for name in kv_cache_group.layer_names
+                }
 
         # Async scheduling: substitute placeholder tokens for DP
         if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
