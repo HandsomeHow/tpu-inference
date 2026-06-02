@@ -23,6 +23,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from tpu_inference.layers.common.gdn_attention import (
     GdnAttentionConfig,
     RaggedGatedDeltaRuleImpl,
+    _exchange_pcp_token_shards_for_head_shards,
     run_jax_gdn_attention,
     run_jax_gdn_attention_local,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -56,6 +57,42 @@ def _make_pcp_mesh(pcp_size: int) -> Mesh:
 
 class TestGdnAttentionPcpPrefill:
     """Test PCP prefill path produces same results as non-PCP baseline."""
+
+    def test_token_to_head_exchange_keeps_only_local_head_shard(self):
+        pcp_size = 4
+        if len(jax.devices()) < pcp_size:
+            pytest.skip(f"Need {pcp_size} devices, have {len(jax.devices())}")
+
+        num_tokens = 32
+        full_dim = 64
+        mesh = _make_pcp_mesh(pcp_size)
+        x = jnp.arange(num_tokens * full_dim,
+                       dtype=jnp.int32).reshape(num_tokens, full_dim)
+
+        def exchange(local_x):
+            return _exchange_pcp_token_shards_for_head_shards(
+                local_x,
+                ShardingAxisNameBase.PREFILL_CONTEXT,
+                pcp_size,
+            )
+
+        mapped_exchange = jax.shard_map(
+            exchange,
+            mesh=mesh,
+            in_specs=P(ShardingAxisNameBase.ATTN_DATA, None),
+            out_specs=P(None, ShardingAxisNameBase.PREFILL_CONTEXT),
+            check_vma=False,
+        )
+
+        x_dev = jax.device_put(
+            x,
+            NamedSharding(mesh, P(ShardingAxisNameBase.ATTN_DATA, None)),
+        )
+        exchanged = mapped_exchange(x_dev)
+
+        np.testing.assert_array_equal(np.array(exchanged), np.array(x))
+        local_shapes = {shard.data.shape for shard in exchanged.addressable_shards}
+        assert local_shapes == {(num_tokens, full_dim // pcp_size)}
 
     @pytest.fixture(params=[
         pytest.param({"pcp_size": 2, "interleave_size": 16,

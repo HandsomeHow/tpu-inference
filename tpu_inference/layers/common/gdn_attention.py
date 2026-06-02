@@ -326,6 +326,30 @@ def _slice_dim(tensor: jnp.ndarray, slice_index: jnp.ndarray | int,
                                         axis=axis)
 
 
+def _exchange_pcp_token_shards_for_head_shards(
+    tensor: jnp.ndarray,
+    pcp_axis: str,
+    pcp_size: int,
+    *,
+    head_axis: int = -1,
+) -> jnp.ndarray:
+    """Exchange PCP token shards for PCP head shards.
+
+    PCP prefill inputs are sharded by token over the PCP axis. GDN runs with PCP
+    as extra head parallelism, so each rank needs all tokens for only its head
+    shard. A tiled all-to-all performs that exchange without materializing the
+    full head dimension on every PCP rank.
+    """
+    if head_axis < 0:
+        head_axis += tensor.ndim
+    assert tensor.shape[head_axis] % pcp_size == 0
+    return jax.lax.all_to_all(tensor,
+                              axis_name=pcp_axis,
+                              split_axis=head_axis,
+                              concat_axis=0,
+                              tiled=True)
+
+
 def run_jax_gdn_attention_pcp_tp_prefill(
     j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
@@ -424,13 +448,15 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         query_start_loc_, state_indices_, distribution_, seq_lens_,
         local_reorder_indices,
     ):
-        # AllGather token data across PCP ranks
-        full_qkv = jax.lax.all_gather(
-            local_qkv, axis_name=pcp_axis, axis=0, tiled=True)
-        full_b = jax.lax.all_gather(
-            local_b, axis_name=pcp_axis, axis=0, tiled=True)
-        full_a = jax.lax.all_gather(
-            local_a, axis_name=pcp_axis, axis=0, tiled=True)
+        # Exchange token-parallel PCP shards for head-parallel PCP shards.
+        # This yields all tokens for only the current PCP rank's head slice,
+        # avoiding a full-dimension all-gather before the recurrent scan.
+        packed_qkv_shard = _exchange_pcp_token_shards_for_head_shards(
+            local_qkv, pcp_axis, pcp_size)
+        packed_b_shard = _exchange_pcp_token_shards_for_head_shards(
+            local_b, pcp_axis, pcp_size)
+        packed_a_shard = _exchange_pcp_token_shards_for_head_shards(
+            local_a, pcp_axis, pcp_size)
         full_reorder = jax.lax.all_gather(
             local_reorder_indices, axis_name=pcp_axis, axis=0, tiled=True)
 
@@ -440,20 +466,18 @@ def run_jax_gdn_attention_pcp_tp_prefill(
         scatter_indices = jnp.where(valid_mask, full_reorder, full_reorder.size)
         gather_indices = jnp.where(valid_mask, full_reorder, 0)
 
-        seq_qkv = jnp.zeros_like(full_qkv)
-        seq_b = jnp.zeros_like(full_b)
-        seq_a = jnp.zeros_like(full_a)
+        seq_qkv = jnp.zeros_like(packed_qkv_shard)
+        seq_b = jnp.zeros_like(packed_b_shard)
+        seq_a = jnp.zeros_like(packed_a_shard)
 
         # Scatter packed -> sequential. Invalid padding entries use an
         # out-of-bounds index and are dropped instead of overwriting token 0.
-        seq_qkv = seq_qkv.at[scatter_indices].set(full_qkv, mode="drop")
-        seq_b = seq_b.at[scatter_indices].set(full_b, mode="drop")
-        seq_a = seq_a.at[scatter_indices].set(full_a, mode="drop")
+        qkv_shard = seq_qkv.at[scatter_indices].set(packed_qkv_shard,
+                                                    mode="drop")
+        b_shard = seq_b.at[scatter_indices].set(packed_b_shard, mode="drop")
+        a_shard = seq_a.at[scatter_indices].set(packed_a_shard, mode="drop")
 
         rank = jax.lax.axis_index(pcp_axis)
-        qkv_shard = _slice_dim(seq_qkv, rank, pcp_size, axis=-1)
-        b_shard = _slice_dim(seq_b, rank, pcp_size, axis=-1)
-        a_shard = _slice_dim(seq_a, rank, pcp_size, axis=-1)
         weight_shard = _slice_dim(conv_weight_, rank, pcp_size, axis=0)
         bias_shard = (None if conv_bias_ is None else
                       _slice_dim(conv_bias_, rank, pcp_size, axis=0))
