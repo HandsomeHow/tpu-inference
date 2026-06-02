@@ -274,10 +274,26 @@ class VllmModelWrapper:
         # Returning to the jax land, so we need to wrap it into a JaxValue.
         return jax_view(params_and_buffers), lora_manager
 
-    def jit_step_func(self):
+    def jit_step_func(self,
+                      params_treedef=None,
+                      closed_params=None,
+                      params_in_shardings=None):
+        donate_argnames = ("kv_caches", )
+        step_in_shardings = (
+            (params_in_shardings, None, None, None, None, None, None, None)
+            if params_in_shardings is not None else None)
+
+        def restore_params(params_and_buffers):
+            if closed_params is not None:
+                return closed_params
+            if params_treedef is None:
+                return params_and_buffers
+            return jax.tree_util.tree_unflatten(params_treedef,
+                                                params_and_buffers)
 
         @jax.jit(
-            donate_argnames=("kv_caches", ),
+            in_shardings=step_in_shardings,
+            donate_argnames=donate_argnames,
             out_shardings=(
                 None,  # kv_caches - keep original sharding
                 NamedSharding(self.mesh,
@@ -313,14 +329,37 @@ class VllmModelWrapper:
             *args,
         ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array]] | Tuple[
                 List[jax.Array], jax.Array, List[jax.Array], jax.Array]:
-            layer_name_to_kvcache_index = dict(layer_name_to_kvcache_index)
+            params_and_buffers = restore_params(params_and_buffers)
+            if (layer_name_to_kvcache_index and
+                    len(layer_name_to_kvcache_index[0]) == 3):
+                layer_name_to_attn_metadata_index = {
+                    name: attn_idx
+                    for name, _, attn_idx in layer_name_to_kvcache_index
+                }
+                layer_name_to_kvcache_index = {
+                    name: kv_idx
+                    for name, kv_idx, _ in layer_name_to_kvcache_index
+                }
+                attn_metadata_for_context = {
+                    name: attn_metadata[attn_idx]
+                    for name, attn_idx in
+                    layer_name_to_attn_metadata_index.items()
+                }
+            else:
+                layer_name_to_kvcache_index = dict(layer_name_to_kvcache_index)
+                attn_metadata_for_context = attn_metadata
             lora_metadata = torch_view(lora_metadata)
+            torch_params_and_buffers = torch_view(params_and_buffers)
+            torch_input_ids = torch_view(input_ids)
+            torch_input_positions = torch_view(input_positions)
+            torch_input_embeds = torch_view(input_embeds)
+
             with torchax.default_env(), set_vllm_model_wrapper_context(
                     kv_caches=kv_caches,
                     mesh=self.mesh,
                     layer_name_to_kvcache_index=layer_name_to_kvcache_index,
                     vllm_config=self.vllm_config), set_forward_context(
-                        attn_metadata=attn_metadata,
+                        attn_metadata=attn_metadata_for_context,
                         vllm_config=self.vllm_config):
                 # We need to wrap args from jax land into TorchValue with
                 # torch_view in order to call the Torch function.
@@ -328,17 +367,19 @@ class VllmModelWrapper:
                     self.model, lora_metadata, self.vllm_config.lora_config)
                 if not is_first_rank:
                     intermediate_tensors = intermediate_tensors.to_torch()
+
                 output_from_torch = torch.func.functional_call(
                     self.model,
-                    torch_view(params_and_buffers),
+                    torch_params_and_buffers,
                     kwargs={
-                        "input_ids": torch_view(input_ids),
-                        "positions": torch_view(input_positions),
+                        "input_ids": torch_input_ids,
+                        "positions": torch_input_positions,
                         "intermediate_tensors": intermediate_tensors,
-                        "inputs_embeds": torch_view(input_embeds),
+                        "inputs_embeds": torch_input_embeds,
                     },
                     tie_weights=False,
                 )
+
                 replace_lora_metadata(self.model, original_lora_metadata,
                                       self.vllm_config.lora_config)
                 vllm_model_wrapper_context = get_vllm_model_wrapper_context()
@@ -418,7 +459,76 @@ class VllmModelWrapper:
                 hidden_states, hidden_prenorm = jax_view(output_from_torch)
             return new_kv_caches, hidden_states, [hidden_prenorm], None
 
-        return draft_step_fun if self.is_draft_model else step_fun
+        def _wrap_step_fun_for_compiled_call(fn, label):
+            use_explicit_compiled_call = not envs.DISABLE_AIOS_EXP
+            compiled_call_cache = {}
+
+            def _leaf_signature(leaf):
+                shape = getattr(leaf, "shape", None)
+                dtype = getattr(leaf, "dtype", None)
+                sharding = getattr(leaf, "sharding", None)
+                return (tuple(shape) if shape is not None else None,
+                        str(dtype) if dtype is not None else type(leaf).__name__,
+                        str(sharding)[:200] if sharding is not None else None)
+
+            def _small_tree_signature(value):
+                leaves, treedef = jax.tree_util.tree_flatten(value)
+                return (str(treedef), tuple(_leaf_signature(leaf)
+                                            for leaf in leaves))
+
+            def _compiled_call_key(args, kwargs):
+                del kwargs
+                params = args[0] if len(args) > 0 else None
+                kv_caches = args[1] if len(args) > 1 else None
+                input_ids = args[2] if len(args) > 2 else None
+                attn_metadata = args[3] if len(args) > 3 else None
+                input_embeds = args[4] if len(args) > 4 else None
+                input_positions = args[5] if len(args) > 5 else None
+                layer_mapping = args[6] if len(args) > 6 else None
+                lora_metadata = args[7] if len(args) > 7 else None
+                intermediate_tensors = args[8] if len(args) > 8 else None
+                is_first_rank = args[9] if len(args) > 9 else None
+                is_last_rank = args[10] if len(args) > 10 else None
+                return (
+                    "params", len(params) if isinstance(params, tuple) else
+                    type(params).__name__,
+                    "kv", len(kv_caches) if isinstance(kv_caches,
+                                                       (list, tuple)) else
+                    type(kv_caches).__name__,
+                    "input_ids", _leaf_signature(input_ids),
+                    "attn_metadata", _small_tree_signature(attn_metadata),
+                    "input_embeds", _small_tree_signature(input_embeds),
+                    "input_positions", _small_tree_signature(input_positions),
+                    "layer_mapping", len(layer_mapping)
+                    if isinstance(layer_mapping, tuple) else
+                    type(layer_mapping).__name__,
+                    "lora", _small_tree_signature(lora_metadata),
+                    "intermediate", _small_tree_signature(intermediate_tensors),
+                    "ranks", bool(is_first_rank), bool(is_last_rank),
+                )
+
+            def _compiled_dynamic_args(args):
+                if label == "step_fun":
+                    # AOT compiled callables receive only non-static args.
+                    return args[:6] + args[7:9]
+                if label == "draft_step_fun":
+                    return args[:5]
+                return args
+
+            def compiled_step_fun(*args, **kwargs):
+                key = _compiled_call_key(args, kwargs)
+                compiled = compiled_call_cache.get(key)
+                if compiled is None:
+                    compiled = fn.lower(*args, **kwargs).compile()
+                    compiled_call_cache[key] = compiled
+                return compiled(*_compiled_dynamic_args(args))
+
+            return compiled_step_fun if use_explicit_compiled_call else fn
+
+        if self.is_draft_model:
+            return _wrap_step_fun_for_compiled_call(draft_step_fun,
+                                                    "draft_step_fun")
+        return _wrap_step_fun_for_compiled_call(step_fun, "step_fun")
 
     def wrap_precompile_vision_encoder_fn(
         self,
@@ -525,19 +635,35 @@ class VllmModelWrapper:
 
         return embed_input_ids_func
 
-    def jit_compute_logits_func(self):
+    def jit_compute_logits_func(self,
+                                params_treedef=None,
+                                closed_params=None,
+                                params_in_shardings=None):
+        logits_in_shardings = ((params_in_shardings, None, None)
+                               if params_in_shardings is not None else None)
+
+        def restore_params(params_and_buffers):
+            if closed_params is not None:
+                return closed_params
+            if params_treedef is None:
+                return params_and_buffers
+            return jax.tree_util.tree_unflatten(params_treedef,
+                                                params_and_buffers)
 
         # TODO(gxd3): revisit if the sharding below is the best way to shard the
         # output logits.
-        @jax.jit(out_shardings=(NamedSharding(
-            self.mesh,
-            PartitionSpec(ShardingAxisName.MLP_DATA,
-                          ShardingAxisName.MLP_TENSOR))))
+        @jax.jit(
+            in_shardings=logits_in_shardings,
+            out_shardings=(NamedSharding(
+                self.mesh,
+                PartitionSpec(ShardingAxisName.MLP_DATA,
+                              ShardingAxisName.MLP_TENSOR))))
         def compute_logits_func(
             params_and_buffers: Any,
             hidden_states: jax.Array,
             lora_metadata,
         ) -> jax.Array:
+            params_and_buffers = restore_params(params_and_buffers)
             lora_metadata = torch_view(lora_metadata)
             with torchax.default_env(), set_vllm_model_wrapper_context(
                     kv_caches=None, mesh=self.mesh):

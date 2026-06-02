@@ -539,8 +539,27 @@ def get_vllm_model(
     )
     params, lora_manager = model.load_weights(shared_params=shared_params)
 
-    jit_model = model.jit_step_func()
-    compute_logits_fn = model.jit_compute_logits_func()
+    aios_exp_enabled = not envs.DISABLE_AIOS_EXP
+    if aios_exp_enabled:
+        params_leaves, params_treedef = jax.tree_util.tree_flatten(params)
+        dispatch_params = tuple(params_leaves)
+        closed_params = None
+        params_in_shardings = tuple(
+            leaf.sharding if isinstance(leaf, jax.Array) else None
+            for leaf in params_leaves)
+    else:
+        params_treedef = None
+        dispatch_params = params
+        closed_params = None
+        params_in_shardings = None
+
+    jit_model = model.jit_step_func(params_treedef=params_treedef,
+                                    closed_params=closed_params,
+                                    params_in_shardings=params_in_shardings)
+    compute_logits_fn = model.jit_compute_logits_func(
+        params_treedef=params_treedef,
+        closed_params=closed_params,
+        params_in_shardings=params_in_shardings)
     pooler_fn = model.build_pooler_func()
     combine_hidden_states_fn = model.jit_combine_hidden_states_func()
 
@@ -569,7 +588,7 @@ def get_vllm_model(
         combine_hidden_states_fn=combine_hidden_states_fn,
         multimodal_fns=multimodal_fns,
         state=params,
-        state_leaves=params,
+        state_leaves=dispatch_params,
         lora_manager=lora_manager,
         model=model,
     )
