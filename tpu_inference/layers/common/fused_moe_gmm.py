@@ -28,7 +28,8 @@ from tpu_inference.kernels.sparse_core.ragged_gather import ragged_gather
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce
 from tpu_inference.layers.common.quantization import quantize_tensor
-from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sharding import (ShardingAxisName,
+                                                  get_moe_expert_shard_axis)
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import get_mesh_shape_product
 
@@ -197,7 +198,8 @@ def moe_gmm_local(x: jax.Array,
                   parallelism: Literal["tp", "ep"],
                   enable_rs_kernel: bool = False,
                   onehot_moe_permute_threshold: int = 0,
-                  scatter_results: bool = False) -> jax.Array:
+                  scatter_results: bool = False,
+                  ep_axis=None) -> jax.Array:
     """Main MoE logic on a local shard can run in TP or EP mode.
 
     Set parallelism for "tp" or "ep"
@@ -241,7 +243,7 @@ def moe_gmm_local(x: jax.Array,
         mask = jnp.full((batch_size, ), True).reshape(-1, topk, 1)
 
     reduction_axis = (ShardingAxisName.MLP_TENSOR
-                      if parallelism == "tp" else ShardingAxisName.EXPERT)
+                      if parallelism == "tp" else ep_axis)
 
     if local_group_size < group_sizes.size:
         if batch_size <= onehot_moe_permute_threshold:
@@ -429,8 +431,9 @@ def expert_parallel_gmm(
     scatter_results: bool = False,
     data_axes=None,
 ) -> jax.Array:
-    ep_size = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
-    ep_p_spec = P(ShardingAxisName.EXPERT)
+    expert_axis = get_moe_expert_shard_axis(mesh)
+    ep_size = get_mesh_shape_product(mesh, expert_axis)
+    ep_p_spec = P(expert_axis)
     data_axes = ShardingAxisName.MLP_DATA if data_axes is None else data_axes
     data_p_spec = P(data_axes)
     ep_data_p_spec = P(ShardingAxisName.EXPERT_DATA)
@@ -457,6 +460,7 @@ def expert_parallel_gmm(
             activation=activation,
             topk=topk,
             parallelism="ep",
+            ep_axis=expert_axis,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             enable_rs_kernel=enable_rs_kernel,
             scatter_results=scatter_results,
@@ -632,10 +636,10 @@ def fused_moe_func(
         topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
 
         if use_ep:
-            num_ep_shard = get_mesh_shape_product(mesh,
-                                                  ShardingAxisName.EXPERT)
+            expert_axis = get_moe_expert_shard_axis(mesh)
+            num_ep_shard = get_mesh_shape_product(mesh, expert_axis)
             local_num_experts = global_num_experts // num_ep_shard
-            shard_idx = jax.lax.axis_index(ShardingAxisName.EXPERT)
+            shard_idx = jax.lax.axis_index(expert_axis)
 
             experts_start = shard_idx * local_num_experts
             experts_end = experts_start + local_num_experts

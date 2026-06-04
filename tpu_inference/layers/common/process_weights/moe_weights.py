@@ -25,7 +25,8 @@ import tpu_inference.envs as envs
 from tpu_inference.layers.common.moe import MoEBackend
 from tpu_inference.layers.common.quantization import (dequantize_tensor,
                                                       quantize_tensor)
-from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sharding import (ShardingAxisName,
+                                                  get_moe_expert_shard_axis)
 from tpu_inference.layers.common.utils import (
     general_device_put, reorder_concatenated_tensor_for_sharding)
 from tpu_inference.logger import init_logger
@@ -557,7 +558,8 @@ def _get_moe_weight_shardings(
     """
     match moe_backend:
         case MoEBackend.FUSED_MOE | MoEBackend.GMM_EP:
-            ep_sharding = NamedSharding(mesh, P(ShardingAxisName.EXPERT))
+            ep_sharding = NamedSharding(mesh,
+                                        P(get_moe_expert_shard_axis(mesh)))
             return FusedMoEWeights(
                 w13_weight=ep_sharding,
                 w13_weight_scale=ep_sharding,
@@ -641,15 +643,7 @@ def shard_moe_weights(
 
 
 def _get_expert_shard_axis(mesh: Mesh) -> str | tuple[str, ...]:
-    expert_axis = ShardingAxisName.EXPERT
-    if isinstance(expert_axis, str):
-        assert expert_axis in mesh.axis_names, f"{expert_axis} not in mesh {mesh}!"
-        return expert_axis
-    else:
-        if all(a in mesh.axis_names for a in expert_axis):
-            return expert_axis
-        else:
-            return mesh.axis_names[0]
+    return get_moe_expert_shard_axis(mesh)
 
 
 def shard_moe_weights_to_tpu(

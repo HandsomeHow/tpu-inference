@@ -120,6 +120,29 @@ class LazyShardingAxisName:
 ShardingAxisName = LazyShardingAxisName()
 
 
+def get_moe_expert_shard_axis(mesh: Mesh) -> str | tuple[str, ...]:
+    """Returns the mesh axis used to shard MoE experts.
+
+    MoE EP can use PCP as extra physical parallelism. Keep this local to MoE
+    instead of adding PCP to ShardingAxisName.EXPERT globally, because other
+    specs may already use PCP on their data axis.
+    """
+    expert_axis = ShardingAxisName.EXPERT
+    expert_axes = (expert_axis, ) if isinstance(expert_axis,
+                                                str) else tuple(expert_axis)
+
+    pcp_axis = ShardingAxisName.PREFILL_CONTEXT
+    if isinstance(pcp_axis, str) and pcp_axis in mesh.axis_names:
+        expert_axes = (*expert_axes, pcp_axis)
+
+    expert_axes = tuple(axis for axis in expert_axes if axis in mesh.axis_names)
+    if not expert_axes:
+        return mesh.axis_names[0]
+    if len(expert_axes) == 1:
+        return expert_axes[0]
+    return expert_axes
+
+
 @dataclass
 class ShardingStrategy:
     """Defines the high-level parallelism strategy.

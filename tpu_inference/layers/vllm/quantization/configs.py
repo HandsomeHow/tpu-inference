@@ -28,7 +28,8 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
 from tpu_inference.layers.common.process_weights.linear_weights import \
     get_model_matmul_fusion_assignment
 from tpu_inference.layers.common.quantization.configs import QuantLinearConfig
-from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sharding import (ShardingAxisName,
+                                                  get_moe_expert_shard_axis)
 from tpu_inference.utils import TPU_SECOND_LAST_MINOR, get_mesh_shape_product
 
 # yapf: enable
@@ -125,5 +126,32 @@ class VllmQuantConfig:
         assert isinstance(layer, FusedMoE)
         moe_config = layer.moe_config
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
-        moe_config.moe_parallel_config.use_ep = use_ep
+        parallel_config = moe_config.moe_parallel_config
+        parallel_config.use_ep = use_ep
+        if use_ep:
+            expert_axis = get_moe_expert_shard_axis(self.mesh)
+            mesh_ep_size = get_mesh_shape_product(self.mesh, expert_axis)
+            if parallel_config.ep_size != 1:
+                logger.info_once(
+                    "Disabling vLLM-side MoE expert slicing; TPU MoE EP "
+                    "will shard full expert weights over axis %s with size "
+                    "%s.", expert_axis, mesh_ep_size)
+            parallel_config.tp_size = 1
+            parallel_config.tp_rank = 0
+            parallel_config.ep_size = 1
+            parallel_config.ep_rank = 0
+
+            layer.moe_parallel_config = parallel_config
+            layer.expert_map_manager.moe_parallel_config = parallel_config
+            layer.expert_map_manager.global_num_experts = layer.global_num_experts
+            layer.expert_map_manager._placement_strategy = (
+                layer.expert_map_manager._determine_placement_strategy(
+                    layer.expert_placement_strategy))
+            layer.expert_map_manager._calculate_expert_maps()
+            layer.expert_map_manager._routing_tables = (
+                layer.expert_map_manager._init_routing_tables())
+            layer.expert_map_manager._init_aiter_shared_experts_topK_buffer()
+            layer.update_expert_map_info()
+            moe_config.num_local_experts = layer.local_num_experts
+            moe_config.moe_parallel_config = parallel_config
         return moe_config

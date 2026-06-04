@@ -42,7 +42,8 @@ from tpu_inference.layers.common.process_weights.moe_weights import (
 from tpu_inference.layers.common.quant_methods import UNQUANTIZED
 from tpu_inference.layers.common.quantization import \
     unquantized as common_unquantized
-from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sharding import (ShardingAxisName,
+                                                  get_moe_expert_shard_axis)
 from tpu_inference.layers.common.utils import general_device_put
 from tpu_inference.layers.vllm.interface.moe import (
     select_moe_backend_from_fused_moe_config, vllm_moe_apply)
@@ -386,7 +387,8 @@ class VllmUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod,
 
         # Under Pathways, shard weights directly onto the TPU mesh to avoid
         # placing a full unsharded copy on a single device (OOM for large MoE).
-        ep_sharding = NamedSharding(self.mesh, P(ShardingAxisName.EXPERT))
+        ep_sharding = NamedSharding(self.mesh,
+                                    P(get_moe_expert_shard_axis(self.mesh)))
         w13_weight = _load_weight_for_layer(layer, "w13_weight", ep_sharding)
         w2_weight = _load_weight_for_layer(layer, "w2_weight", ep_sharding)
         # Free CPU memory immediately
