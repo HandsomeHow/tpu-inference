@@ -346,3 +346,33 @@ def test_page_group_kernel_handles_two_lanes():
                                expected,
                                rtol=5e-4,
                                atol=5e-5)
+
+
+def test_page_group_kernel_handles_multiple_kv_and_q_heads():
+    rng = np.random.default_rng(1357)
+    q_by_rank = rng.normal(size=(PCP_SIZE, Q_TILE, 2, 2,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    kv_cache = rng.normal(size=(PCP_SIZE, 1, PAGE_SIZE, 2, 2,
+                                HEAD_DIM)).astype(np.float32) * 0.1
+    schedule = _make_single_page_group_schedule()
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    out = pcp_streaming_attention_page_groups(
+        jnp.asarray(q_by_rank),
+        jnp.asarray(kv_cache),
+        jnp.asarray(schedule.packed_schedule),
+        pcp_size=PCP_SIZE,
+        q_block_size=Q_TILE,
+        sm_scale=sm_scale,
+        collective_id=20,
+    )
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               kv_cache,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-4,
+                               atol=5e-5)

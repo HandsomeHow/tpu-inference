@@ -319,7 +319,48 @@ def _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
             "page-group MVP requires head_dim to be 128-aligned.")
 
 
-def pcp_streaming_attention_page_groups(
+def _validate_common_page_group_inputs(q_by_rank, kv_cache_by_rank,
+                                       packed_schedule, pcp_size,
+                                       q_block_size):
+    if q_by_rank.ndim != 5:
+        raise ValueError("q_by_rank must have shape "
+                         "[pcp, local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_by_rank.ndim != 6:
+        raise ValueError("kv_cache_by_rank must have shape "
+                         "[pcp, pages, page_size, kv_heads, 2, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_by_rank.shape[0] != pcp_size or kv_cache_by_rank.shape[0] != pcp_size:
+        raise ValueError("q_by_rank and kv_cache_by_rank must be sharded over "
+                         "pcp_size ranks.")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_by_rank.shape[1] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if kv_cache_by_rank.shape[3] != q_by_rank.shape[2]:
+        raise ValueError("Q kv_heads and KV kv_heads must match.")
+    if kv_cache_by_rank.shape[4] != 2:
+        raise ValueError("KV cache must store K/V pair at axis 4.")
+    if q_by_rank.shape[-1] != kv_cache_by_rank.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_by_rank.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+
+
+def _pcp_streaming_attention_page_groups_single_head(
     q_by_rank,
     kv_cache_by_rank,
     packed_schedule,
@@ -413,6 +454,63 @@ def pcp_streaming_attention_page_groups(
             check_vma=False,
         ))
     return shard_map_kernel(q_by_rank, kv_cache_by_rank, packed_schedule)
+
+
+def pcp_streaming_attention_page_groups(
+    q_by_rank,
+    kv_cache_by_rank,
+    packed_schedule,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+):
+    """Run RingAttention-style PCP page groups.
+
+    This wrapper supports multiple KV heads and Q heads per KV head by invoking
+    the single-head Pallas kernel for each head pair.
+    """
+    _validate_common_page_group_inputs(q_by_rank, kv_cache_by_rank,
+                                       packed_schedule, pcp_size,
+                                       q_block_size)
+    kv_heads = q_by_rank.shape[2]
+    q_per_kv = q_by_rank.shape[3]
+    if kv_heads == 1 and q_per_kv == 1:
+        return _pcp_streaming_attention_page_groups_single_head(
+            q_by_rank,
+            kv_cache_by_rank,
+            packed_schedule,
+            pcp_size=pcp_size,
+            q_block_size=q_block_size,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+        )
+
+    head_outputs = []
+    for kv_head_idx in range(kv_heads):
+        q_head_outputs = []
+        kv_slice = kv_cache_by_rank[:, :, :, kv_head_idx:kv_head_idx + 1]
+        for q_head_idx in range(q_per_kv):
+            q_slice = q_by_rank[:, :, kv_head_idx:kv_head_idx + 1,
+                                q_head_idx:q_head_idx + 1]
+            if collective_id is None:
+                head_collective_id = None
+            else:
+                head_collective_id = (collective_id + kv_head_idx * q_per_kv +
+                                      q_head_idx)
+            q_head_outputs.append(
+                _pcp_streaming_attention_page_groups_single_head(
+                    q_slice,
+                    kv_slice,
+                    packed_schedule,
+                    pcp_size=pcp_size,
+                    q_block_size=q_block_size,
+                    sm_scale=sm_scale,
+                    collective_id=head_collective_id,
+                ))
+        head_outputs.append(jnp.concatenate(q_head_outputs, axis=3))
+    return jnp.concatenate(head_outputs, axis=2)
 
 
 def pcp_streaming_attention_single_page_group(
