@@ -32,6 +32,8 @@ import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference import envs
 from tpu_inference.kernels.experimental.batched_rpa import \
     wrapper as batched_rpa_wrapper
+from tpu_inference.kernels.experimental.pcp_streaming_rpa import (
+    pcp_streaming_attention_page_groups_packed_local)
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from tpu_inference.layers.common.attention_metadata import (AttentionMetadata,
@@ -366,6 +368,7 @@ def sharded_ragged_paged_attention(
     pcp_cu_k_lens: jax.Array | None = None,
     pcp_slot_ids: jax.Array | None = None,
     pcp_source_block_tables: jax.Array | None = None,
+    pcp_streaming_schedule: jax.Array | None = None,
 ):
     """Shards along KV heads."""
     if use_pcp_decode:
@@ -440,6 +443,7 @@ def sharded_ragged_paged_attention(
             pcp_q_start_offsets=pcp_q_start_offsets,
             pcp_cu_k_lens=pcp_cu_k_lens,
             pcp_slot_ids=pcp_slot_ids,
+            pcp_streaming_schedule=pcp_streaming_schedule,
         )
 
     data_axis = (ShardingAxisName.ATTN_DATA
@@ -831,6 +835,7 @@ def sharded_pcp_ragged_paged_attention(
     pcp_q_start_offsets: jax.Array | None = None,
     pcp_cu_k_lens: jax.Array | None = None,
     pcp_slot_ids: jax.Array | None = None,
+    pcp_streaming_schedule: jax.Array | None = None,
 ):
     """Runs local-query/full-KV RPA over the prefill context axis."""
     if attention_sink is not None:
@@ -845,12 +850,6 @@ def sharded_pcp_ragged_paged_attention(
     pcp_size = mesh.shape[pcp_axis]
     if get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT) > 1:
         raise NotImplementedError("PCP RPA does not support DCP yet.")
-
-    if not _ragged_paged_attention_accepts_pcp_metadata(
-            ragged_paged_attention):
-        raise NotImplementedError(
-            "PCP RPA requires the batched RPA wrapper with local-Q/full-KV "
-            "metadata support.")
 
     precomputed_pcp_metadata = (
         pcp_kv_lens,
@@ -869,12 +868,43 @@ def sharded_pcp_ragged_paged_attention(
             "PCP RPA requires all precomputed PCP metadata fields when any "
             "one of them is provided.")
 
+    streaming_requested = (envs.USE_PCP_STREAMING_RPA_KERNEL
+                           and pcp_streaming_schedule is not None)
+    if streaming_requested:
+        if not has_precomputed_pcp_metadata:
+            raise ValueError(
+                "PCP streaming RPA requires precomputed PCP metadata from "
+                "the runner.")
+        if attention_chunk_size is not None:
+            raise NotImplementedError(
+                "PCP streaming RPA supports full attention only.")
+        if q_scale is not None or k_scale is not None or v_scale is not None:
+            raise NotImplementedError(
+                "PCP streaming RPA does not support quantized Q/K/V scales.")
+        if not update_kv_cache:
+            raise NotImplementedError(
+                "PCP streaming RPA requires update_kv_cache=True.")
+        if cp_kv_cache_interleave_size != kv_cache.shape[1]:
+            raise NotImplementedError(
+                "PCP streaming RPA currently requires "
+                "cp_kv_cache_interleave_size == page_size.")
+    elif not _ragged_paged_attention_accepts_pcp_metadata(
+            ragged_paged_attention):
+        raise NotImplementedError(
+            "PCP RPA requires the batched RPA wrapper with local-Q/full-KV "
+            "metadata support.")
+
     qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.KV_CACHE_HEAD,
                  None)
     kv_cache_spec = P(ShardingAxisName.KV_CACHE_BLOCK, None,
                       ShardingAxisName.KV_CACHE_HEAD, None, None)
     metadata_spec = P(ShardingAxisName.BATCH)
     pcp_metadata_spec = P(ShardingAxisName.ATTN_DATA)
+    if pcp_streaming_schedule is not None and pcp_streaming_schedule.ndim == 4:
+        pcp_streaming_schedule_spec = P(None, None, None, None)
+    else:
+        pcp_streaming_schedule_spec = P(ShardingAxisName.BATCH, None, None,
+                                        None, None)
     in_specs = (
         qkv_spec,
         qkv_spec,
@@ -898,10 +928,18 @@ def sharded_pcp_ragged_paged_attention(
             pcp_metadata_spec,  # pcp_slot_ids
         )
         args += precomputed_pcp_metadata
+    if streaming_requested:
+        in_specs += (pcp_streaming_schedule_spec, )
+        args += (pcp_streaming_schedule, )
 
     def _pcp_ragged_paged_attention(q_local, k_local, v_local, kv_cache,
                                     kv_lens, page_indices, cu_q_lens,
-                                    distribution, *pcp_metadata_args):
+                                    distribution, *extra_pcp_args):
+        num_pcp_metadata_args = (len(precomputed_pcp_metadata)
+                                 if has_precomputed_pcp_metadata else 0)
+        pcp_metadata_args = extra_pcp_args[:num_pcp_metadata_args]
+        streaming_schedule_arg = (extra_pcp_args[num_pcp_metadata_args]
+                                  if streaming_requested else None)
         kv_indices = _make_pcp_interleaved_token_indices(
             kv_lens,
             k_local.shape[0],
@@ -932,6 +970,26 @@ def sharded_pcp_ragged_paged_attention(
         if update_kv_cache:
             kv_cache = _update_local_paged_kv_cache(kv_cache, k_local, v_local,
                                                     slot_ids)
+        if streaming_requested:
+            if q_local.shape[1] % k_local.shape[1] != 0:
+                raise ValueError("Q heads must be divisible by KV heads.")
+            q_per_kv = q_local.shape[1] // k_local.shape[1]
+            q_streaming = q_local.reshape(q_local.shape[0], k_local.shape[1],
+                                          q_per_kv, q_local.shape[2])
+            if streaming_schedule_arg.ndim == 5:
+                streaming_schedule_arg = streaming_schedule_arg[0]
+            output = pcp_streaming_attention_page_groups_packed_local(
+                q_streaming,
+                kv_cache,
+                streaming_schedule_arg,
+                pcp_size=pcp_size,
+                q_block_size=envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
+                sm_scale=sm_scale,
+                collective_id=23,
+                mesh_axis_names=tuple(mesh.axis_names),
+                pcp_axis_name=pcp_axis,
+            )
+            return output.reshape(q_local.shape), kv_cache
         full_k = jax.lax.all_gather(k_local,
                                     axis_name=pcp_axis,
                                     axis=0,
@@ -1152,6 +1210,7 @@ def attention(
         pcp_cu_k_lens=md.pcp_cu_k_lens,
         pcp_slot_ids=md.pcp_slot_ids,
         pcp_source_block_tables=md.pcp_source_block_tables,
+        pcp_streaming_schedule=md.pcp_streaming_schedule,
     )
 
     return kv_cache, output

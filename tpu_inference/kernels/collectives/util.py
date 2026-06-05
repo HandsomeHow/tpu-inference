@@ -2,9 +2,16 @@
 """utilities for collective kernels."""
 
 import functools
+from typing import Any
 
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+
+def _device_id_tuple(device_id: Any) -> tuple[Any, ...]:
+    if isinstance(device_id, tuple):
+        return device_id
+    return (device_id, )
 
 
 def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
@@ -23,7 +30,7 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
         pltpu.semaphore_signal(
             barrier_sem,
             inc=1,
-            device_id=(neighbor, ),
+            device_id=_device_id_tuple(neighbor),
             device_id_type=pl.DeviceIdType.MESH,
         )
     pltpu.semaphore_wait(barrier_sem, 2)
@@ -41,7 +48,7 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
                 pltpu.semaphore_signal(
                     second_barrier,
                     inc=1,
-                    device_id=(neighbor, ),
+                    device_id=_device_id_tuple(neighbor),
                     device_id_type=pl.DeviceIdType.MESH,
                 )
             pltpu.semaphore_wait(second_barrier, 2)

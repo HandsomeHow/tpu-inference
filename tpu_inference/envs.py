@@ -40,6 +40,9 @@ if TYPE_CHECKING:
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     USE_BATCHED_RPA_KERNEL: bool = False
+    USE_PCP_STREAMING_RPA_KERNEL: bool = False
+    PCP_STREAMING_RPA_NUM_LANES: int = 1
+    PCP_STREAMING_RPA_Q_BLOCK_SIZE: int = 256
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -188,6 +191,17 @@ def env_int_list(env_name: str) -> Callable[[], list[int]]:
     return _get_int_list_env
 
 
+def env_int(env_name: str, default: int) -> Callable[[], int]:
+
+    def _get_int_env() -> int:
+        value = os.getenv(env_name)
+        if value is None or value == "":
+            return default
+        return int(value)
+
+    return _get_int_env
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # JAX platform selection (e.g., "tpu", "cpu", "proxy", "proxy,cpu")
     "JAX_PLATFORMS":
@@ -301,6 +315,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("JAX_PROFILER_SERVER_PORT") or "9999"),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
+    "USE_PCP_STREAMING_RPA_KERNEL":
+    env_bool("USE_PCP_STREAMING_RPA_KERNEL"),
+    "PCP_STREAMING_RPA_NUM_LANES":
+    env_int("PCP_STREAMING_RPA_NUM_LANES", default=1),
+    "PCP_STREAMING_RPA_Q_BLOCK_SIZE":
+    env_int("PCP_STREAMING_RPA_Q_BLOCK_SIZE", default=256),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),

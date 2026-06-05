@@ -1174,6 +1174,91 @@ def test_sharded_rpa_pcp_path_consumes_precomputed_metadata(monkeypatch):
                                   np.asarray(kv_cache) + 3)
 
 
+def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
+    monkeypatch.setattr(ShardingAxisName, "_cls", ShardingAxisNameBase)
+    monkeypatch.setenv("USE_PCP_STREAMING_RPA_KERNEL", "1")
+    monkeypatch.setenv("PCP_STREAMING_RPA_Q_BLOCK_SIZE", "2")
+    devices = np.array(jax.local_devices()[:1] * 2).reshape((1, 1, 1, 1, 1, 2))
+    pcp_mesh = Mesh(
+        devices,
+        ("data", "attn_dp", "attn_dp_expert", "expert", "model", "pcp"))
+
+    q = jnp.ones((4, 2, 128), dtype=jnp.float32)
+    k = jnp.ones((4, 1, 128), dtype=jnp.float32)
+    v = jnp.full((4, 1, 128), 2.0, dtype=jnp.float32)
+    kv_cache = jnp.zeros((2, 4, 2, 1, 128), dtype=jnp.float32)
+    streaming_schedule = jnp.zeros((1, 2, 2, 1, 128), dtype=jnp.int32)
+    captured = {}
+
+    def fake_cache_update(kv_cache_arg, k_arg, v_arg, slot_ids_arg):
+        captured["slot_ids"] = slot_ids_arg
+        return kv_cache_arg + 5
+
+    def fake_streaming_kernel(q_arg, kv_cache_arg, schedule_arg, **kwargs):
+        captured["q_shape"] = q_arg.shape
+        captured["kv_cache"] = kv_cache_arg
+        captured["schedule"] = schedule_arg
+        captured["pcp_size"] = kwargs["pcp_size"]
+        captured["q_block_size"] = kwargs["q_block_size"]
+        captured["sm_scale"] = kwargs["sm_scale"]
+        return jnp.full_like(q_arg, 7.0)
+
+    monkeypatch.setattr(
+        "tpu_inference.layers.common.attention_interface._update_local_paged_kv_cache",
+        fake_cache_update,
+    )
+    monkeypatch.setattr(
+        "tpu_inference.layers.common.attention_interface.pcp_streaming_attention_page_groups_packed_local",
+        fake_streaming_kernel,
+    )
+    monkeypatch.setattr(
+        "tpu_inference.layers.common.attention_interface.ragged_paged_attention",
+        lambda *_, **__: pytest.fail("old PCP RPA path must not run"),
+    )
+    monkeypatch.setattr(
+        "jax.lax.all_gather",
+        lambda *_, **__: pytest.fail("streaming path must not all_gather KV"),
+    )
+    monkeypatch.setattr("jax.shard_map", lambda inner_fn, **_: inner_fn)
+
+    out, new_cache = sharded_ragged_paged_attention(
+        mesh=pcp_mesh,
+        q=q,
+        k=k,
+        v=v,
+        kv_cache=kv_cache,
+        kv_lens=jnp.array([8], dtype=jnp.int32),
+        page_indices=jnp.zeros((2, ), dtype=jnp.int32),
+        cu_q_lens=jnp.array([0, 4], dtype=jnp.int32),
+        distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+        attention_sink=None,
+        sm_scale=0.25,
+        pcp_mode=PcpMode.PREFILL_LOCAL_Q_FULL_KV,
+        cp_kv_cache_interleave_size=4,
+        pcp_kv_lens=jnp.array([8, 8], dtype=jnp.int32),
+        pcp_page_indices=jnp.arange(4, dtype=jnp.int32),
+        pcp_query_start_loc=jnp.array([0, 2, 4], dtype=jnp.int32),
+        pcp_request_distribution=jnp.array([0, 0, 2], dtype=jnp.int32),
+        pcp_q_start_offsets=jnp.array([0, 4], dtype=jnp.int32),
+        pcp_cu_k_lens=jnp.array([0, 0, 8], dtype=jnp.int32),
+        pcp_slot_ids=jnp.array([0, 1, 2, 3], dtype=jnp.int32),
+        pcp_streaming_schedule=streaming_schedule,
+    )
+
+    assert out.shape == q.shape
+    np.testing.assert_array_equal(np.asarray(out), np.full(q.shape, 7.0))
+    np.testing.assert_array_equal(np.asarray(new_cache),
+                                  np.asarray(kv_cache) + 5)
+    assert captured["q_shape"] == (4, 1, 2, 128)
+    np.testing.assert_array_equal(captured["slot_ids"],
+                                  np.array([0, 1, 2, 3], dtype=np.int32))
+    np.testing.assert_array_equal(captured["schedule"],
+                                  np.zeros((2, 2, 1, 128), dtype=np.int32))
+    assert captured["pcp_size"] == 2
+    assert captured["q_block_size"] == 2
+    assert captured["sm_scale"] == 0.25
+
+
 def test_sharded_rpa_legacy_pcp_flags_select_explicit_modes(monkeypatch, mesh):
     q = jnp.ones((4, 1, 128), dtype=jnp.float32)
     k = jnp.ones((4, 1, 128), dtype=jnp.float32)
@@ -1444,6 +1529,8 @@ def test_attention_forwards_precomputed_pcp_metadata(monkeypatch, mesh):
         "pcp_slot_ids": jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),
         "pcp_source_block_tables": jnp.arange(16,
                                               dtype=jnp.int32).reshape(4, 4),
+        "pcp_streaming_schedule": jnp.zeros((1, 2, 2, 1, 128),
+                                            dtype=jnp.int32),
     }
     attention_metadata = AttentionMetadata(
         input_positions=jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),

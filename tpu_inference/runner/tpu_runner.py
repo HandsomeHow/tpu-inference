@@ -50,6 +50,8 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
+from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
+    ScheduleField, generate_pcp_streaming_schedule)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.pcp_layout import (
     apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order,
@@ -423,6 +425,7 @@ class _PCPAttentionMetadataHost:
     q_start_offsets: np.ndarray
     cu_k_lens: np.ndarray
     slot_ids: np.ndarray
+    streaming_schedule: np.ndarray | None = None
 
 
 def _pcp_chunks_per_seq(max_num_tokens: int, pcp_size: int,
@@ -598,6 +601,9 @@ def _build_pcp_attention_metadata(
     padded_num_tokens: int,
     max_num_reqs_per_dp_rank: int,
     block_size: int,
+    build_streaming_schedule: bool = False,
+    streaming_num_lanes: int = 1,
+    streaming_q_block_size: int = 256,
 ) -> _PCPAttentionMetadataHost:
     """Build runner-owned local-Q/full-KV metadata for one DP rank."""
     if pcp_size <= 1:
@@ -704,6 +710,30 @@ def _build_pcp_attention_metadata(
         rank_request_distribution.append(
             np.array([0, 0, pseudo_seq_count], dtype=np.int32))
 
+    streaming_schedule = None
+    if build_streaming_schedule:
+        local_padded_num_tokens = padded_num_tokens // pcp_size
+        if local_padded_num_tokens % streaming_q_block_size != 0:
+            raise ValueError(
+                "PCP streaming schedule requires local padded tokens to be a "
+                "multiple of streaming_q_block_size: got "
+                f"{local_padded_num_tokens=} and {streaming_q_block_size=}.")
+        virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
+        source_block_tables = block_tables[:, :virtual_blocks_per_req]
+        cu_q_lens = np.pad(np.cumsum(q_lens_full, dtype=np.int32), (1, 0))
+        streaming_schedule = generate_pcp_streaming_schedule(
+            kv_lens=kv_lens_full,
+            cu_q_lens=cu_q_lens,
+            q_start_offsets=q_global_base,
+            block_tables=source_block_tables,
+            page_size=block_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            num_lanes=streaming_num_lanes,
+            bq_sz=streaming_q_block_size,
+            pad_kv_pages_to_pcp_group=True,
+        ).packed_schedule
+
     return _PCPAttentionMetadataHost(
         kv_lens=np.concatenate(rank_kv_lens),
         page_indices=np.concatenate(rank_page_indices),
@@ -720,12 +750,32 @@ def _build_pcp_attention_metadata(
             interleave_size,
             padded_num_tokens,
         ),
+        streaming_schedule=streaming_schedule,
     )
 
 
 def _merge_pcp_attention_metadata(
     metadata_per_dp: list[_PCPAttentionMetadataHost],
 ) -> _PCPAttentionMetadataHost:
+    streaming_schedules = [m.streaming_schedule for m in metadata_per_dp]
+    if all(schedule is None for schedule in streaming_schedules):
+        merged_streaming_schedule = None
+    elif any(schedule is None for schedule in streaming_schedules):
+        raise ValueError("PCP streaming schedules must be present for every "
+                         "DP rank or for none.")
+    else:
+        max_steps = max(schedule.shape[0] for schedule in streaming_schedules)
+        first_schedule = streaming_schedules[0]
+        schedule_shape = (len(streaming_schedules), max_steps,
+                          *first_schedule.shape[1:])
+        merged_streaming_schedule = np.zeros(schedule_shape, dtype=np.int32)
+        merged_streaming_schedule[..., ScheduleField.REQ_ID] = -1
+        for dp_rank, schedule in enumerate(streaming_schedules):
+            if schedule.shape[1:] != first_schedule.shape[1:]:
+                raise ValueError("PCP streaming schedule static dimensions "
+                                 "must match across DP ranks.")
+            merged_streaming_schedule[dp_rank, :schedule.shape[0]] = schedule
+
     return _PCPAttentionMetadataHost(
         kv_lens=np.concatenate([m.kv_lens for m in metadata_per_dp]),
         page_indices=np.concatenate([m.page_indices for m in metadata_per_dp]),
@@ -737,6 +787,7 @@ def _merge_pcp_attention_metadata(
             [m.q_start_offsets for m in metadata_per_dp]),
         cu_k_lens=np.concatenate([m.cu_k_lens for m in metadata_per_dp]),
         slot_ids=np.concatenate([m.slot_ids for m in metadata_per_dp]),
+        streaming_schedule=merged_streaming_schedule,
     )
 
 
@@ -2155,6 +2206,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             self.mesh, PartitionSpec(ShardingAxisName.BATCH))
         source_block_tables_sharding = NamedSharding(
             self.mesh, PartitionSpec(ShardingAxisName.BATCH, None))
+        pcp_streaming_schedule_sharding = NamedSharding(
+            self.mesh,
+            PartitionSpec(ShardingAxisName.BATCH, None, None, None, None))
 
         (req_ids_dp, req_indices_dp, num_scheduled_tokens_per_dp_rank,
          scheduled_tokens_per_dp_rank, num_req_per_dp_rank,
@@ -2476,6 +2530,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         pcp_attention_metadata_by_gid: dict[int, dict[str, jax.Array]] = {}
         if (use_pcp or use_pcp_decode) and block_table_views_by_gid:
+            build_pcp_streaming_schedule = envs.USE_PCP_STREAMING_RPA_KERNEL
+            pcp_streaming_num_lanes = envs.PCP_STREAMING_RPA_NUM_LANES
+            pcp_streaming_q_block_size = envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE
             for gid, block_tables_view in block_table_views_by_gid.items():
                 if use_pcp:
                     metadata_per_dp = []
@@ -2494,6 +2551,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 padded_num_scheduled_tokens_per_dp_rank,
                                 max_num_reqs_per_dp_rank,
                                 self.block_size,
+                                build_streaming_schedule=(
+                                    build_pcp_streaming_schedule),
+                                streaming_num_lanes=pcp_streaming_num_lanes,
+                                streaming_q_block_size=(
+                                    pcp_streaming_q_block_size),
                             ))
                     host_pcp_metadata = _merge_pcp_attention_metadata(
                         metadata_per_dp)
@@ -2508,6 +2570,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                      host_pcp_metadata.cu_k_lens,
                                      host_pcp_metadata.slot_ids),
                          sharding=token_data_sharding)
+                    pcp_streaming_schedule = None
+                    if host_pcp_metadata.streaming_schedule is not None:
+                        pcp_streaming_schedule = device_array(
+                            self.mesh,
+                            host_pcp_metadata.streaming_schedule,
+                            sharding=pcp_streaming_schedule_sharding)
                     pcp_attention_metadata_by_gid[gid] = {
                         "pcp_kv_lens": pcp_kv_lens,
                         "pcp_page_indices": pcp_page_indices,
@@ -2516,6 +2584,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         "pcp_q_start_offsets": pcp_q_start_offsets,
                         "pcp_cu_k_lens": pcp_cu_k_lens,
                         "pcp_slot_ids": pcp_slot_ids,
+                        "pcp_streaming_schedule": pcp_streaming_schedule,
                     }
                 else:
                     metadata_per_dp = []
@@ -2642,6 +2711,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 pcp_slot_ids=pcp_metadata.get("pcp_slot_ids"),
                 pcp_source_block_tables=pcp_metadata.get(
                     "pcp_source_block_tables"),
+                pcp_streaming_schedule=pcp_metadata.get(
+                    "pcp_streaming_schedule"),
                 pcp_gdn_reorder_indices=pcp_gdn_reorder_indices,
                 padded_num_reqs=attn_padded_num_reqs,
             )

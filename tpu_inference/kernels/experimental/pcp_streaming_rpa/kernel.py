@@ -158,6 +158,12 @@ def _load_local_kv_page(kv_cache_ref, kv_vmem_ref, sem, local_page_idx, *,
         load.wait()
 
 
+def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
+    return tuple(
+        pcp_rank if axis_name == pcp_axis_name else lax.axis_index(axis_name)
+        for axis_name in mesh_axis_names)
+
+
 def _pcp_streaming_attention_page_groups_kernel(
     q_ref,
     kv_cache_ref,
@@ -181,10 +187,14 @@ def _pcp_streaming_attention_page_groups_kernel(
     kv_head_idx,
     kv_packing,
     packed_kv_cache,
+    mesh_axis_names,
+    pcp_axis_name,
 ):
-    my_id = lax.axis_index(AXIS)
+    my_id = lax.axis_index(pcp_axis_name)
     next_rank = lax.rem(my_id + 1, pcp_size)
     prev_rank = lax.rem(my_id + pcp_size - 1, pcp_size)
+    next_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, next_rank)
+    prev_device_id = _mesh_device_id(mesh_axis_names, pcp_axis_name, prev_rank)
 
     o_vmem_ref[...] = jnp.zeros_like(o_vmem_ref)
     for block_idx in range(num_q_blocks):
@@ -245,7 +255,7 @@ def _pcp_streaming_attention_page_groups_kernel(
                 packed_kv_cache=packed_kv_cache,
             )
 
-            util.local_barrier(prev_rank, next_rank)
+            util.local_barrier(prev_device_id, next_device_id)
 
             m = jnp.where(group_is_first_kv,
                           jnp.full_like(m, -jnp.inf),
@@ -275,7 +285,7 @@ def _pcp_streaming_attention_page_groups_kernel(
                                                      round_idx],
                         recv_sem=remote_recv_sems.at[lane, group_idx,
                                                      round_idx],
-                        device_id=(next_rank, ),
+                        device_id=next_device_id,
                         device_id_type=pl.DeviceIdType.MESH,
                     )
                     remote_op.start()
@@ -503,6 +513,8 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
     kv_head_idx: int = 0,
     kv_packing: int = 1,
     packed_kv_cache: bool = False,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
 ):
     page_size = kv_cache_single_head.shape[2]
     head_dim = q_single_head.shape[-1]
@@ -522,6 +534,8 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             kv_head_idx=kv_head_idx,
             kv_packing=kv_packing,
             packed_kv_cache=packed_kv_cache,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
         ),
         out_shape=jax.ShapeDtypeStruct(
             (1, q_single_head.shape[1], 1, 1, head_dim),
@@ -569,6 +583,8 @@ def pcp_streaming_attention_page_groups_local(
     q_block_size: int,
     sm_scale: float,
     collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
 ):
     """Run PCP streaming page groups inside an existing PCP shard_map.
 
@@ -605,6 +621,8 @@ def pcp_streaming_attention_page_groups_local(
                 q_block_size=q_block_size,
                 sm_scale=sm_scale,
                 collective_id=head_collective_id,
+                mesh_axis_names=mesh_axis_names,
+                pcp_axis_name=pcp_axis_name,
             )
             q_head_outputs.append(out[0])
         head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
@@ -620,6 +638,8 @@ def pcp_streaming_attention_page_groups_packed_local(
     q_block_size: int,
     sm_scale: float,
     collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
 ):
     """Run PCP streaming page groups on batched-RPA packed KV cache layout.
 
@@ -660,6 +680,8 @@ def pcp_streaming_attention_page_groups_packed_local(
                 kv_head_idx=kv_head_idx,
                 kv_packing=kv_packing,
                 packed_kv_cache=True,
+                mesh_axis_names=mesh_axis_names,
+                pcp_axis_name=pcp_axis_name,
             )
             q_head_outputs.append(out[0])
         head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
@@ -675,6 +697,8 @@ def _pcp_streaming_attention_page_groups_single_head(
     q_block_size: int,
     sm_scale: float,
     collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
 ):
     """Run RingAttention-style PCP page groups.
 
@@ -703,6 +727,8 @@ def _pcp_streaming_attention_page_groups_single_head(
             q_block_size=q_block_size,
             sm_scale=sm_scale,
             collective_id=collective_id,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
         )
 
     mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
@@ -730,6 +756,8 @@ def pcp_streaming_attention_page_groups(
     q_block_size: int,
     sm_scale: float,
     collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
 ):
     """Run RingAttention-style PCP page groups.
 
@@ -750,6 +778,8 @@ def pcp_streaming_attention_page_groups(
             q_block_size=q_block_size,
             sm_scale=sm_scale,
             collective_id=collective_id,
+            mesh_axis_names=mesh_axis_names,
+            pcp_axis_name=pcp_axis_name,
         )
 
     head_outputs = []
@@ -773,6 +803,8 @@ def pcp_streaming_attention_page_groups(
                     q_block_size=q_block_size,
                     sm_scale=sm_scale,
                     collective_id=head_collective_id,
+                    mesh_axis_names=mesh_axis_names,
+                    pcp_axis_name=pcp_axis_name,
                 ))
         head_outputs.append(jnp.concatenate(q_head_outputs, axis=3))
     return jnp.concatenate(head_outputs, axis=2)
@@ -786,6 +818,8 @@ def pcp_streaming_attention_single_page_group(
     pcp_size: int,
     sm_scale: float,
     collective_id: int | None = 13,
+    mesh_axis_names: tuple[str, ...] = (AXIS, ),
+    pcp_axis_name: str = AXIS,
 ):
     """Run one RingAttention-style PCP page group."""
     if packed_schedule.shape[0] != pcp_size:
@@ -800,4 +834,6 @@ def pcp_streaming_attention_single_page_group(
         q_block_size=q_by_rank.shape[1],
         sm_scale=sm_scale,
         collective_id=collective_id,
+        mesh_axis_names=mesh_axis_names,
+        pcp_axis_name=pcp_axis_name,
     )

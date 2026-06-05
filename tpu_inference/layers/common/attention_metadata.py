@@ -45,6 +45,7 @@ class PcpMode(enum.Enum):
         "pcp_cu_k_lens",
         "pcp_slot_ids",
         "pcp_source_block_tables",
+        "pcp_streaming_schedule",
         "pcp_gdn_reorder_indices",
     ],
     meta_fields=["padded_num_reqs"],
@@ -82,6 +83,7 @@ class AttentionMetadata(object):
     pcp_cu_k_lens: jax.Array | None = None
     pcp_slot_ids: jax.Array | None = None
     pcp_source_block_tables: jax.Array | None = None
+    pcp_streaming_schedule: jax.Array | None = None
     # (padded_total_num_scheduled_tokens,) int32 — maps packed rank-major
     # token position → original sequential position. Used by GDN layers
     # under PCP prefill to AllGather + reorder tokens to sequential order

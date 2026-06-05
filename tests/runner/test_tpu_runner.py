@@ -23,6 +23,8 @@ from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
 from vllm.config.multimodal import BaseDummyOptions
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
+    ScheduleField, unpack_pcp_streaming_schedule_field)
 from tpu_inference.models.common.interface import (ModelInterface,
                                                    MultiModalInterface)
 from tpu_inference.runner.tpu_runner import (TPUModelRunner,
@@ -183,6 +185,33 @@ class TestPCPTokenPacking:
         np.testing.assert_array_equal(
             metadata.slot_ids,
             np.array([28, 29, 30, 31, 28, 29, 30, 31], dtype=np.int32))
+
+    def test_build_attention_metadata_adds_streaming_schedule(self):
+        metadata = _build_pcp_attention_metadata(
+            num_scheduled_tokens_per_req=[8],
+            seq_lens_per_req=[8],
+            block_tables=np.array([[7, 8]], dtype=np.int32),
+            pcp_size=2,
+            interleave_size=4,
+            padded_num_tokens=8,
+            max_num_reqs_per_dp_rank=1,
+            block_size=4,
+            build_streaming_schedule=True,
+            streaming_num_lanes=1,
+            streaming_q_block_size=2,
+        )
+
+        schedule = metadata.streaming_schedule
+        assert schedule is not None
+        assert schedule.shape == (4, 2, 1, ScheduleField.PACKED_NUM_FIELDS)
+        req_id = unpack_pcp_streaming_schedule_field(schedule,
+                                                     ScheduleField.REQ_ID)
+        kv_page_idx = unpack_pcp_streaming_schedule_field(
+            schedule, ScheduleField.KV_PAGE_IDX)
+        assert np.any(req_id != -1)
+        # Streaming schedule consumes the local virtual PCP block table.
+        np.testing.assert_array_equal(np.unique(kv_page_idx[req_id != -1]),
+                                      np.array([7], dtype=np.int32))
 
     def test_build_attention_metadata_chunked_prefill_continuation(self):
         metadata = _build_pcp_attention_metadata(
