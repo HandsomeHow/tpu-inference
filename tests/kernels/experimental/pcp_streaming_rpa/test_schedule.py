@@ -116,8 +116,12 @@ def test_schedule_packed_fields_match_unpacked_arrays():
         bq_sz=2,
     )
 
-    assert schedule.packed_schedule.shape == (6, 4, 1,
-                                              ScheduleField.NUM_FIELDS)
+    assert schedule.packed_schedule.shape == (
+        6,
+        4,
+        1,
+        ScheduleField.PACKED_NUM_FIELDS,
+    )
     np.testing.assert_array_equal(
         unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
                                             ScheduleField.REQ_ID),

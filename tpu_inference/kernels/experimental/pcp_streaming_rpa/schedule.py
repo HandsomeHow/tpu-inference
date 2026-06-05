@@ -35,6 +35,7 @@ class ScheduleField:
     Q_TILE_SIZE = 10
     O_HBM_OFFSET = 11
     NUM_FIELDS = 12
+    PACKED_NUM_FIELDS = 128
 
 
 _PACKED_FIELD_NAMES = (
@@ -167,7 +168,7 @@ def pack_pcp_streaming_schedule_fields(
     q_tile_size: np.ndarray,
     o_hbm_offset: np.ndarray,
 ) -> np.ndarray:
-    """Pack schedule fields into [max_steps, pcp_size, lanes, fields]."""
+    """Pack schedule fields into [max_steps, pcp_size, lanes, padded_fields]."""
     field_arrays = (
         req_id,
         kv_page_rank,
@@ -184,7 +185,10 @@ def pack_pcp_streaming_schedule_fields(
     )
     if len({array.shape for array in field_arrays}) != 1:
         raise ValueError("all schedule fields must have identical shapes.")
-    packed = np.stack(field_arrays, axis=-1).astype(np.int32, copy=False)
+    logical = np.stack(field_arrays, axis=-1).astype(np.int32, copy=False)
+    padded_shape = logical.shape[:-1] + (ScheduleField.PACKED_NUM_FIELDS, )
+    packed = np.zeros(padded_shape, dtype=np.int32)
+    packed[..., :ScheduleField.NUM_FIELDS] = logical
     return np.transpose(packed, (1, 0, 2, 3)).copy()
 
 
