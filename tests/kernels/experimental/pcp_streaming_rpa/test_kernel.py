@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.kernel import (
+    pcp_streaming_attention_page_groups,
     pcp_streaming_attention_single_page_group)
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.reference import (
     execute_pcp_streaming_reference)
@@ -172,6 +173,46 @@ def test_single_page_group_kernel_handles_idle_consumer_ranks():
         pcp_size=PCP_SIZE,
         sm_scale=sm_scale,
         collective_id=15,
+    )
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               kv_cache,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-4,
+                               atol=5e-5)
+
+
+def test_page_group_kernel_matches_generated_multi_tile_schedule():
+    rng = np.random.default_rng(9012)
+    q_by_rank = rng.normal(size=(PCP_SIZE, 4 * Q_TILE, 1, 1,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    kv_cache = rng.normal(size=(PCP_SIZE, 1, PAGE_SIZE, 1, 2,
+                                HEAD_DIM)).astype(np.float32) * 0.1
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[PCP_SIZE * PAGE_SIZE],
+        cu_q_lens=[0, 32],
+        q_start_offsets=[3 * PAGE_SIZE],
+        block_tables=np.array([[0]], dtype=np.int32),
+        page_size=PAGE_SIZE,
+        pcp_size=PCP_SIZE,
+        interleave_size=PAGE_SIZE,
+        num_lanes=1,
+        bq_sz=Q_TILE,
+    )
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    out = pcp_streaming_attention_page_groups(
+        jnp.asarray(q_by_rank),
+        jnp.asarray(kv_cache),
+        jnp.asarray(schedule.packed_schedule),
+        pcp_size=PCP_SIZE,
+        q_block_size=Q_TILE,
+        sm_scale=sm_scale,
+        collective_id=16,
     )
     out.block_until_ready()
 

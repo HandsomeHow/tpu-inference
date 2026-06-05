@@ -13,6 +13,10 @@
 # limitations under the License.
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.kernel import (
+    pcp_streaming_attention_page_groups,
     pcp_streaming_attention_single_page_group)
 
-__all__ = ["pcp_streaming_attention_single_page_group"]
+__all__ = [
+    "pcp_streaming_attention_page_groups",
+    "pcp_streaming_attention_single_page_group",
+]
