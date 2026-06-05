@@ -154,12 +154,18 @@ def _pcp_streaming_attention_page_groups_kernel(
         zero_store.start()
         zero_store.wait()
 
+    m = jnp.full((q_block_size, 128), -jnp.inf, dtype=jnp.float32)
+    l = jnp.zeros((q_block_size, 128), dtype=jnp.float32)
+    acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]), dtype=jnp.float32)
+
     for group_idx in range(num_page_groups):
         group_start = group_idx * pcp_size
 
         _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
                             sched_dma_sem, group_start)
         q_hbm_offset = sched_vmem_ref[my_id, 0, ScheduleField.Q_HBM_OFFSET]
+        group_is_first_kv = sched_vmem_ref[
+            my_id, 0, ScheduleField.IS_FIRST_KV] != 0
         q_load = pltpu.make_async_copy(
             src_ref=q_ref.at[
                 0,
@@ -188,10 +194,12 @@ def _pcp_streaming_attention_page_groups_kernel(
 
         util.local_barrier(prev_rank, next_rank)
 
-        m = jnp.full((q_block_size, 128), -jnp.inf, dtype=jnp.float32)
-        l = jnp.zeros((q_block_size, 128), dtype=jnp.float32)
-        acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]),
-                        dtype=jnp.float32)
+        m = jnp.where(group_is_first_kv,
+                      jnp.full_like(m, -jnp.inf),
+                      m)
+        l = jnp.where(group_is_first_kv, jnp.zeros_like(l), l)
+        acc = jnp.where(group_is_first_kv, jnp.zeros_like(acc), acc)
+        group_has_last = jnp.array(False)
 
         for round_idx in range(pcp_size):
             curr_slot = round_idx % 2
@@ -200,6 +208,10 @@ def _pcp_streaming_attention_page_groups_kernel(
 
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
                                 sched_dma_sem, group_start + src_rank)
+            group_has_last = jnp.logical_or(
+                group_has_last,
+                sched_vmem_ref[my_id, 0, ScheduleField.IS_LAST_KV] != 0,
+            )
 
             if round_idx < pcp_size - 1:
                 remote_op = pltpu.make_async_remote_copy(
@@ -236,7 +248,7 @@ def _pcp_streaming_attention_page_groups_kernel(
         req_id = sched_vmem_ref[my_id, 0, ScheduleField.REQ_ID]
         o_hbm_offset = sched_vmem_ref[my_id, 0, ScheduleField.O_HBM_OFFSET]
 
-        @pl.when(req_id != -1)
+        @pl.when(jnp.logical_and(req_id != -1, group_has_last))
         def _store_output():
             o_store = pltpu.make_async_copy(
                 src_ref=o_vmem_ref.at[:, :],

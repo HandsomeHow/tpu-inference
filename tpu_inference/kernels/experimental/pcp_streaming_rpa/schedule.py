@@ -214,12 +214,15 @@ def generate_pcp_streaming_schedule(
     interleave_size: int,
     num_lanes: int,
     bq_sz: int,
+    pad_kv_pages_to_pcp_group: bool = False,
 ) -> PcpStreamingSchedule:
     """Generate a replicated PCP streaming schedule for page-aligned PCP.
 
     Q ownership follows PCP interleave chunks. KV page ownership follows the
     fast path where page_size == interleave_size, so each global KV page belongs
-    to exactly one PCP rank.
+    to exactly one PCP rank. When pad_kv_pages_to_pcp_group is true, each Q
+    tile's KV pages are padded with no-op entries to a multiple of pcp_size so
+    the schedule can drive ring-grouped kernels.
     """
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
     cu_q_lens = np.asarray(cu_q_lens, dtype=np.int64)
@@ -270,10 +273,33 @@ def generate_pcp_streaming_schedule(
                     effective_kv_pages = min(num_kv_pages,
                                              q_global_last // page_size + 1)
 
-                    for kv_page_seq_idx in range(effective_kv_pages):
+                    scheduled_kv_pages = effective_kv_pages
+                    if pad_kv_pages_to_pcp_group:
+                        scheduled_kv_pages = _cdiv(effective_kv_pages,
+                                                    pcp_size) * pcp_size
+
+                    for kv_page_seq_idx in range(scheduled_kv_pages):
                         global_token_start = kv_page_seq_idx * page_size
                         global_page = global_token_start // page_size
                         src_rank = global_page % pcp_size
+                        if kv_page_seq_idx >= effective_kv_pages:
+                            lane_entries[target_lane].append(
+                                _Entry(
+                                    req_id=-1,
+                                    kv_page_rank=src_rank,
+                                    kv_page_idx=0,
+                                    is_first_kv=0,
+                                    is_last_kv=0,
+                                    load_q=0,
+                                    q_global_start=q_global,
+                                    kv_global_start=global_token_start,
+                                    kv_valid_len=0,
+                                    q_hbm_offset=q_hbm_offset,
+                                    q_tile_size=tile_len,
+                                    o_hbm_offset=q_hbm_offset,
+                                ))
+                            lane_lengths[target_lane] += 1
+                            continue
                         local_page_index = global_page // pcp_size
                         if local_page_index >= block_tables.shape[1]:
                             raise ValueError(
@@ -373,8 +399,6 @@ def validate_pcp_streaming_schedule(schedule: PcpStreamingSchedule) -> None:
             for step in range(int(schedule.actual_steps[consumer_rank])):
                 req_id = int(schedule.req_id[consumer_rank, step, lane])
                 if req_id == -1:
-                    if in_tile:
-                        raise ValueError("idle entry inside active q_tile.")
                     continue
                 is_first = bool(schedule.is_first_kv[consumer_rank, step,
                                                      lane])

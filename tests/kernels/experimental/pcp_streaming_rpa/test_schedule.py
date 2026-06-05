@@ -103,6 +103,41 @@ def test_validate_schedule_lane_invariant_accepts_generated_schedule():
     validate_pcp_streaming_schedule(schedule)
 
 
+def test_generate_schedule_can_pad_kv_pages_to_pcp_groups():
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[10],
+        cu_q_lens=[0, 2],
+        q_start_offsets=[8],
+        block_tables=np.array([[100, 101]], dtype=np.int32),
+        page_size=2,
+        pcp_size=4,
+        interleave_size=2,
+        num_lanes=1,
+        bq_sz=2,
+        pad_kv_pages_to_pcp_group=True,
+    )
+
+    assert schedule.actual_steps[0] == 8
+    assert schedule.global_actual_steps[0] == 8
+    np.testing.assert_array_equal(schedule.req_id[0, :5, 0],
+                                  np.zeros(5, dtype=np.int32))
+    np.testing.assert_array_equal(schedule.req_id[0, 5:8, 0],
+                                  np.full(3, -1, dtype=np.int32))
+    np.testing.assert_array_equal(schedule.kv_page_rank[0, :8, 0],
+                                  np.array([0, 1, 2, 3, 0, 1, 2, 3],
+                                           dtype=np.int32))
+    np.testing.assert_array_equal(schedule.kv_page_idx[0, :5, 0],
+                                  np.array([100, 100, 100, 100, 101],
+                                           dtype=np.int32))
+    np.testing.assert_array_equal(schedule.is_first_kv[0, :8, 0],
+                                  np.array([1, 0, 0, 0, 0, 0, 0, 0],
+                                           dtype=np.int32))
+    np.testing.assert_array_equal(schedule.is_last_kv[0, :8, 0],
+                                  np.array([0, 0, 0, 0, 1, 0, 0, 0],
+                                           dtype=np.int32))
+    validate_pcp_streaming_schedule(schedule)
+
+
 def test_schedule_packed_fields_match_unpacked_arrays():
     schedule = generate_pcp_streaming_schedule(
         kv_lens=[12],
