@@ -16,9 +16,9 @@
 
 This module currently contains the first production-shaped MVP kernels for the
 RingAttention-style PCP path. They intentionally support only page-grouped
-schedules, one KV head, and one Q head per KV head. The goal is to keep the
-first kernels small while validating the real schedule staging + ring
-communication + online softmax control flow.
+schedules. Multi-head correctness is provided by invoking the single-head
+Pallas kernel once per head pair while the first optimized kernel keeps the
+schedule staging + ring communication + online softmax control flow small.
 """
 
 import functools
@@ -360,6 +360,158 @@ def _validate_common_page_group_inputs(q_by_rank, kv_cache_by_rank,
             "page-group MVP requires head_dim to be 128-aligned.")
 
 
+def _validate_common_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size):
+    if q_local.ndim != 4:
+        raise ValueError("q_local must have shape "
+                         "[local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_local.ndim != 5:
+        raise ValueError("kv_cache_local must have shape "
+                         "[pages, page_size, kv_heads, 2, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_local.shape[0] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if kv_cache_local.shape[2] != q_local.shape[1]:
+        raise ValueError("Q kv_heads and KV kv_heads must match.")
+    if kv_cache_local.shape[3] != 2:
+        raise ValueError("KV cache must store K/V pair at axis 3.")
+    if q_local.shape[-1] != kv_cache_local.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_local.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+
+
+def _pcp_streaming_attention_page_groups_single_head_pallas_call(
+    q_single_head,
+    kv_cache_single_head,
+    packed_schedule,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None,
+):
+    page_size = kv_cache_single_head.shape[2]
+    head_dim = q_single_head.shape[-1]
+    num_page_groups = packed_schedule.shape[0] // pcp_size
+    num_lanes = packed_schedule.shape[2]
+    num_q_blocks = q_single_head.shape[1] // q_block_size
+
+    return pl.pallas_call(
+        functools.partial(
+            _pcp_streaming_attention_page_groups_kernel,
+            pcp_size=pcp_size,
+            num_lanes=num_lanes,
+            q_block_size=q_block_size,
+            num_page_groups=num_page_groups,
+            num_q_blocks=num_q_blocks,
+            sm_scale=sm_scale,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (1, q_single_head.shape[1], 1, 1, head_dim),
+            jnp.float32,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+                pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA,
+                pltpu.SemaphoreType.DMA(
+                    (num_lanes, num_page_groups, pcp_size - 1)),
+                pltpu.SemaphoreType.DMA(
+                    (num_lanes, num_page_groups, pcp_size - 1)),
+                pltpu.VMEM((pcp_size, num_lanes,
+                            ScheduleField.PACKED_NUM_FIELDS),
+                           packed_schedule.dtype),
+                pltpu.VMEM((q_block_size, head_dim), q_single_head.dtype),
+                pltpu.VMEM((2, page_size, 2, head_dim),
+                           kv_cache_single_head.dtype),
+                pltpu.VMEM((q_block_size, head_dim), jnp.float32),
+            ),
+            grid=(1, ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=8 * 1024 * 1024,
+        ),
+        name="pcp_streaming_attention_page_groups",
+    )(q_single_head, kv_cache_single_head, packed_schedule)
+
+
+def pcp_streaming_attention_page_groups_local(
+    q_local,
+    kv_cache_local,
+    packed_schedule,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+):
+    """Run PCP streaming page groups inside an existing PCP shard_map.
+
+    Args:
+        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] for one PCP rank.
+        kv_cache_local: [pages, page_size, kv_heads, 2, head_dim] for one rank.
+        packed_schedule: Replicated [steps, pcp, lanes, 128] schedule.
+
+    Returns:
+        Local rank output with the same shape as q_local.
+    """
+    _validate_common_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size)
+    kv_heads = q_local.shape[1]
+    q_per_kv = q_local.shape[2]
+    head_outputs = []
+    for kv_head_idx in range(kv_heads):
+        q_head_outputs = []
+        kv_slice = kv_cache_local[:, :, kv_head_idx:kv_head_idx + 1]
+        for q_head_idx in range(q_per_kv):
+            q_slice = q_local[:, kv_head_idx:kv_head_idx + 1,
+                              q_head_idx:q_head_idx + 1]
+            if collective_id is None:
+                head_collective_id = None
+            else:
+                head_collective_id = (collective_id + kv_head_idx * q_per_kv +
+                                      q_head_idx)
+            out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
+                q_slice[None, ...],
+                kv_slice[None, ...],
+                packed_schedule,
+                pcp_size=pcp_size,
+                q_block_size=q_block_size,
+                sm_scale=sm_scale,
+                collective_id=head_collective_id,
+            )
+            q_head_outputs.append(out[0])
+        head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
+    return jnp.concatenate(head_outputs, axis=1)
+
+
 def _pcp_streaming_attention_page_groups_single_head(
     q_by_rank,
     kv_cache_by_rank,
@@ -388,57 +540,16 @@ def _pcp_streaming_attention_page_groups_single_head(
     _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
                                 pcp_size, q_block_size)
 
-    page_size = kv_cache_by_rank.shape[2]
-    head_dim = q_by_rank.shape[-1]
-    num_page_groups = packed_schedule.shape[0] // pcp_size
-    num_lanes = packed_schedule.shape[2]
-    num_q_blocks = q_by_rank.shape[1] // q_block_size
-
     def _call(q, kv_cache, schedule):
-        return pl.pallas_call(
-            functools.partial(
-                _pcp_streaming_attention_page_groups_kernel,
-                pcp_size=pcp_size,
-                num_lanes=num_lanes,
-                q_block_size=q_block_size,
-                num_page_groups=num_page_groups,
-                num_q_blocks=num_q_blocks,
-                sm_scale=sm_scale,
-            ),
-            out_shape=jax.ShapeDtypeStruct(
-                (1, q_by_rank.shape[1], 1, 1, head_dim),
-                jnp.float32,
-            ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=0,
-                in_specs=[
-                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                    pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                ],
-                out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
-                scratch_shapes=(
-                    pltpu.SemaphoreType.DMA,
-                    pltpu.SemaphoreType.DMA,
-                    pltpu.SemaphoreType.DMA(
-                        (num_lanes, num_page_groups, pcp_size - 1)),
-                    pltpu.SemaphoreType.DMA(
-                        (num_lanes, num_page_groups, pcp_size - 1)),
-                    pltpu.VMEM((pcp_size, num_lanes,
-                                ScheduleField.PACKED_NUM_FIELDS),
-                               schedule.dtype),
-                    pltpu.VMEM((q_block_size, head_dim), q.dtype),
-                    pltpu.VMEM((2, page_size, 2, head_dim), kv_cache.dtype),
-                    pltpu.VMEM((q_block_size, head_dim), jnp.float32),
-                ),
-                grid=(1, ),
-            ),
-            compiler_params=pltpu.CompilerParams(
-                collective_id=collective_id,
-                vmem_limit_bytes=8 * 1024 * 1024,
-            ),
-            name="pcp_streaming_attention_page_groups",
-        )(q, kv_cache, schedule)
+        return _pcp_streaming_attention_page_groups_single_head_pallas_call(
+            q,
+            kv_cache,
+            schedule,
+            pcp_size=pcp_size,
+            q_block_size=q_block_size,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+        )
 
     mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
     shard_map_kernel = jax.jit(

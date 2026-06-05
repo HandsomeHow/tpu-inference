@@ -21,6 +21,7 @@ import pytest
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.kernel import (
     pcp_streaming_attention_page_groups,
+    pcp_streaming_attention_page_groups_local,
     pcp_streaming_attention_single_page_group)
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.reference import (
     execute_pcp_streaming_reference)
@@ -32,6 +33,8 @@ PCP_SIZE = 4
 Q_TILE = 8
 PAGE_SIZE = 128
 HEAD_DIM = 128
+P = jax.sharding.PartitionSpec
+AXIS = "pcp"
 
 pytestmark = pytest.mark.skipif(
     jax.local_device_count() < PCP_SIZE
@@ -113,6 +116,36 @@ def _truncate_schedule(schedule, steps, actual_steps):
         actual_steps=np.asarray(actual_steps, dtype=np.int32),
         global_actual_steps=np.array([steps], dtype=np.int32),
     )
+
+
+def _run_page_groups_local(q_global, kv_cache_by_rank, packed_schedule, *,
+                           sm_scale, collective_id):
+    mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS, ))
+
+    def _call(q_local, kv_cache_local, schedule):
+        return pcp_streaming_attention_page_groups_local(
+            q_local,
+            kv_cache_local[0],
+            schedule,
+            pcp_size=PCP_SIZE,
+            q_block_size=Q_TILE,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+        )
+
+    fn = jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(AXIS, None, None, None),
+                P(AXIS, None, None, None, None, None),
+                P(None, None, None, None),
+            ),
+            out_specs=P(AXIS, None, None, None),
+            check_vma=False,
+        ))
+    return fn(q_global, kv_cache_by_rank, packed_schedule)
 
 
 def test_single_page_group_kernel_matches_reference():
@@ -372,6 +405,36 @@ def test_page_group_kernel_handles_multiple_kv_and_q_heads():
                                                kv_cache,
                                                schedule,
                                                sm_scale=sm_scale)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-4,
+                               atol=5e-5)
+
+
+def test_page_group_local_kernel_runs_inside_existing_pcp_shard_map():
+    rng = np.random.default_rng(9753)
+    q_by_rank = rng.normal(size=(PCP_SIZE, Q_TILE, 1, 1,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    q_global = q_by_rank.reshape(PCP_SIZE * Q_TILE, 1, 1, HEAD_DIM)
+    kv_cache = rng.normal(size=(PCP_SIZE, 1, PAGE_SIZE, 1, 2,
+                                HEAD_DIM)).astype(np.float32) * 0.1
+    schedule = _make_single_page_group_schedule()
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    out = _run_page_groups_local(
+        jnp.asarray(q_global),
+        jnp.asarray(kv_cache),
+        jnp.asarray(schedule.packed_schedule),
+        sm_scale=sm_scale,
+        collective_id=21,
+    )
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               kv_cache,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    expected = expected.reshape(PCP_SIZE * Q_TILE, 1, 1, HEAD_DIM)
     np.testing.assert_allclose(np.asarray(jax.device_get(out)),
                                expected,
                                rtol=5e-4,
