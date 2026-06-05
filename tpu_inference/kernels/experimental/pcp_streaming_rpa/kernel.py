@@ -16,8 +16,8 @@
 
 This module currently contains the first production-shaped MVP kernels for the
 RingAttention-style PCP path. They intentionally support only page-grouped
-single-lane schedules, one KV head, and one Q head per KV head. The goal is to
-keep the first kernels small while validating the real schedule staging + ring
+schedules, one KV head, and one Q head per KV head. The goal is to keep the
+first kernels small while validating the real schedule staging + ring
 communication + online softmax control flow.
 """
 
@@ -45,6 +45,7 @@ def _consume_scheduled_kv_page(
     sched_vmem_ref,
     slot,
     consumer_rank,
+    lane,
     m,
     l,
     acc,
@@ -55,14 +56,15 @@ def _consume_scheduled_kv_page(
     k = kv_vmem_ref.at[slot, :, 0, :][...].astype(jnp.float32)
     v = kv_vmem_ref.at[slot, :, 1, :][...].astype(jnp.float32)
 
-    q_global_start = sched_vmem_ref[
-        consumer_rank, 0, ScheduleField.Q_GLOBAL_START]
-    kv_global_start = sched_vmem_ref[
-        consumer_rank, 0, ScheduleField.KV_GLOBAL_START]
-    req_id = sched_vmem_ref[consumer_rank, 0, ScheduleField.REQ_ID]
-    kv_valid_len = sched_vmem_ref[consumer_rank, 0,
+    q_global_start = sched_vmem_ref[consumer_rank, lane,
+                                    ScheduleField.Q_GLOBAL_START]
+    kv_global_start = sched_vmem_ref[consumer_rank, lane,
+                                     ScheduleField.KV_GLOBAL_START]
+    req_id = sched_vmem_ref[consumer_rank, lane, ScheduleField.REQ_ID]
+    kv_valid_len = sched_vmem_ref[consumer_rank, lane,
                                   ScheduleField.KV_VALID_LEN]
-    q_tile_size = sched_vmem_ref[consumer_rank, 0, ScheduleField.Q_TILE_SIZE]
+    q_tile_size = sched_vmem_ref[consumer_rank, lane,
+                                 ScheduleField.Q_TILE_SIZE]
 
     scores = jnp.matmul(q, k.T, preferred_element_type=jnp.float32) * sm_scale
     q_pos = q_global_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
@@ -99,16 +101,16 @@ def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
     load_op.wait()
 
 
-def _source_page_idx_from_staged_schedule(sched_vmem_ref, source_rank,
+def _source_page_idx_from_staged_schedule(sched_vmem_ref, source_rank, lane,
                                           pcp_size):
     page_idx = jnp.array(0, dtype=jnp.int32)
     for consumer_rank in range(pcp_size):
-        req_id = sched_vmem_ref[consumer_rank, 0, ScheduleField.REQ_ID]
-        kv_page_rank = sched_vmem_ref[consumer_rank, 0,
+        req_id = sched_vmem_ref[consumer_rank, lane, ScheduleField.REQ_ID]
+        kv_page_rank = sched_vmem_ref[consumer_rank, lane,
                                       ScheduleField.KV_PAGE_RANK]
         candidate = jnp.logical_and(req_id != -1, kv_page_rank == source_rank)
         page_idx = jnp.where(candidate,
-                             sched_vmem_ref[consumer_rank, 0,
+                             sched_vmem_ref[consumer_rank, lane,
                                             ScheduleField.KV_PAGE_IDX],
                              page_idx)
     return page_idx
@@ -129,6 +131,7 @@ def _pcp_streaming_attention_page_groups_kernel(
     o_vmem_ref,
     *,
     pcp_size,
+    num_lanes,
     q_block_size,
     num_page_groups,
     num_q_blocks,
@@ -154,115 +157,123 @@ def _pcp_streaming_attention_page_groups_kernel(
         zero_store.start()
         zero_store.wait()
 
-    m = jnp.full((q_block_size, 128), -jnp.inf, dtype=jnp.float32)
-    l = jnp.zeros((q_block_size, 128), dtype=jnp.float32)
-    acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]), dtype=jnp.float32)
+    for lane in range(num_lanes):
+        m = jnp.full((q_block_size, 128), -jnp.inf, dtype=jnp.float32)
+        l = jnp.zeros((q_block_size, 128), dtype=jnp.float32)
+        acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]),
+                        dtype=jnp.float32)
 
-    for group_idx in range(num_page_groups):
-        group_start = group_idx * pcp_size
-
-        _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
-                            sched_dma_sem, group_start)
-        q_hbm_offset = sched_vmem_ref[my_id, 0, ScheduleField.Q_HBM_OFFSET]
-        group_is_first_kv = sched_vmem_ref[
-            my_id, 0, ScheduleField.IS_FIRST_KV] != 0
-        q_load = pltpu.make_async_copy(
-            src_ref=q_ref.at[
-                0,
-                pl.ds(q_hbm_offset, q_block_size),
-                0,
-                0,
-                :,
-            ],
-            dst_ref=q_vmem_ref.at[:, :],
-            sem=local_dma_sem,
-        )
-        q_load.start()
-        q_load.wait()
-
-        _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
-                            sched_dma_sem, group_start + my_id)
-        local_page_idx = _source_page_idx_from_staged_schedule(
-            sched_vmem_ref, my_id, pcp_size)
-        kv_load = pltpu.make_async_copy(
-            src_ref=kv_cache_ref.at[0, local_page_idx, :, 0, :, :],
-            dst_ref=kv_vmem_ref.at[0],
-            sem=local_dma_sem,
-        )
-        kv_load.start()
-        kv_load.wait()
-
-        util.local_barrier(prev_rank, next_rank)
-
-        m = jnp.where(group_is_first_kv,
-                      jnp.full_like(m, -jnp.inf),
-                      m)
-        l = jnp.where(group_is_first_kv, jnp.zeros_like(l), l)
-        acc = jnp.where(group_is_first_kv, jnp.zeros_like(acc), acc)
-        group_has_last = jnp.array(False)
-
-        for round_idx in range(pcp_size):
-            curr_slot = round_idx % 2
-            next_slot = 1 - curr_slot
-            src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
+        for group_idx in range(num_page_groups):
+            group_start = group_idx * pcp_size
 
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
-                                sched_dma_sem, group_start + src_rank)
-            group_has_last = jnp.logical_or(
-                group_has_last,
-                sched_vmem_ref[my_id, 0, ScheduleField.IS_LAST_KV] != 0,
-            )
-
-            if round_idx < pcp_size - 1:
-                remote_op = pltpu.make_async_remote_copy(
-                    src_ref=kv_vmem_ref.at[curr_slot],
-                    dst_ref=kv_vmem_ref.at[next_slot],
-                    send_sem=remote_send_sems.at[group_idx, round_idx],
-                    recv_sem=remote_recv_sems.at[group_idx, round_idx],
-                    device_id=(next_rank, ),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-                remote_op.start()
-
-            m, l, acc = _consume_scheduled_kv_page(
-                q_vmem_ref,
-                kv_vmem_ref,
-                sched_vmem_ref,
-                curr_slot,
-                my_id,
-                m,
-                l,
-                acc,
-                sm_scale=sm_scale,
-            )
-
-            if round_idx < pcp_size - 1:
-                remote_op.wait()
-
-        l_broadcast = broadcast_minor(l, acc.shape)
-        o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
-                                    0.0).astype(
-            o_vmem_ref.dtype)
-        _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
-                            sched_dma_sem, group_start)
-        req_id = sched_vmem_ref[my_id, 0, ScheduleField.REQ_ID]
-        o_hbm_offset = sched_vmem_ref[my_id, 0, ScheduleField.O_HBM_OFFSET]
-
-        @pl.when(jnp.logical_and(req_id != -1, group_has_last))
-        def _store_output():
-            o_store = pltpu.make_async_copy(
-                src_ref=o_vmem_ref.at[:, :],
-                dst_ref=o_ref.at[
+                                sched_dma_sem, group_start)
+            q_hbm_offset = sched_vmem_ref[my_id, lane,
+                                          ScheduleField.Q_HBM_OFFSET]
+            group_is_first_kv = sched_vmem_ref[
+                my_id, lane, ScheduleField.IS_FIRST_KV] != 0
+            q_load = pltpu.make_async_copy(
+                src_ref=q_ref.at[
                     0,
-                    pl.ds(o_hbm_offset, q_block_size),
+                    pl.ds(q_hbm_offset, q_block_size),
                     0,
                     0,
                     :,
                 ],
+                dst_ref=q_vmem_ref.at[:, :],
                 sem=local_dma_sem,
             )
-            o_store.start()
-            o_store.wait()
+            q_load.start()
+            q_load.wait()
+
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start + my_id)
+            local_page_idx = _source_page_idx_from_staged_schedule(
+                sched_vmem_ref, my_id, lane, pcp_size)
+            kv_load = pltpu.make_async_copy(
+                src_ref=kv_cache_ref.at[0, local_page_idx, :, 0, :, :],
+                dst_ref=kv_vmem_ref.at[0],
+                sem=local_dma_sem,
+            )
+            kv_load.start()
+            kv_load.wait()
+
+            util.local_barrier(prev_rank, next_rank)
+
+            m = jnp.where(group_is_first_kv,
+                          jnp.full_like(m, -jnp.inf),
+                          m)
+            l = jnp.where(group_is_first_kv, jnp.zeros_like(l), l)
+            acc = jnp.where(group_is_first_kv, jnp.zeros_like(acc), acc)
+            group_has_last = jnp.array(False)
+
+            for round_idx in range(pcp_size):
+                curr_slot = round_idx % 2
+                next_slot = 1 - curr_slot
+                src_rank = lax.rem(my_id + pcp_size - round_idx, pcp_size)
+
+                _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                    sched_dma_sem, group_start + src_rank)
+                group_has_last = jnp.logical_or(
+                    group_has_last,
+                    sched_vmem_ref[my_id, lane,
+                                   ScheduleField.IS_LAST_KV] != 0,
+                )
+
+                if round_idx < pcp_size - 1:
+                    remote_op = pltpu.make_async_remote_copy(
+                        src_ref=kv_vmem_ref.at[curr_slot],
+                        dst_ref=kv_vmem_ref.at[next_slot],
+                        send_sem=remote_send_sems.at[lane, group_idx,
+                                                     round_idx],
+                        recv_sem=remote_recv_sems.at[lane, group_idx,
+                                                     round_idx],
+                        device_id=(next_rank, ),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    remote_op.start()
+
+                m, l, acc = _consume_scheduled_kv_page(
+                    q_vmem_ref,
+                    kv_vmem_ref,
+                    sched_vmem_ref,
+                    curr_slot,
+                    my_id,
+                    lane,
+                    m,
+                    l,
+                    acc,
+                    sm_scale=sm_scale,
+                )
+
+                if round_idx < pcp_size - 1:
+                    remote_op.wait()
+
+            l_broadcast = broadcast_minor(l, acc.shape)
+            o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
+                                        0.0).astype(
+                o_vmem_ref.dtype)
+            _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
+                                sched_dma_sem, group_start)
+            req_id = sched_vmem_ref[my_id, lane, ScheduleField.REQ_ID]
+            o_hbm_offset = sched_vmem_ref[my_id, lane,
+                                          ScheduleField.O_HBM_OFFSET]
+
+            @pl.when(jnp.logical_and(req_id != -1, group_has_last))
+            def _store_output():
+                o_store = pltpu.make_async_copy(
+                    src_ref=o_vmem_ref.at[:, :],
+                    dst_ref=o_ref.at[
+                        0,
+                        pl.ds(o_hbm_offset, q_block_size),
+                        0,
+                        0,
+                        :,
+                    ],
+                    sem=local_dma_sem,
+                )
+                o_store.start()
+                o_store.wait()
 
 
 def _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
@@ -289,9 +300,9 @@ def _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
         raise NotImplementedError(
             "page-group MVP requires schedule steps to be grouped in "
             "pcp_size-step ring groups.")
-    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] != 1:
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
         raise NotImplementedError(
-            "page-group MVP supports exactly one lane.")
+            "page-group MVP requires at least one lane.")
     if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
         raise ValueError("packed_schedule must use padded packed fields.")
     if q_by_rank.shape[2] != 1 or q_by_rank.shape[3] != 1:
@@ -323,7 +334,7 @@ def pcp_streaming_attention_page_groups(
     Args:
         q_by_rank: [pcp, local_tokens, 1, 1, head_dim].
         kv_cache_by_rank: [pcp, pages, page_size, 1, 2, head_dim].
-        packed_schedule: [page_groups * pcp, pcp, 1, 128] ring-grouped
+        packed_schedule: [page_groups * pcp, pcp, lanes, 128] ring-grouped
             schedule. Within each page group, step order is source-rank order.
         pcp_size: Number of PCP ranks.
         q_block_size: Static Q tile size consumed by each page group.
@@ -339,6 +350,7 @@ def pcp_streaming_attention_page_groups(
     page_size = kv_cache_by_rank.shape[2]
     head_dim = q_by_rank.shape[-1]
     num_page_groups = packed_schedule.shape[0] // pcp_size
+    num_lanes = packed_schedule.shape[2]
     num_q_blocks = q_by_rank.shape[1] // q_block_size
 
     def _call(q, kv_cache, schedule):
@@ -346,6 +358,7 @@ def pcp_streaming_attention_page_groups(
             functools.partial(
                 _pcp_streaming_attention_page_groups_kernel,
                 pcp_size=pcp_size,
+                num_lanes=num_lanes,
                 q_block_size=q_block_size,
                 num_page_groups=num_page_groups,
                 num_q_blocks=num_q_blocks,
@@ -367,10 +380,10 @@ def pcp_streaming_attention_page_groups(
                     pltpu.SemaphoreType.DMA,
                     pltpu.SemaphoreType.DMA,
                     pltpu.SemaphoreType.DMA(
-                        (num_page_groups, pcp_size - 1)),
+                        (num_lanes, num_page_groups, pcp_size - 1)),
                     pltpu.SemaphoreType.DMA(
-                        (num_page_groups, pcp_size - 1)),
-                    pltpu.VMEM((pcp_size, 1,
+                        (num_lanes, num_page_groups, pcp_size - 1)),
+                    pltpu.VMEM((pcp_size, num_lanes,
                                 ScheduleField.PACKED_NUM_FIELDS),
                                schedule.dtype),
                     pltpu.VMEM((q_block_size, head_dim), q.dtype),

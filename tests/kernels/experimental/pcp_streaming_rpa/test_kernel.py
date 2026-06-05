@@ -305,3 +305,44 @@ def test_page_group_kernel_carries_online_state_across_kv_groups():
                                expected,
                                rtol=5e-4,
                                atol=5e-5)
+
+
+def test_page_group_kernel_handles_two_lanes():
+    rng = np.random.default_rng(2468)
+    q_by_rank = rng.normal(size=(PCP_SIZE, 4 * Q_TILE, 1, 1,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    kv_cache = rng.normal(size=(PCP_SIZE, 2, PAGE_SIZE, 1, 2,
+                                HEAD_DIM)).astype(np.float32) * 0.1
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[5 * PAGE_SIZE],
+        cu_q_lens=[0, 4 * Q_TILE],
+        q_start_offsets=[4 * PAGE_SIZE],
+        block_tables=np.array([[0, 1]], dtype=np.int32),
+        page_size=PAGE_SIZE,
+        pcp_size=PCP_SIZE,
+        interleave_size=PAGE_SIZE,
+        num_lanes=2,
+        bq_sz=Q_TILE,
+        pad_kv_pages_to_pcp_group=True,
+    )
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    out = pcp_streaming_attention_page_groups(
+        jnp.asarray(q_by_rank),
+        jnp.asarray(kv_cache),
+        jnp.asarray(schedule.packed_schedule),
+        pcp_size=PCP_SIZE,
+        q_block_size=Q_TILE,
+        sm_scale=sm_scale,
+        collective_id=19,
+    )
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               kv_cache,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-4,
+                               atol=5e-5)
