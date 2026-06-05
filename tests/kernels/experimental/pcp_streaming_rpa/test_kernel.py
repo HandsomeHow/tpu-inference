@@ -22,6 +22,7 @@ import pytest
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.kernel import (
     pcp_streaming_attention_page_groups,
     pcp_streaming_attention_page_groups_local,
+    pcp_streaming_attention_page_groups_packed_local,
     pcp_streaming_attention_single_page_group)
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.reference import (
     execute_pcp_streaming_reference)
@@ -146,6 +147,52 @@ def _run_page_groups_local(q_global, kv_cache_by_rank, packed_schedule, *,
             check_vma=False,
         ))
     return fn(q_global, kv_cache_by_rank, packed_schedule)
+
+
+def _run_page_groups_packed_local(q_global, kv_cache_by_rank, packed_schedule,
+                                  *, sm_scale, collective_id):
+    mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS, ))
+
+    def _call(q_local, kv_cache_local, schedule):
+        return pcp_streaming_attention_page_groups_packed_local(
+            q_local,
+            kv_cache_local[0],
+            schedule,
+            pcp_size=PCP_SIZE,
+            q_block_size=Q_TILE,
+            sm_scale=sm_scale,
+            collective_id=collective_id,
+        )
+
+    fn = jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(AXIS, None, None, None),
+                P(AXIS, None, None, None, None, None),
+                P(None, None, None, None),
+            ),
+            out_specs=P(AXIS, None, None, None),
+            check_vma=False,
+        ))
+    return fn(q_global, kv_cache_by_rank, packed_schedule)
+
+
+def _pack_native_kv_cache(kv_cache, kv_packing):
+    pcp_size, pages, page_size, kv_heads, kv_pair, head_dim = kv_cache.shape
+    if kv_pair != 2:
+        raise ValueError("native KV cache must have a K/V pair axis.")
+    aligned_kv_heads_x2 = math.ceil(kv_heads * 2 / kv_packing) * kv_packing
+    flat = np.zeros((pcp_size, pages, page_size, aligned_kv_heads_x2,
+                     head_dim),
+                    dtype=kv_cache.dtype)
+    flat[..., :kv_heads * 2, :] = kv_cache.reshape(pcp_size, pages,
+                                                   page_size, kv_heads * 2,
+                                                   head_dim)
+    return flat.reshape(pcp_size, pages, page_size,
+                        aligned_kv_heads_x2 // kv_packing, kv_packing,
+                        head_dim)
 
 
 def test_single_page_group_kernel_matches_reference():
@@ -439,3 +486,37 @@ def test_page_group_local_kernel_runs_inside_existing_pcp_shard_map():
                                expected,
                                rtol=5e-4,
                                atol=5e-5)
+
+
+def test_page_group_packed_local_kernel_consumes_batched_rpa_kv_layout():
+    rng = np.random.default_rng(8642)
+    q_by_rank = rng.normal(size=(PCP_SIZE, Q_TILE, 2, 2,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    q_global = q_by_rank.reshape(PCP_SIZE * Q_TILE, 2, 2, HEAD_DIM)
+    native_kv_np = rng.normal(size=(PCP_SIZE, 1, PAGE_SIZE, 2, 2,
+                                    HEAD_DIM)).astype(np.float32) * 0.1
+    native_kv = jnp.asarray(native_kv_np, dtype=jnp.bfloat16)
+    native_kv_host = np.asarray(jax.device_get(native_kv))
+    packed_kv = jnp.asarray(_pack_native_kv_cache(native_kv_host, 2),
+                            dtype=jnp.bfloat16)
+    schedule = _make_single_page_group_schedule()
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    out = _run_page_groups_packed_local(
+        jnp.asarray(q_global),
+        packed_kv,
+        jnp.asarray(schedule.packed_schedule),
+        sm_scale=sm_scale,
+        collective_id=22,
+    )
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               native_kv_host,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    expected = expected.reshape(PCP_SIZE * Q_TILE, 2, 2, HEAD_DIM)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-3,
+                               atol=5e-4)

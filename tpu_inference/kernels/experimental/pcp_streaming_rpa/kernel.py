@@ -31,7 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.collectives import util
 from tpu_inference.kernels.experimental.batched_rpa.utils import (
-    broadcast_minor)
+    broadcast_minor, get_dtype_packing)
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField)
 
@@ -116,6 +116,48 @@ def _source_page_idx_from_staged_schedule(sched_vmem_ref, source_rank, lane,
     return page_idx
 
 
+def _load_local_kv_page(kv_cache_ref, kv_vmem_ref, sem, local_page_idx, *,
+                        kv_head_idx, kv_packing, packed_kv_cache):
+    if packed_kv_cache:
+        if kv_packing == 2:
+            load = pltpu.make_async_copy(
+                src_ref=kv_cache_ref.at[0, local_page_idx, :, kv_head_idx, :, :],
+                dst_ref=kv_vmem_ref.at[0],
+                sem=sem,
+            )
+            load.start()
+            load.wait()
+        elif kv_packing == 1:
+            for kv_pair_idx in range(2):
+                linear_idx = kv_head_idx * 2 + kv_pair_idx
+                load = pltpu.make_async_copy(
+                    src_ref=kv_cache_ref.at[
+                        0,
+                        local_page_idx,
+                        :,
+                        linear_idx,
+                        0,
+                        :,
+                    ],
+                    dst_ref=kv_vmem_ref.at[0, :, kv_pair_idx, :],
+                    sem=sem,
+                )
+                load.start()
+                load.wait()
+        else:
+            raise NotImplementedError(
+                "packed PCP streaming KV loads currently support "
+                "kv_packing in {1, 2}.")
+    else:
+        load = pltpu.make_async_copy(
+            src_ref=kv_cache_ref.at[0, local_page_idx, :, 0, :, :],
+            dst_ref=kv_vmem_ref.at[0],
+            sem=sem,
+        )
+        load.start()
+        load.wait()
+
+
 def _pcp_streaming_attention_page_groups_kernel(
     q_ref,
     kv_cache_ref,
@@ -136,6 +178,9 @@ def _pcp_streaming_attention_page_groups_kernel(
     num_page_groups,
     num_q_blocks,
     sm_scale,
+    kv_head_idx,
+    kv_packing,
+    packed_kv_cache,
 ):
     my_id = lax.axis_index(AXIS)
     next_rank = lax.rem(my_id + 1, pcp_size)
@@ -190,13 +235,15 @@ def _pcp_streaming_attention_page_groups_kernel(
                                 sched_dma_sem, group_start + my_id)
             local_page_idx = _source_page_idx_from_staged_schedule(
                 sched_vmem_ref, my_id, lane, pcp_size)
-            kv_load = pltpu.make_async_copy(
-                src_ref=kv_cache_ref.at[0, local_page_idx, :, 0, :, :],
-                dst_ref=kv_vmem_ref.at[0],
-                sem=local_dma_sem,
+            _load_local_kv_page(
+                kv_cache_ref,
+                kv_vmem_ref,
+                local_dma_sem,
+                local_page_idx,
+                kv_head_idx=kv_head_idx,
+                kv_packing=kv_packing,
+                packed_kv_cache=packed_kv_cache,
             )
-            kv_load.start()
-            kv_load.wait()
 
             util.local_barrier(prev_rank, next_rank)
 
@@ -398,6 +445,52 @@ def _validate_common_page_group_local_inputs(q_local, kv_cache_local,
             "page-group MVP requires head_dim to be 128-aligned.")
 
 
+def _validate_packed_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size):
+    if q_local.ndim != 4:
+        raise ValueError("q_local must have shape "
+                         "[local_tokens, kv_heads, q_per_kv, head_dim].")
+    if kv_cache_local.ndim != 5:
+        raise ValueError("kv_cache_local must have shape "
+                         "[pages, page_size, packed_kv_heads_x2, "
+                         "kv_packing, head_dim].")
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must have shape "
+                         "[steps, pcp, lanes, packed_fields].")
+    if q_block_size <= 0:
+        raise ValueError("q_block_size must be positive.")
+    if q_local.shape[0] % q_block_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires local_tokens to be a multiple of "
+            "q_block_size.")
+    if packed_schedule.shape[0] % pcp_size != 0:
+        raise NotImplementedError(
+            "page-group MVP requires schedule steps to be grouped in "
+            "pcp_size-step ring groups.")
+    if packed_schedule.shape[1] != pcp_size or packed_schedule.shape[2] <= 0:
+        raise NotImplementedError(
+            "page-group MVP requires at least one lane.")
+    if packed_schedule.shape[3] != ScheduleField.PACKED_NUM_FIELDS:
+        raise ValueError("packed_schedule must use padded packed fields.")
+    if q_local.shape[-1] != kv_cache_local.shape[-1]:
+        raise ValueError("Q and KV head_dim must match.")
+    if q_local.shape[-1] % 128 != 0:
+        raise NotImplementedError(
+            "page-group MVP requires head_dim to be 128-aligned.")
+    expected_packing = get_dtype_packing(kv_cache_local.dtype)
+    if kv_cache_local.shape[3] != expected_packing:
+        raise ValueError("kv_cache_local packing axis does not match dtype "
+                         f"packing: got {kv_cache_local.shape[3]} vs "
+                         f"{expected_packing}.")
+    if kv_cache_local.shape[3] not in (1, 2):
+        raise NotImplementedError(
+            "packed PCP streaming KV loads currently support kv_packing in "
+            "{1, 2}.")
+    if kv_cache_local.shape[2] * kv_cache_local.shape[3] < q_local.shape[1] * 2:
+        raise ValueError("packed KV cache does not contain all local K/V heads.")
+
+
 def _pcp_streaming_attention_page_groups_single_head_pallas_call(
     q_single_head,
     kv_cache_single_head,
@@ -407,6 +500,9 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
     q_block_size: int,
     sm_scale: float,
     collective_id: int | None,
+    kv_head_idx: int = 0,
+    kv_packing: int = 1,
+    packed_kv_cache: bool = False,
 ):
     page_size = kv_cache_single_head.shape[2]
     head_dim = q_single_head.shape[-1]
@@ -423,6 +519,9 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             num_page_groups=num_page_groups,
             num_q_blocks=num_q_blocks,
             sm_scale=sm_scale,
+            kv_head_idx=kv_head_idx,
+            kv_packing=kv_packing,
+            packed_kv_cache=packed_kv_cache,
         ),
         out_shape=jax.ShapeDtypeStruct(
             (1, q_single_head.shape[1], 1, 1, head_dim),
@@ -506,6 +605,61 @@ def pcp_streaming_attention_page_groups_local(
                 q_block_size=q_block_size,
                 sm_scale=sm_scale,
                 collective_id=head_collective_id,
+            )
+            q_head_outputs.append(out[0])
+        head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
+    return jnp.concatenate(head_outputs, axis=1)
+
+
+def pcp_streaming_attention_page_groups_packed_local(
+    q_local,
+    kv_cache_local,
+    packed_schedule,
+    *,
+    pcp_size: int,
+    q_block_size: int,
+    sm_scale: float,
+    collective_id: int | None = 13,
+):
+    """Run PCP streaming page groups on batched-RPA packed KV cache layout.
+
+    Args:
+        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] for one PCP rank.
+        kv_cache_local: [pages, page_size, packed_kv_heads_x2, kv_packing,
+            head_dim] for one rank.
+        packed_schedule: Replicated [steps, pcp, lanes, 128] schedule.
+
+    Returns:
+        Local rank output with the same shape as q_local.
+    """
+    _validate_packed_page_group_local_inputs(q_local, kv_cache_local,
+                                             packed_schedule, pcp_size,
+                                             q_block_size)
+    kv_heads = q_local.shape[1]
+    q_per_kv = q_local.shape[2]
+    kv_packing = kv_cache_local.shape[3]
+    head_outputs = []
+    for kv_head_idx in range(kv_heads):
+        q_head_outputs = []
+        for q_head_idx in range(q_per_kv):
+            q_slice = q_local[:, kv_head_idx:kv_head_idx + 1,
+                              q_head_idx:q_head_idx + 1]
+            if collective_id is None:
+                head_collective_id = None
+            else:
+                head_collective_id = (collective_id + kv_head_idx * q_per_kv +
+                                      q_head_idx)
+            out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
+                q_slice[None, ...],
+                kv_cache_local[None, ...],
+                packed_schedule,
+                pcp_size=pcp_size,
+                q_block_size=q_block_size,
+                sm_scale=sm_scale,
+                collective_id=head_collective_id,
+                kv_head_idx=kv_head_idx,
+                kv_packing=kv_packing,
+                packed_kv_cache=True,
             )
             q_head_outputs.append(out[0])
         head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
