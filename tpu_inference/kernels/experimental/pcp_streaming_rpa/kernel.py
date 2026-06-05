@@ -59,20 +59,30 @@ def _consume_scheduled_kv_page(
         consumer_rank, 0, ScheduleField.Q_GLOBAL_START]
     kv_global_start = sched_vmem_ref[
         consumer_rank, 0, ScheduleField.KV_GLOBAL_START]
+    req_id = sched_vmem_ref[consumer_rank, 0, ScheduleField.REQ_ID]
     kv_valid_len = sched_vmem_ref[consumer_rank, 0,
                                   ScheduleField.KV_VALID_LEN]
+    q_tile_size = sched_vmem_ref[consumer_rank, 0, ScheduleField.Q_TILE_SIZE]
 
     scores = jnp.matmul(q, k.T, preferred_element_type=jnp.float32) * sm_scale
     q_pos = q_global_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
     kv_pos = kv_global_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
     kv_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 1) < kv_valid_len
-    mask = jnp.logical_and(q_pos >= kv_pos, kv_valid)
+    q_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 0) < q_tile_size
+    entry_valid = req_id != -1
+    row_active = jnp.logical_and(entry_valid,
+                                 q_valid[:, :1])
+    mask = jnp.logical_and(jnp.logical_and(q_pos >= kv_pos, kv_valid),
+                           q_valid)
     scores = jnp.where(mask, scores, -jnp.inf)
+    scores = jnp.where(row_active, scores, 0.0)
 
     m_curr = jnp.max(scores, axis=1, keepdims=True)
-    m_next = jnp.maximum(m, m_curr)
-    p = jnp.exp(scores - broadcast_minor(m_next, scores.shape))
-    alpha = jnp.exp(m - m_next)
+    m_next = jnp.where(row_active, jnp.maximum(m, m_curr), m)
+    p = jnp.where(row_active,
+                  jnp.exp(scores - broadcast_minor(m_next, scores.shape)),
+                  0.0)
+    alpha = jnp.where(row_active, jnp.exp(m - m_next), 1.0)
     l_next = alpha * l + jnp.sum(p, axis=1, keepdims=True)
     pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
     acc_next = broadcast_minor(alpha, acc.shape) * acc + pv
@@ -87,6 +97,21 @@ def _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sem, step):
     )
     load_op.start()
     load_op.wait()
+
+
+def _source_page_idx_from_staged_schedule(sched_vmem_ref, source_rank,
+                                          pcp_size):
+    page_idx = jnp.array(0, dtype=jnp.int32)
+    for consumer_rank in range(pcp_size):
+        req_id = sched_vmem_ref[consumer_rank, 0, ScheduleField.REQ_ID]
+        kv_page_rank = sched_vmem_ref[consumer_rank, 0,
+                                      ScheduleField.KV_PAGE_RANK]
+        candidate = jnp.logical_and(req_id != -1, kv_page_rank == source_rank)
+        page_idx = jnp.where(candidate,
+                             sched_vmem_ref[consumer_rank, 0,
+                                            ScheduleField.KV_PAGE_IDX],
+                             page_idx)
+    return page_idx
 
 
 def _pcp_streaming_attention_single_page_group_kernel(
@@ -130,7 +155,8 @@ def _pcp_streaming_attention_single_page_group_kernel(
 
     _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sched_dma_sem,
                         my_id)
-    local_page_idx = sched_vmem_ref[my_id, 0, ScheduleField.KV_PAGE_IDX]
+    local_page_idx = _source_page_idx_from_staged_schedule(
+        sched_vmem_ref, my_id, pcp_size)
     kv_load = pltpu.make_async_copy(
         src_ref=kv_cache_ref.at[0, local_page_idx, :, 0, :, :],
         dst_ref=kv_vmem_ref.at[0],
@@ -138,6 +164,15 @@ def _pcp_streaming_attention_single_page_group_kernel(
     )
     kv_load.start()
     kv_load.wait()
+
+    o_vmem_ref[...] = jnp.zeros_like(o_vmem_ref)
+    zero_store = pltpu.make_async_copy(
+        src_ref=o_vmem_ref.at[:, :],
+        dst_ref=o_ref.at[0, :, 0, 0, :],
+        sem=local_dma_sem,
+    )
+    zero_store.start()
+    zero_store.wait()
 
     util.local_barrier(prev_rank, next_rank)
 
@@ -179,24 +214,30 @@ def _pcp_streaming_attention_single_page_group_kernel(
         if round_idx < pcp_size - 1:
             remote_op.wait()
 
-    o_vmem_ref[...] = (acc / broadcast_minor(l, acc.shape)).astype(
+    l_broadcast = broadcast_minor(l, acc.shape)
+    o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
+                                0.0).astype(
         o_vmem_ref.dtype)
     _load_schedule_step(packed_schedule_ref, sched_vmem_ref, sched_dma_sem,
                         pcp_size - 1)
+    req_id = sched_vmem_ref[my_id, 0, ScheduleField.REQ_ID]
     o_hbm_offset = sched_vmem_ref[my_id, 0, ScheduleField.O_HBM_OFFSET]
-    o_store = pltpu.make_async_copy(
-        src_ref=o_vmem_ref.at[:, :],
-        dst_ref=o_ref.at[
-            0,
-            pl.ds(o_hbm_offset, q_block_size),
-            0,
-            0,
-            :,
-        ],
-        sem=local_dma_sem,
-    )
-    o_store.start()
-    o_store.wait()
+
+    @pl.when(req_id != -1)
+    def _store_output():
+        o_store = pltpu.make_async_copy(
+            src_ref=o_vmem_ref.at[:, :],
+            dst_ref=o_ref.at[
+                0,
+                pl.ds(o_hbm_offset, q_block_size),
+                0,
+                0,
+                :,
+            ],
+            sem=local_dma_sem,
+        )
+        o_store.start()
+        o_store.wait()
 
 
 def _validate_single_page_group_inputs(q_by_rank, kv_cache_by_rank,
