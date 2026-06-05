@@ -18,7 +18,8 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    generate_pcp_streaming_schedule, validate_pcp_streaming_schedule)
+    ScheduleField, generate_pcp_streaming_schedule,
+    unpack_pcp_streaming_schedule_field, validate_pcp_streaming_schedule)
 
 
 def test_generate_schedule_uses_interleave_q_ownership_and_page_mapping():
@@ -100,6 +101,65 @@ def test_validate_schedule_lane_invariant_accepts_generated_schedule():
     )
 
     validate_pcp_streaming_schedule(schedule)
+
+
+def test_schedule_packed_fields_match_unpacked_arrays():
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[12],
+        cu_q_lens=[0, 7],
+        q_start_offsets=[5],
+        block_tables=np.array([[100, 101]], dtype=np.int32),
+        page_size=2,
+        pcp_size=4,
+        interleave_size=2,
+        num_lanes=1,
+        bq_sz=2,
+    )
+
+    assert schedule.packed_schedule.shape == (6, 4, 1,
+                                              ScheduleField.NUM_FIELDS)
+    np.testing.assert_array_equal(
+        unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
+                                            ScheduleField.REQ_ID),
+        schedule.req_id,
+    )
+    np.testing.assert_array_equal(
+        unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
+                                            ScheduleField.KV_PAGE_RANK),
+        schedule.kv_page_rank,
+    )
+    np.testing.assert_array_equal(
+        unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
+                                            ScheduleField.KV_PAGE_IDX),
+        schedule.kv_page_idx,
+    )
+    np.testing.assert_array_equal(
+        unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
+                                            ScheduleField.Q_GLOBAL_START),
+        schedule.q_global_start,
+    )
+    np.testing.assert_array_equal(
+        schedule.packed_schedule[0, :, 0, ScheduleField.Q_TILE_SIZE],
+        schedule.q_tile_size[:, 0, 0],
+    )
+
+
+def test_schedule_packed_field_rejects_invalid_field_index():
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[12],
+        cu_q_lens=[0, 7],
+        q_start_offsets=[5],
+        block_tables=np.array([[100, 101]], dtype=np.int32),
+        page_size=2,
+        pcp_size=4,
+        interleave_size=2,
+        num_lanes=1,
+        bq_sz=2,
+    )
+
+    with pytest.raises(ValueError, match="invalid schedule field"):
+        unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
+                                            ScheduleField.NUM_FIELDS)
 
 
 def test_validate_schedule_lane_invariant_rejects_q_offset_change_inside_tile():

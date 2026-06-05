@@ -21,6 +21,38 @@ import numpy as np
 from tpu_inference.layers.common.pcp_layout import pcp_query_chunk_ranges
 
 
+class ScheduleField:
+    REQ_ID = 0
+    KV_PAGE_RANK = 1
+    KV_PAGE_IDX = 2
+    IS_FIRST_KV = 3
+    IS_LAST_KV = 4
+    LOAD_Q = 5
+    Q_GLOBAL_START = 6
+    KV_GLOBAL_START = 7
+    KV_VALID_LEN = 8
+    Q_HBM_OFFSET = 9
+    Q_TILE_SIZE = 10
+    O_HBM_OFFSET = 11
+    NUM_FIELDS = 12
+
+
+_PACKED_FIELD_NAMES = (
+    "req_id",
+    "kv_page_rank",
+    "kv_page_idx",
+    "is_first_kv",
+    "is_last_kv",
+    "load_q",
+    "q_global_start",
+    "kv_global_start",
+    "kv_valid_len",
+    "q_hbm_offset",
+    "q_tile_size",
+    "o_hbm_offset",
+)
+
+
 def _cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
@@ -46,6 +78,7 @@ class PcpStreamingSchedule:
     q_hbm_offset: np.ndarray
     q_tile_size: np.ndarray
     o_hbm_offset: np.ndarray
+    packed_schedule: np.ndarray
     actual_steps: np.ndarray
     global_actual_steps: np.ndarray
 
@@ -117,6 +150,54 @@ def _validate_inputs(
     if block_tables.shape[0] < num_reqs:
         raise ValueError("block_tables must cover every request.")
     return num_reqs
+
+
+def pack_pcp_streaming_schedule_fields(
+    *,
+    req_id: np.ndarray,
+    kv_page_rank: np.ndarray,
+    kv_page_idx: np.ndarray,
+    is_first_kv: np.ndarray,
+    is_last_kv: np.ndarray,
+    load_q: np.ndarray,
+    q_global_start: np.ndarray,
+    kv_global_start: np.ndarray,
+    kv_valid_len: np.ndarray,
+    q_hbm_offset: np.ndarray,
+    q_tile_size: np.ndarray,
+    o_hbm_offset: np.ndarray,
+) -> np.ndarray:
+    """Pack schedule fields into [max_steps, pcp_size, lanes, fields]."""
+    field_arrays = (
+        req_id,
+        kv_page_rank,
+        kv_page_idx,
+        is_first_kv,
+        is_last_kv,
+        load_q,
+        q_global_start,
+        kv_global_start,
+        kv_valid_len,
+        q_hbm_offset,
+        q_tile_size,
+        o_hbm_offset,
+    )
+    if len({array.shape for array in field_arrays}) != 1:
+        raise ValueError("all schedule fields must have identical shapes.")
+    packed = np.stack(field_arrays, axis=-1).astype(np.int32, copy=False)
+    return np.transpose(packed, (1, 0, 2, 3)).copy()
+
+
+def unpack_pcp_streaming_schedule_field(
+    packed_schedule: np.ndarray,
+    field: int,
+) -> np.ndarray:
+    """Unpack one field to [pcp_size, max_steps, num_lanes]."""
+    if packed_schedule.ndim != 4:
+        raise ValueError("packed_schedule must be rank 4.")
+    if field < 0 or field >= ScheduleField.NUM_FIELDS:
+        raise ValueError(f"invalid schedule field index: {field}")
+    return np.transpose(packed_schedule[..., field], (1, 0, 2)).copy()
 
 
 def generate_pcp_streaming_schedule(
@@ -264,10 +345,14 @@ def generate_pcp_streaming_schedule(
                 fields["o_hbm_offset"][consumer_rank, step,
                                        lane] = entry.o_hbm_offset
 
+    packed_schedule = pack_pcp_streaming_schedule_fields(req_id=req_id,
+                                                         **fields)
+
     return PcpStreamingSchedule(
         req_id=req_id,
         actual_steps=actual_steps,
         global_actual_steps=np.array([max_steps], dtype=np.int32),
+        packed_schedule=packed_schedule,
         **fields,
     )
 
