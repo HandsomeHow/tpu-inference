@@ -29,14 +29,23 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tpu_inference import envs
 from tpu_inference.kernels.collectives import util
-from tpu_inference.kernels.experimental.batched_rpa.utils import (
-    broadcast_minor, get_dtype_packing)
+from tpu_inference.kernels.experimental.batched_rpa.utils import get_dtype_packing
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField)
 
 P = jax.sharding.PartitionSpec
 AXIS = "pcp"
+
+
+def _pcp_streaming_vmem_limit_bytes() -> int:
+    limit_bytes = envs.PCP_STREAMING_RPA_VMEM_LIMIT_BYTES
+    if limit_bytes < 0:
+        raise ValueError("PCP_STREAMING_RPA_VMEM_LIMIT_BYTES must be >= 0.")
+    if limit_bytes == 0:
+        return pltpu.get_tpu_info().vmem_capacity_bytes
+    return limit_bytes
 
 
 def _consume_scheduled_kv_page(
@@ -82,12 +91,12 @@ def _consume_scheduled_kv_page(
     m_curr = jnp.max(scores, axis=1, keepdims=True)
     m_next = jnp.where(row_active, jnp.maximum(m, m_curr), m)
     p = jnp.where(row_active,
-                  jnp.exp(scores - broadcast_minor(m_next, scores.shape)),
+                  jnp.exp(scores - jnp.broadcast_to(m_next, scores.shape)),
                   0.0)
     alpha = jnp.where(row_active, jnp.exp(m - m_next), 1.0)
     l_next = alpha * l + jnp.sum(p, axis=1, keepdims=True)
     pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
-    acc_next = broadcast_minor(alpha, acc.shape) * acc + pv
+    acc_next = jnp.broadcast_to(alpha, acc.shape) * acc + pv
     return m_next, l_next, acc_next
 
 
@@ -201,10 +210,7 @@ def _pcp_streaming_attention_page_groups_kernel(
         zero_store = pltpu.make_async_copy(
             src_ref=o_vmem_ref.at[:, :],
             dst_ref=o_ref.at[
-                0,
                 pl.ds(block_idx * q_block_size, q_block_size),
-                0,
-                0,
                 :,
             ],
             sem=local_dma_sem,
@@ -213,8 +219,8 @@ def _pcp_streaming_attention_page_groups_kernel(
         zero_store.wait()
 
     for lane in range(num_lanes):
-        m = jnp.full((q_block_size, 128), -jnp.inf, dtype=jnp.float32)
-        l = jnp.zeros((q_block_size, 128), dtype=jnp.float32)
+        m = jnp.full((q_block_size, 1), -jnp.inf, dtype=jnp.float32)
+        l = jnp.zeros((q_block_size, 1), dtype=jnp.float32)
         acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]),
                         dtype=jnp.float32)
 
@@ -225,14 +231,12 @@ def _pcp_streaming_attention_page_groups_kernel(
                                 sched_dma_sem, group_start)
             q_hbm_offset = sched_vmem_ref[my_id, lane,
                                           ScheduleField.Q_HBM_OFFSET]
+            q_hbm_offset = pl.multiple_of(q_hbm_offset, q_block_size)
             group_is_first_kv = sched_vmem_ref[
                 my_id, lane, ScheduleField.IS_FIRST_KV] != 0
             q_load = pltpu.make_async_copy(
                 src_ref=q_ref.at[
-                    0,
                     pl.ds(q_hbm_offset, q_block_size),
-                    0,
-                    0,
                     :,
                 ],
                 dst_ref=q_vmem_ref.at[:, :],
@@ -306,7 +310,7 @@ def _pcp_streaming_attention_page_groups_kernel(
                 if round_idx < pcp_size - 1:
                     remote_op.wait()
 
-            l_broadcast = broadcast_minor(l, acc.shape)
+            l_broadcast = jnp.broadcast_to(l, acc.shape)
             o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
                                         0.0).astype(
                 o_vmem_ref.dtype)
@@ -315,16 +319,14 @@ def _pcp_streaming_attention_page_groups_kernel(
             req_id = sched_vmem_ref[my_id, lane, ScheduleField.REQ_ID]
             o_hbm_offset = sched_vmem_ref[my_id, lane,
                                           ScheduleField.O_HBM_OFFSET]
+            o_hbm_offset = pl.multiple_of(o_hbm_offset, q_block_size)
 
             @pl.when(jnp.logical_and(req_id != -1, group_has_last))
             def _store_output():
                 o_store = pltpu.make_async_copy(
                     src_ref=o_vmem_ref.at[:, :],
                     dst_ref=o_ref.at[
-                        0,
                         pl.ds(o_hbm_offset, q_block_size),
-                        0,
-                        0,
                         :,
                     ],
                     sem=local_dma_sem,
@@ -520,7 +522,7 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
     head_dim = q_single_head.shape[-1]
     num_page_groups = packed_schedule.shape[0] // pcp_size
     num_lanes = packed_schedule.shape[2]
-    num_q_blocks = q_single_head.shape[1] // q_block_size
+    num_q_blocks = q_single_head.shape[0] // q_block_size
 
     return pl.pallas_call(
         functools.partial(
@@ -538,8 +540,8 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             pcp_axis_name=pcp_axis_name,
         ),
         out_shape=jax.ShapeDtypeStruct(
-            (1, q_single_head.shape[1], 1, 1, head_dim),
-            jnp.float32,
+            (q_single_head.shape[0], head_dim),
+            q_single_head.dtype,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
@@ -562,13 +564,13 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
                 pltpu.VMEM((q_block_size, head_dim), q_single_head.dtype),
                 pltpu.VMEM((2, page_size, 2, head_dim),
                            kv_cache_single_head.dtype),
-                pltpu.VMEM((q_block_size, head_dim), jnp.float32),
+                pltpu.VMEM((q_block_size, head_dim), q_single_head.dtype),
             ),
             grid=(1, ),
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=collective_id,
-            vmem_limit_bytes=8 * 1024 * 1024,
+            vmem_limit_bytes=_pcp_streaming_vmem_limit_bytes(),
         ),
         name="pcp_streaming_attention_page_groups",
     )(q_single_head, kv_cache_single_head, packed_schedule)
@@ -614,7 +616,7 @@ def pcp_streaming_attention_page_groups_local(
                 head_collective_id = (collective_id + kv_head_idx * q_per_kv +
                                       q_head_idx)
             out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
-                q_slice[None, ...],
+                q_slice[:, 0, 0, :],
                 kv_slice[None, ...],
                 packed_schedule,
                 pcp_size=pcp_size,
@@ -624,7 +626,7 @@ def pcp_streaming_attention_page_groups_local(
                 mesh_axis_names=mesh_axis_names,
                 pcp_axis_name=pcp_axis_name,
             )
-            q_head_outputs.append(out[0])
+            q_head_outputs.append(out[:, None, None, :])
         head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
     return jnp.concatenate(head_outputs, axis=1)
 
@@ -670,7 +672,7 @@ def pcp_streaming_attention_page_groups_packed_local(
                 head_collective_id = (collective_id + kv_head_idx * q_per_kv +
                                       q_head_idx)
             out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
-                q_slice[None, ...],
+                q_slice[:, 0, 0, :],
                 kv_cache_local[None, ...],
                 packed_schedule,
                 pcp_size=pcp_size,
@@ -683,7 +685,7 @@ def pcp_streaming_attention_page_groups_packed_local(
                 mesh_axis_names=mesh_axis_names,
                 pcp_axis_name=pcp_axis_name,
             )
-            q_head_outputs.append(out[0])
+            q_head_outputs.append(out[:, None, None, :])
         head_outputs.append(jnp.concatenate(q_head_outputs, axis=2))
     return jnp.concatenate(head_outputs, axis=1)
 
@@ -719,8 +721,8 @@ def _pcp_streaming_attention_page_groups_single_head(
                                 pcp_size, q_block_size)
 
     def _call(q, kv_cache, schedule):
-        return _pcp_streaming_attention_page_groups_single_head_pallas_call(
-            q,
+        out = _pcp_streaming_attention_page_groups_single_head_pallas_call(
+            q[0, :, 0, 0, :],
             kv_cache,
             schedule,
             pcp_size=pcp_size,
@@ -730,6 +732,7 @@ def _pcp_streaming_attention_page_groups_single_head(
             mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
         )
+        return out[None, :, None, None, :]
 
     mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
     shard_map_kernel = jax.jit(

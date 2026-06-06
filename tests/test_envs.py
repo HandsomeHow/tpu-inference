@@ -121,6 +121,9 @@ def test_boolean_env_vars(monkeypatch: pytest.MonkeyPatch):
     assert envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE == 256
     monkeypatch.setenv("PCP_STREAMING_RPA_Q_BLOCK_SIZE", "128")
     assert envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE == 128
+    assert envs.PCP_STREAMING_RPA_VMEM_LIMIT_BYTES == 0
+    monkeypatch.setenv("PCP_STREAMING_RPA_VMEM_LIMIT_BYTES", "16777216")
+    assert envs.PCP_STREAMING_RPA_VMEM_LIMIT_BYTES == 16777216
 
 
 def test_boolean_env_vars_string_values(monkeypatch: pytest.MonkeyPatch):

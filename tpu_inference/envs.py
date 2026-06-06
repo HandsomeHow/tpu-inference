@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     USE_PCP_STREAMING_RPA_KERNEL: bool = False
     PCP_STREAMING_RPA_NUM_LANES: int = 1
     PCP_STREAMING_RPA_Q_BLOCK_SIZE: int = 256
+    PCP_STREAMING_RPA_VMEM_LIMIT_BYTES: int = 0
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -321,6 +322,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_int("PCP_STREAMING_RPA_NUM_LANES", default=1),
     "PCP_STREAMING_RPA_Q_BLOCK_SIZE":
     env_int("PCP_STREAMING_RPA_Q_BLOCK_SIZE", default=256),
+    # 0 means use the platform-reported TPU VMEM capacity.
+    "PCP_STREAMING_RPA_VMEM_LIMIT_BYTES":
+    env_int("PCP_STREAMING_RPA_VMEM_LIMIT_BYTES", default=0),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
