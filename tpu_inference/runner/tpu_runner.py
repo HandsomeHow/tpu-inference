@@ -38,7 +38,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, KVConnectorOutput, LogprobsLists,
                              LogprobsTensors, ModelRunnerOutput)
@@ -302,6 +302,11 @@ def _get_pcp_parallel_config(vllm_config: VllmConfig) -> tuple[int, int]:
     return pcp_size, interleave_size
 
 
+def _kv_cache_group_supports_pcp_attention_metadata(kv_cache_group: Any) -> bool:
+    kv_cache_spec = getattr(kv_cache_group, "kv_cache_spec", None)
+    return isinstance(kv_cache_spec, AttentionSpec)
+
+
 def _scheduled_token_span(
     input_batch: InputBatch,
     scheduler_output: VllmSchedulerOutput,
@@ -554,7 +559,12 @@ def _build_pcp_decode_attention_metadata(
     max_capacity_tokens = pages_per_seq * block_size
     if np.any(seq_lens > max_capacity_tokens):
         raise ValueError(
-            "seq_lens_per_req exceeds PCP decode block table capacity.")
+            "seq_lens_per_req exceeds PCP decode block table capacity: "
+            f"seq_lens_per_req={seq_lens.tolist()}, "
+            f"max_capacity_tokens={int(max_capacity_tokens)}, "
+            f"pages_per_seq={int(pages_per_seq)}, "
+            f"block_size={int(block_size)}, "
+            f"block_tables_shape={tuple(block_tables.shape)}.")
     virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
     source_block_tables = block_tables[:, :virtual_blocks_per_req]
 
@@ -2534,6 +2544,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             pcp_streaming_num_lanes = envs.PCP_STREAMING_RPA_NUM_LANES
             pcp_streaming_q_block_size = envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE
             for gid, block_tables_view in block_table_views_by_gid.items():
+                kv_cache_group = self.kv_cache_config.kv_cache_groups[gid]
+                if not _kv_cache_group_supports_pcp_attention_metadata(
+                        kv_cache_group):
+                    continue
                 if use_pcp:
                     metadata_per_dp = []
                     for dp_rank in range(dp_size):

@@ -18,9 +18,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig, VllmConfig)
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
@@ -36,6 +38,7 @@ from tpu_inference.runner.tpu_runner import (TPUModelRunner,
                                              _build_pcp_attention_metadata,
                                              _build_pcp_logits_indices,
                                              _build_pcp_rank_major_token_order,
+                                             _kv_cache_group_supports_pcp_attention_metadata,
                                              _logits_indices_require_global_gather,
                                              _pcp_local_token_counts)
 
@@ -384,6 +387,20 @@ class TestPCPTokenPacking:
 
         with pytest.raises(ValueError, match=match):
             _build_pcp_decode_attention_metadata(**args)
+
+    def test_pcp_attention_metadata_filter_skips_mamba_groups(self):
+        attention_group = MagicMock()
+        attention_group.kv_cache_spec = FullAttentionSpec(block_size=16,
+                                                          num_kv_heads=1,
+                                                          head_size=64,
+                                                          dtype=torch.bfloat16)
+        mamba_group = MagicMock()
+        mamba_group.kv_cache_spec = MambaSpec(block_size=16,
+                                             shapes=((1, ), ),
+                                             dtypes=(torch.float32, ))
+
+        assert _kv_cache_group_supports_pcp_attention_metadata(attention_group)
+        assert not _kv_cache_group_supports_pcp_attention_metadata(mamba_group)
 
 
 class TestPCPBatchSelection:
