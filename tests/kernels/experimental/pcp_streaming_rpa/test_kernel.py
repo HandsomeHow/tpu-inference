@@ -120,14 +120,19 @@ def _truncate_schedule(schedule, steps, actual_steps):
 
 
 def _run_page_groups_local(q_global, kv_cache_by_rank, packed_schedule, *,
-                           sm_scale, collective_id):
+                           sm_scale, collective_id,
+                           active_page_groups=None):
     mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS, ))
+    if active_page_groups is None:
+        active_page_groups = jnp.array([packed_schedule.shape[0] // PCP_SIZE],
+                                       dtype=jnp.int32)
 
-    def _call(q_local, kv_cache_local, schedule):
+    def _call(q_local, kv_cache_local, schedule, active_groups):
         return pcp_streaming_attention_page_groups_local(
             q_local,
             kv_cache_local[0],
             schedule,
+            active_groups,
             pcp_size=PCP_SIZE,
             q_block_size=Q_TILE,
             sm_scale=sm_scale,
@@ -142,22 +147,28 @@ def _run_page_groups_local(q_global, kv_cache_by_rank, packed_schedule, *,
                 P(AXIS, None, None, None),
                 P(AXIS, None, None, None, None, None),
                 P(None, None, None, None),
+                P(None),
             ),
             out_specs=P(AXIS, None, None, None),
             check_vma=False,
         ))
-    return fn(q_global, kv_cache_by_rank, packed_schedule)
+    return fn(q_global, kv_cache_by_rank, packed_schedule, active_page_groups)
 
 
 def _run_page_groups_packed_local(q_global, kv_cache_by_rank, packed_schedule,
-                                  *, sm_scale, collective_id):
+                                  *, sm_scale, collective_id,
+                                  active_page_groups=None):
     mesh = jax.sharding.Mesh(jax.local_devices()[:PCP_SIZE], (AXIS, ))
+    if active_page_groups is None:
+        active_page_groups = jnp.array([packed_schedule.shape[0] // PCP_SIZE],
+                                       dtype=jnp.int32)
 
-    def _call(q_local, kv_cache_local, schedule):
+    def _call(q_local, kv_cache_local, schedule, active_groups):
         return pcp_streaming_attention_page_groups_packed_local(
             q_local,
             kv_cache_local[0],
             schedule,
+            active_groups,
             pcp_size=PCP_SIZE,
             q_block_size=Q_TILE,
             sm_scale=sm_scale,
@@ -172,11 +183,12 @@ def _run_page_groups_packed_local(q_global, kv_cache_by_rank, packed_schedule,
                 P(AXIS, None, None, None),
                 P(AXIS, None, None, None, None, None),
                 P(None, None, None, None),
+                P(None),
             ),
             out_specs=P(AXIS, None, None, None),
             check_vma=False,
         ))
-    return fn(q_global, kv_cache_by_rank, packed_schedule)
+    return fn(q_global, kv_cache_by_rank, packed_schedule, active_page_groups)
 
 
 def _pack_native_kv_cache(kv_cache, kv_packing):
@@ -488,6 +500,42 @@ def test_page_group_local_kernel_runs_inside_existing_pcp_shard_map():
                                atol=5e-5)
 
 
+def test_page_group_local_kernel_uses_dynamic_active_page_groups():
+    rng = np.random.default_rng(2468)
+    q_by_rank = rng.normal(size=(PCP_SIZE, Q_TILE, 1, 1,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    q_global = q_by_rank.reshape(PCP_SIZE * Q_TILE, 1, 1, HEAD_DIM)
+    kv_cache = rng.normal(size=(PCP_SIZE, 1, PAGE_SIZE, 1, 2,
+                                HEAD_DIM)).astype(np.float32) * 0.1
+    schedule = _make_single_page_group_schedule()
+    padded_schedule = np.zeros((PCP_SIZE * 2, PCP_SIZE, 1,
+                                schedule.packed_schedule.shape[-1]),
+                               dtype=np.int32)
+    padded_schedule[..., 0] = -1
+    padded_schedule[:PCP_SIZE] = schedule.packed_schedule
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    out = _run_page_groups_local(
+        jnp.asarray(q_global),
+        jnp.asarray(kv_cache),
+        jnp.asarray(padded_schedule),
+        sm_scale=sm_scale,
+        collective_id=24,
+        active_page_groups=jnp.array([1], dtype=jnp.int32),
+    )
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               kv_cache,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    expected = expected.reshape(PCP_SIZE * Q_TILE, 1, 1, HEAD_DIM)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-4,
+                               atol=5e-5)
+
+
 def test_page_group_packed_local_kernel_consumes_batched_rpa_kv_layout():
     rng = np.random.default_rng(8642)
     q_by_rank = rng.normal(size=(PCP_SIZE, Q_TILE, 2, 2,
@@ -566,6 +614,84 @@ def test_page_group_packed_local_kernel_handles_qwen_pcp8_tile_shape():
             q_block_size=q_tile,
             sm_scale=sm_scale,
             collective_id=24,
+        )
+
+    fn = jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(AXIS, None, None, None),
+                P(AXIS, None, None, None, None, None),
+                P(None, None, None, None),
+            ),
+            out_specs=P(AXIS, None, None, None),
+            check_vma=False,
+        ))
+    out = fn(jnp.asarray(q_global, dtype=jnp.bfloat16), packed_kv,
+             jnp.asarray(schedule.packed_schedule))
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               native_kv_host,
+                                               schedule,
+                                               sm_scale=sm_scale)
+    expected = expected.reshape(q_global.shape)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-3,
+                               atol=5e-4)
+
+
+def test_page_group_packed_local_kernel_handles_page32_interleave():
+    if jax.local_device_count() < 8:
+        pytest.skip("page32 PCP streaming regression requires 8 devices.")
+
+    pcp_size = 8
+    q_tile = 32
+    page_size = 32
+    kv_heads = 1
+    q_per_kv = 1
+    q_len = 1024
+    local_q_len = q_len // pcp_size
+    local_pages = q_len // (pcp_size * page_size)
+    rng = np.random.default_rng(64208)
+    q_by_rank = rng.normal(size=(pcp_size, local_q_len, kv_heads, q_per_kv,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    q_global = q_by_rank.reshape(pcp_size * local_q_len, kv_heads, q_per_kv,
+                                 HEAD_DIM)
+    native_kv_np = rng.normal(size=(pcp_size, local_pages, page_size, kv_heads,
+                                    2, HEAD_DIM)).astype(np.float32) * 0.1
+    native_kv = jnp.asarray(native_kv_np, dtype=jnp.bfloat16)
+    native_kv_host = np.asarray(jax.device_get(native_kv))
+    packed_kv = jnp.asarray(_pack_native_kv_cache(native_kv_host, 2),
+                            dtype=jnp.bfloat16)
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[q_len],
+        cu_q_lens=[0, q_len],
+        q_start_offsets=[0],
+        block_tables=np.arange(local_pages, dtype=np.int32)[None, :],
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=page_size,
+        num_lanes=1,
+        bq_sz=q_tile,
+        pad_kv_pages_to_pcp_group=True,
+    )
+    assert schedule.packed_schedule.shape[0] > pcp_size
+
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
+
+    def _call(q_local, kv_cache_local, packed_schedule):
+        return pcp_streaming_attention_page_groups_packed_local(
+            q_local,
+            kv_cache_local[0],
+            packed_schedule,
+            pcp_size=pcp_size,
+            q_block_size=q_tile,
+            sm_scale=sm_scale,
+            collective_id=25,
         )
 
     fn = jax.jit(

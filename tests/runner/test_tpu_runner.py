@@ -207,6 +207,8 @@ class TestPCPTokenPacking:
         schedule = metadata.streaming_schedule
         assert schedule is not None
         assert schedule.shape == (4, 2, 1, ScheduleField.PACKED_NUM_FIELDS)
+        np.testing.assert_array_equal(metadata.streaming_active_page_groups,
+                                      np.array([2], dtype=np.int32))
         req_id = unpack_pcp_streaming_schedule_field(schedule,
                                                      ScheduleField.REQ_ID)
         kv_page_idx = unpack_pcp_streaming_schedule_field(
@@ -215,6 +217,45 @@ class TestPCPTokenPacking:
         # Streaming schedule consumes the local virtual PCP block table.
         np.testing.assert_array_equal(np.unique(kv_page_idx[req_id != -1]),
                                       np.array([7], dtype=np.int32))
+
+    def test_build_attention_metadata_pads_streaming_schedule_to_stable_shape(
+            self):
+        block_tables = np.zeros((8, 2064), dtype=np.int32)
+        first_chunk = _build_pcp_attention_metadata(
+            num_scheduled_tokens_per_req=[4096],
+            seq_lens_per_req=[4096],
+            block_tables=block_tables,
+            pcp_size=8,
+            interleave_size=32,
+            padded_num_tokens=4096,
+            max_num_reqs_per_dp_rank=8,
+            block_size=32,
+            build_streaming_schedule=True,
+            streaming_num_lanes=1,
+            streaming_q_block_size=32,
+        )
+        second_chunk = _build_pcp_attention_metadata(
+            num_scheduled_tokens_per_req=[4096],
+            seq_lens_per_req=[8192],
+            block_tables=block_tables,
+            pcp_size=8,
+            interleave_size=32,
+            padded_num_tokens=4096,
+            max_num_reqs_per_dp_rank=8,
+            block_size=32,
+            build_streaming_schedule=True,
+            streaming_num_lanes=1,
+            streaming_q_block_size=32,
+        )
+
+        assert first_chunk.streaming_schedule is not None
+        assert second_chunk.streaming_schedule is not None
+        assert (first_chunk.streaming_schedule.shape ==
+                second_chunk.streaming_schedule.shape)
+        assert (first_chunk.streaming_active_page_groups[0] <
+                second_chunk.streaming_active_page_groups[0])
+        assert (second_chunk.streaming_active_page_groups[0] <
+                second_chunk.streaming_schedule.shape[0] // 8)
 
     def test_build_attention_metadata_chunked_prefill_continuation(self):
         metadata = _build_pcp_attention_metadata(
@@ -460,7 +501,7 @@ class TestPCPBatchSelection:
             num_reqs=1,
         )
 
-    def test_chunked_prompt_continuation_multiple_tokens_materializes_pcp_kv(
+    def test_chunked_prompt_continuation_multiple_tokens_uses_pcp_prefill(
             self):
         assert not _batch_uses_pcp_prefill(
             self._vllm_config(pcp_size=1),
@@ -470,13 +511,30 @@ class TestPCPBatchSelection:
         )
         input_batch = self._input_batch(["req1"], [4096], [4100])
         scheduler_output = self._scheduler({"req1": 4})
-        assert not _batch_uses_pcp_prefill(
+        assert _batch_uses_pcp_prefill(
             self._vllm_config(),
             input_batch,
             scheduler_output,
             num_reqs=1,
         )
-        assert _batch_uses_pcp_decode(
+        assert not _batch_uses_pcp_decode(
+            self._vllm_config(),
+            input_batch,
+            scheduler_output,
+            num_reqs=1,
+        )
+
+    def test_chunked_prefill_late_64k_chunk_uses_pcp_prefill(self):
+        input_batch = self._input_batch(["req1"], [57344], [65536])
+        scheduler_output = self._scheduler({"req1": 4096})
+
+        assert _batch_uses_pcp_prefill(
+            self._vllm_config(),
+            input_batch,
+            scheduler_output,
+            num_reqs=1,
+        )
+        assert not _batch_uses_pcp_decode(
             self._vllm_config(),
             input_batch,
             scheduler_output,

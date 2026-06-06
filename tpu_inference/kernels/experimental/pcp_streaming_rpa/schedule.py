@@ -215,6 +215,7 @@ def generate_pcp_streaming_schedule(
     num_lanes: int,
     bq_sz: int,
     pad_kv_pages_to_pcp_group: bool = False,
+    pad_steps_to: int | None = None,
 ) -> PcpStreamingSchedule:
     """Generate a replicated PCP streaming schedule for page-aligned PCP.
 
@@ -331,7 +332,14 @@ def generate_pcp_streaming_schedule(
         actual_steps[consumer_rank] = int(lane_lengths.max(initial=0))
         schedules.append(lane_entries)
 
-    max_steps = int(actual_steps.max(initial=0))
+    actual_max_steps = int(actual_steps.max(initial=0))
+    max_steps = actual_max_steps
+    if pad_steps_to is not None:
+        pad_steps_to = int(pad_steps_to)
+        if pad_steps_to < actual_max_steps:
+            raise ValueError("pad_steps_to must be >= generated schedule steps: "
+                             f"{pad_steps_to=} {actual_max_steps=}.")
+        max_steps = pad_steps_to
     shape = (pcp_size, max_steps, num_lanes)
 
     req_id = np.full(shape, -1, dtype=np.int32)
@@ -381,7 +389,7 @@ def generate_pcp_streaming_schedule(
     return PcpStreamingSchedule(
         req_id=req_id,
         actual_steps=actual_steps,
-        global_actual_steps=np.array([max_steps], dtype=np.int32),
+        global_actual_steps=np.array([actual_max_steps], dtype=np.int32),
         packed_schedule=packed_schedule,
         **fields,
     )

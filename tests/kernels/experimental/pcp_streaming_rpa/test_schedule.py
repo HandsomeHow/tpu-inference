@@ -138,6 +138,53 @@ def test_generate_schedule_can_pad_kv_pages_to_pcp_groups():
     validate_pcp_streaming_schedule(schedule)
 
 
+def test_generate_schedule_can_pad_steps_without_changing_actual_steps():
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[10],
+        cu_q_lens=[0, 2],
+        q_start_offsets=[8],
+        block_tables=np.array([[100, 101]], dtype=np.int32),
+        page_size=2,
+        pcp_size=4,
+        interleave_size=2,
+        num_lanes=1,
+        bq_sz=2,
+        pad_kv_pages_to_pcp_group=True,
+        pad_steps_to=12,
+    )
+
+    assert schedule.req_id.shape == (4, 12, 1)
+    assert schedule.packed_schedule.shape == (
+        12,
+        4,
+        1,
+        ScheduleField.PACKED_NUM_FIELDS,
+    )
+    np.testing.assert_array_equal(schedule.actual_steps,
+                                  np.array([8, 0, 0, 0], dtype=np.int32))
+    np.testing.assert_array_equal(schedule.global_actual_steps,
+                                  np.array([8], dtype=np.int32))
+    np.testing.assert_array_equal(schedule.req_id[:, 8:, 0],
+                                  np.full((4, 4), -1, dtype=np.int32))
+
+
+def test_generate_schedule_rejects_too_small_step_padding():
+    with pytest.raises(ValueError, match="pad_steps_to"):
+        generate_pcp_streaming_schedule(
+            kv_lens=[10],
+            cu_q_lens=[0, 2],
+            q_start_offsets=[8],
+            block_tables=np.array([[100, 101]], dtype=np.int32),
+            page_size=2,
+            pcp_size=4,
+            interleave_size=2,
+            num_lanes=1,
+            bq_sz=2,
+            pad_kv_pages_to_pcp_group=True,
+            pad_steps_to=4,
+        )
+
+
 def test_schedule_packed_fields_match_unpacked_arrays():
     schedule = generate_pcp_streaming_schedule(
         kv_lens=[12],

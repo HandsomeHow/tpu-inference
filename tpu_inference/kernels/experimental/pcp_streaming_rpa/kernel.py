@@ -174,6 +174,7 @@ def _mesh_device_id(mesh_axis_names, pcp_axis_name, pcp_rank):
 
 
 def _pcp_streaming_attention_page_groups_kernel(
+    active_page_groups_ref,
     q_ref,
     kv_cache_ref,
     packed_schedule_ref,
@@ -224,7 +225,8 @@ def _pcp_streaming_attention_page_groups_kernel(
         acc = jnp.zeros((q_block_size, q_vmem_ref.shape[1]),
                         dtype=jnp.float32)
 
-        for group_idx in range(num_page_groups):
+        def _page_group_loop(group_idx, carry):
+            m, l, acc = carry
             group_start = group_idx * pcp_size
 
             _load_schedule_step(packed_schedule_ref, sched_vmem_ref,
@@ -285,10 +287,8 @@ def _pcp_streaming_attention_page_groups_kernel(
                     remote_op = pltpu.make_async_remote_copy(
                         src_ref=kv_vmem_ref.at[curr_slot],
                         dst_ref=kv_vmem_ref.at[next_slot],
-                        send_sem=remote_send_sems.at[lane, group_idx,
-                                                     round_idx],
-                        recv_sem=remote_recv_sems.at[lane, group_idx,
-                                                     round_idx],
+                        send_sem=remote_send_sems.at[lane, round_idx],
+                        recv_sem=remote_recv_sems.at[lane, round_idx],
                         device_id=next_device_id,
                         device_id_type=pl.DeviceIdType.MESH,
                     )
@@ -333,6 +333,18 @@ def _pcp_streaming_attention_page_groups_kernel(
                 )
                 o_store.start()
                 o_store.wait()
+
+            return m, l, acc
+
+        active_page_groups = jnp.minimum(active_page_groups_ref[0],
+                                         num_page_groups)
+        m, l, acc = lax.fori_loop(
+            0,
+            active_page_groups,
+            _page_group_loop,
+            (m, l, acc),
+            unroll=False,
+        )
 
 
 def _validate_page_group_inputs(q_by_rank, kv_cache_by_rank, packed_schedule,
@@ -507,6 +519,7 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
     q_single_head,
     kv_cache_single_head,
     packed_schedule,
+    active_page_groups=None,
     *,
     pcp_size: int,
     q_block_size: int,
@@ -523,6 +536,12 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
     num_page_groups = packed_schedule.shape[0] // pcp_size
     num_lanes = packed_schedule.shape[2]
     num_q_blocks = q_single_head.shape[0] // q_block_size
+    if active_page_groups is None:
+        active_page_groups = jnp.array([num_page_groups], dtype=jnp.int32)
+    else:
+        active_page_groups = jnp.asarray(active_page_groups, dtype=jnp.int32)
+        if active_page_groups.shape == ():
+            active_page_groups = active_page_groups[None]
 
     return pl.pallas_call(
         functools.partial(
@@ -544,7 +563,7 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             q_single_head.dtype,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=0,
+            num_scalar_prefetch=1,
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
@@ -554,10 +573,8 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             scratch_shapes=(
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA(
-                    (num_lanes, num_page_groups, pcp_size - 1)),
-                pltpu.SemaphoreType.DMA(
-                    (num_lanes, num_page_groups, pcp_size - 1)),
+                pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
+                pltpu.SemaphoreType.DMA((num_lanes, pcp_size - 1)),
                 pltpu.VMEM((pcp_size, num_lanes,
                             ScheduleField.PACKED_NUM_FIELDS),
                            packed_schedule.dtype),
@@ -573,13 +590,14 @@ def _pcp_streaming_attention_page_groups_single_head_pallas_call(
             vmem_limit_bytes=_pcp_streaming_vmem_limit_bytes(),
         ),
         name="pcp_streaming_attention_page_groups",
-    )(q_single_head, kv_cache_single_head, packed_schedule)
+    )(active_page_groups, q_single_head, kv_cache_single_head, packed_schedule)
 
 
 def pcp_streaming_attention_page_groups_local(
     q_local,
     kv_cache_local,
     packed_schedule,
+    active_page_groups=None,
     *,
     pcp_size: int,
     q_block_size: int,
@@ -619,6 +637,7 @@ def pcp_streaming_attention_page_groups_local(
                 q_slice[:, 0, 0, :],
                 kv_slice[None, ...],
                 packed_schedule,
+                active_page_groups,
                 pcp_size=pcp_size,
                 q_block_size=q_block_size,
                 sm_scale=sm_scale,
@@ -635,6 +654,7 @@ def pcp_streaming_attention_page_groups_packed_local(
     q_local,
     kv_cache_local,
     packed_schedule,
+    active_page_groups=None,
     *,
     pcp_size: int,
     q_block_size: int,
@@ -675,6 +695,7 @@ def pcp_streaming_attention_page_groups_packed_local(
                 q_slice[:, 0, 0, :],
                 kv_cache_local[None, ...],
                 packed_schedule,
+                active_page_groups,
                 pcp_size=pcp_size,
                 q_block_size=q_block_size,
                 sm_scale=sm_scale,
@@ -694,6 +715,7 @@ def _pcp_streaming_attention_page_groups_single_head(
     q_by_rank,
     kv_cache_by_rank,
     packed_schedule,
+    active_page_groups=None,
     *,
     pcp_size: int,
     q_block_size: int,
@@ -725,6 +747,7 @@ def _pcp_streaming_attention_page_groups_single_head(
             q[0, :, 0, 0, :],
             kv_cache,
             schedule,
+            active_page_groups,
             pcp_size=pcp_size,
             q_block_size=q_block_size,
             sm_scale=sm_scale,
@@ -754,6 +777,7 @@ def pcp_streaming_attention_page_groups(
     q_by_rank,
     kv_cache_by_rank,
     packed_schedule,
+    active_page_groups=None,
     *,
     pcp_size: int,
     q_block_size: int,
@@ -777,6 +801,7 @@ def pcp_streaming_attention_page_groups(
             q_by_rank,
             kv_cache_by_rank,
             packed_schedule,
+            active_page_groups,
             pcp_size=pcp_size,
             q_block_size=q_block_size,
             sm_scale=sm_scale,
@@ -802,6 +827,7 @@ def pcp_streaming_attention_page_groups(
                     q_slice,
                     kv_slice,
                     packed_schedule,
+                    active_page_groups,
                     pcp_size=pcp_size,
                     q_block_size=q_block_size,
                     sm_scale=sm_scale,

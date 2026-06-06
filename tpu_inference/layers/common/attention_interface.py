@@ -369,6 +369,7 @@ def sharded_ragged_paged_attention(
     pcp_slot_ids: jax.Array | None = None,
     pcp_source_block_tables: jax.Array | None = None,
     pcp_streaming_schedule: jax.Array | None = None,
+    pcp_streaming_active_page_groups: jax.Array | None = None,
 ):
     """Shards along KV heads."""
     if use_pcp_decode:
@@ -444,6 +445,8 @@ def sharded_ragged_paged_attention(
             pcp_cu_k_lens=pcp_cu_k_lens,
             pcp_slot_ids=pcp_slot_ids,
             pcp_streaming_schedule=pcp_streaming_schedule,
+            pcp_streaming_active_page_groups=(
+                pcp_streaming_active_page_groups),
         )
 
     data_axis = (ShardingAxisName.ATTN_DATA
@@ -836,6 +839,7 @@ def sharded_pcp_ragged_paged_attention(
     pcp_cu_k_lens: jax.Array | None = None,
     pcp_slot_ids: jax.Array | None = None,
     pcp_streaming_schedule: jax.Array | None = None,
+    pcp_streaming_active_page_groups: jax.Array | None = None,
 ):
     """Runs local-query/full-KV RPA over the prefill context axis."""
     if attention_sink is not None:
@@ -871,6 +875,8 @@ def sharded_pcp_ragged_paged_attention(
     streaming_requested = (envs.USE_PCP_STREAMING_RPA_KERNEL
                            and pcp_streaming_schedule is not None)
     if streaming_requested:
+        if pcp_streaming_active_page_groups is None:
+            raise ValueError("PCP streaming RPA requires active page groups.")
         if not has_precomputed_pcp_metadata:
             raise ValueError(
                 "PCP streaming RPA requires precomputed PCP metadata from "
@@ -905,6 +911,11 @@ def sharded_pcp_ragged_paged_attention(
     else:
         pcp_streaming_schedule_spec = P(ShardingAxisName.BATCH, None, None,
                                         None, None)
+    if (pcp_streaming_active_page_groups is not None
+            and pcp_streaming_active_page_groups.ndim == 1):
+        pcp_streaming_active_page_groups_spec = P(None)
+    else:
+        pcp_streaming_active_page_groups_spec = P(ShardingAxisName.BATCH, None)
     in_specs = (
         qkv_spec,
         qkv_spec,
@@ -929,8 +940,9 @@ def sharded_pcp_ragged_paged_attention(
         )
         args += precomputed_pcp_metadata
     if streaming_requested:
-        in_specs += (pcp_streaming_schedule_spec, )
-        args += (pcp_streaming_schedule, )
+        in_specs += (pcp_streaming_schedule_spec,
+                     pcp_streaming_active_page_groups_spec)
+        args += (pcp_streaming_schedule, pcp_streaming_active_page_groups)
 
     def _pcp_ragged_paged_attention(q_local, k_local, v_local, kv_cache,
                                     kv_lens, page_indices, cu_q_lens,
@@ -940,6 +952,9 @@ def sharded_pcp_ragged_paged_attention(
         pcp_metadata_args = extra_pcp_args[:num_pcp_metadata_args]
         streaming_schedule_arg = (extra_pcp_args[num_pcp_metadata_args]
                                   if streaming_requested else None)
+        streaming_active_page_groups_arg = (
+            extra_pcp_args[num_pcp_metadata_args + 1]
+            if streaming_requested else None)
         kv_indices = _make_pcp_interleaved_token_indices(
             kv_lens,
             k_local.shape[0],
@@ -978,12 +993,17 @@ def sharded_pcp_ragged_paged_attention(
                                           q_per_kv, q_local.shape[2])
             if streaming_schedule_arg.ndim == 5:
                 streaming_schedule_arg = streaming_schedule_arg[0]
+            if streaming_active_page_groups_arg.ndim == 2:
+                streaming_active_page_groups_arg = (
+                    streaming_active_page_groups_arg[0])
             output = pcp_streaming_attention_page_groups_packed_local(
                 q_streaming,
                 kv_cache,
                 streaming_schedule_arg,
+                streaming_active_page_groups_arg,
                 pcp_size=pcp_size,
-                q_block_size=envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
+                q_block_size=min(envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
+                                 cp_kv_cache_interleave_size),
                 sm_scale=sm_scale,
                 collective_id=23,
                 mesh_axis_names=tuple(mesh.axis_names),
@@ -1211,6 +1231,8 @@ def attention(
         pcp_slot_ids=md.pcp_slot_ids,
         pcp_source_block_tables=md.pcp_source_block_tables,
         pcp_streaming_schedule=md.pcp_streaming_schedule,
+        pcp_streaming_active_page_groups=(
+            md.pcp_streaming_active_page_groups),
     )
 
     return kv_cache, output
