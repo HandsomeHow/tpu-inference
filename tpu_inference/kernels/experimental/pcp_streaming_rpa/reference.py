@@ -95,14 +95,38 @@ def execute_pcp_streaming_reference(
                     schedule.kv_global_start[consumer_rank, step, lane])
                 q_global_start = int(
                     schedule.q_global_start[consumer_rank, step, lane])
-                k = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :, 0,
-                                     :].astype(np.float32)
-                v = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :, 1,
-                                     :].astype(np.float32)
+                if schedule.kv_page_indices is None:
+                    k = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :,
+                                         0, :].astype(np.float32)
+                    v = kv_cache_by_rank[src_rank, page_idx, :kv_valid_len, :,
+                                         1, :].astype(np.float32)
+                    kv_pos = kv_global_start + np.arange(kv_valid_len)
+                else:
+                    page_size = kv_cache_by_rank.shape[2]
+                    page_ids = schedule.kv_page_indices[consumer_rank, step,
+                                                        lane]
+                    k_pages = []
+                    v_pages = []
+                    remaining = kv_valid_len
+                    for page_id in page_ids:
+                        if remaining <= 0:
+                            break
+                        take = min(page_size, remaining)
+                        k_pages.append(kv_cache_by_rank[src_rank, page_id, :take,
+                                                       :, 0, :])
+                        v_pages.append(kv_cache_by_rank[src_rank, page_id, :take,
+                                                       :, 1, :])
+                        remaining -= take
+                    k = np.concatenate(k_pages, axis=0).astype(np.float32)
+                    v = np.concatenate(v_pages, axis=0).astype(np.float32)
+                    local_kv_pos = np.arange(kv_valid_len)
+                    kv_pos = (kv_global_start +
+                              (local_kv_pos // page_size) *
+                              schedule.pcp_size * page_size +
+                              local_kv_pos % page_size)
 
                 scores = np.einsum("thqd,shd->thqs", q_tile, k) * sm_scale
                 q_pos = q_global_start + np.arange(q_tile_size)
-                kv_pos = kv_global_start + np.arange(kv_valid_len)
                 mask = q_pos[:, None] >= kv_pos[None, :]
                 scores = np.where(mask[:, None, None, :], scores, -np.inf)
 

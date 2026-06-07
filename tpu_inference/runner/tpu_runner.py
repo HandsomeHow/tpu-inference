@@ -515,8 +515,10 @@ def _estimate_pcp_streaming_schedule_steps_ub(
     interleave_size: int,
     num_lanes: int,
     q_block_size: int,
+    kv_pages_per_block: int = 1,
 ) -> int:
     max_global_pages = cdiv(capacity_tokens, block_size)
+    kv_pages_per_block = max(1, int(kv_pages_per_block))
     max_steps = 0
     for consumer_rank in range(pcp_size):
         lane_lengths = np.zeros(num_lanes, dtype=np.int64)
@@ -536,7 +538,9 @@ def _estimate_pcp_streaming_schedule_steps_ub(
                     q_global_last = chunk_start + tile_start + tile_len - 1
                     effective_pages = min(max_global_pages,
                                           q_global_last // block_size + 1)
-                    scheduled_pages = cdiv(effective_pages, pcp_size) * pcp_size
+                    scheduled_pages = (
+                        cdiv(effective_pages,
+                             pcp_size * kv_pages_per_block) * pcp_size)
                     target_lane = int(np.argmin(lane_lengths))
                     lane_lengths[target_lane] += scheduled_pages
         max_steps = max(max_steps, int(lane_lengths.max(initial=0)))
@@ -660,6 +664,7 @@ def _build_pcp_attention_metadata(
     build_streaming_schedule: bool = False,
     streaming_num_lanes: int = 1,
     streaming_q_block_size: int = 256,
+    streaming_kv_pages_per_block: int = 1,
 ) -> _PCPAttentionMetadataHost:
     """Build runner-owned local-Q/full-KV metadata for one DP rank."""
     if pcp_size <= 1:
@@ -785,6 +790,7 @@ def _build_pcp_attention_metadata(
             interleave_size=interleave_size,
             num_lanes=streaming_num_lanes,
             q_block_size=streaming_q_block_size,
+            kv_pages_per_block=streaming_kv_pages_per_block,
         )
         cu_q_lens = np.pad(np.cumsum(q_lens_full, dtype=np.int32), (1, 0))
         streaming_schedule_host = generate_pcp_streaming_schedule(
@@ -799,6 +805,7 @@ def _build_pcp_attention_metadata(
             bq_sz=streaming_q_block_size,
             pad_kv_pages_to_pcp_group=True,
             pad_steps_to=max_streaming_steps,
+            kv_pages_per_block=streaming_kv_pages_per_block,
         )
         actual_steps = int(streaming_schedule_host.global_actual_steps[0])
         if actual_steps % pcp_size != 0:
@@ -2624,6 +2631,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
                 cp_kv_cache_interleave_size,
             )
+            pcp_streaming_kv_pages_per_block = max(
+                1,
+                min(
+                    ScheduleField.MAX_KV_PAGES_PER_BLOCK,
+                    envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE // self.block_size,
+                ),
+            )
             for gid, block_tables_view in block_table_views_by_gid.items():
                 kv_cache_group = self.kv_cache_config.kv_cache_groups[gid]
                 if not _kv_cache_group_supports_pcp_attention_metadata(
@@ -2651,6 +2665,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 streaming_num_lanes=pcp_streaming_num_lanes,
                                 streaming_q_block_size=(
                                     pcp_streaming_q_block_size),
+                                streaming_kv_pages_per_block=(
+                                    pcp_streaming_kv_pages_per_block),
                             ))
                     host_pcp_metadata = _merge_pcp_attention_metadata(
                         metadata_per_dp)

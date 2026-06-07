@@ -36,6 +36,8 @@ class ScheduleField:
     O_HBM_OFFSET = 11
     NUM_FIELDS = 12
     PACKED_NUM_FIELDS = 128
+    KV_PAGE_INDICES_START = NUM_FIELDS
+    MAX_KV_PAGES_PER_BLOCK = PACKED_NUM_FIELDS - KV_PAGE_INDICES_START
 
 
 _PACKED_FIELD_NAMES = (
@@ -82,6 +84,7 @@ class PcpStreamingSchedule:
     packed_schedule: np.ndarray
     actual_steps: np.ndarray
     global_actual_steps: np.ndarray
+    kv_page_indices: np.ndarray | None = None
 
     @property
     def pcp_size(self) -> int:
@@ -110,6 +113,7 @@ class _Entry:
     q_hbm_offset: int
     q_tile_size: int
     o_hbm_offset: int
+    kv_page_indices: tuple[int, ...] | None = None
 
 
 def _validate_inputs(
@@ -122,6 +126,7 @@ def _validate_inputs(
     interleave_size: int,
     num_lanes: int,
     bq_sz: int,
+    kv_pages_per_block: int,
 ) -> int:
     if page_size <= 0:
         raise ValueError("page_size must be positive.")
@@ -133,6 +138,13 @@ def _validate_inputs(
         raise ValueError("num_lanes must be positive.")
     if bq_sz <= 0:
         raise ValueError("bq_sz must be positive.")
+    if kv_pages_per_block <= 0:
+        raise ValueError("kv_pages_per_block must be positive.")
+    if kv_pages_per_block > ScheduleField.MAX_KV_PAGES_PER_BLOCK:
+        raise ValueError(
+            "kv_pages_per_block exceeds packed schedule capacity: "
+            f"{kv_pages_per_block} > "
+            f"{ScheduleField.MAX_KV_PAGES_PER_BLOCK}.")
     if page_size != interleave_size:
         raise NotImplementedError(
             "PCP streaming schedule currently requires "
@@ -216,6 +228,7 @@ def generate_pcp_streaming_schedule(
     bq_sz: int,
     pad_kv_pages_to_pcp_group: bool = False,
     pad_steps_to: int | None = None,
+    kv_pages_per_block: int = 1,
 ) -> PcpStreamingSchedule:
     """Generate a replicated PCP streaming schedule for page-aligned PCP.
 
@@ -224,6 +237,11 @@ def generate_pcp_streaming_schedule(
     to exactly one PCP rank. When pad_kv_pages_to_pcp_group is true, each Q
     tile's KV pages are padded with no-op entries to a multiple of pcp_size so
     the schedule can drive ring-grouped kernels.
+
+    kv_pages_per_block groups consecutive local pages from the same source rank
+    into one ring step. The grouped pages are strided in global token order by
+    pcp_size * page_size, and their physical page ids are stored in the padded
+    schedule fields starting at ScheduleField.KV_PAGE_INDICES_START.
     """
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
     cu_q_lens = np.asarray(cu_q_lens, dtype=np.int64)
@@ -239,7 +257,9 @@ def generate_pcp_streaming_schedule(
         interleave_size,
         num_lanes,
         bq_sz,
+        kv_pages_per_block,
     )
+    kv_pages_per_block = int(kv_pages_per_block)
 
     schedules: list[list[list[_Entry]]] = []
     actual_steps = np.zeros(pcp_size, dtype=np.int32)
@@ -274,16 +294,63 @@ def generate_pcp_streaming_schedule(
                     effective_kv_pages = min(num_kv_pages,
                                              q_global_last // page_size + 1)
 
-                    scheduled_kv_pages = effective_kv_pages
-                    if pad_kv_pages_to_pcp_group:
-                        scheduled_kv_pages = _cdiv(effective_kv_pages,
-                                                    pcp_size) * pcp_size
+                    if kv_pages_per_block == 1:
+                        scheduled_kv_pages = effective_kv_pages
+                        if pad_kv_pages_to_pcp_group:
+                            scheduled_kv_pages = _cdiv(
+                                effective_kv_pages, pcp_size) * pcp_size
+                        last_block = -1
+                        last_store_src_rank = -1
+                    else:
+                        block_span_pages = pcp_size * kv_pages_per_block
+                        scheduled_kv_blocks = _cdiv(effective_kv_pages,
+                                                     block_span_pages)
+                        scheduled_kv_pages = scheduled_kv_blocks * pcp_size
+                        last_global_page = effective_kv_pages - 1
+                        last_local_page = last_global_page // pcp_size
+                        last_block = last_local_page // kv_pages_per_block
+                        last_store_src_rank = 0
+                        last_local_page_start = last_block * kv_pages_per_block
+                        for candidate_src_rank in range(pcp_size):
+                            for page_offset in range(kv_pages_per_block):
+                                candidate_global_page = (
+                                    (last_local_page_start + page_offset) *
+                                    pcp_size + candidate_src_rank)
+                                if candidate_global_page < effective_kv_pages:
+                                    last_store_src_rank = candidate_src_rank
 
                     for kv_page_seq_idx in range(scheduled_kv_pages):
-                        global_token_start = kv_page_seq_idx * page_size
-                        global_page = global_token_start // page_size
-                        src_rank = global_page % pcp_size
-                        if kv_page_seq_idx >= effective_kv_pages:
+                        if kv_pages_per_block == 1:
+                            src_rank = kv_page_seq_idx % pcp_size
+                            local_page_start = kv_page_seq_idx // pcp_size
+                        else:
+                            src_rank = kv_page_seq_idx % pcp_size
+                            local_page_start = (kv_page_seq_idx // pcp_size *
+                                                kv_pages_per_block)
+                        global_page = local_page_start * pcp_size + src_rank
+                        global_token_start = global_page * page_size
+                        valid_tokens = 0
+                        page_indices = []
+                        for page_offset in range(kv_pages_per_block):
+                            page_global = ((local_page_start + page_offset) *
+                                           pcp_size + src_rank)
+                            if page_global < effective_kv_pages:
+                                local_page_index = page_global // pcp_size
+                                if local_page_index >= block_tables.shape[1]:
+                                    raise ValueError(
+                                        "block_tables does not cover requested "
+                                        "KV page.")
+                                physical_page = int(block_tables[
+                                    req_idx, local_page_index])
+                                page_valid = min(
+                                    page_size,
+                                    kv_len - page_global * page_size,
+                                )
+                                valid_tokens += max(page_valid, 0)
+                            else:
+                                physical_page = 0
+                            page_indices.append(physical_page)
+                        if valid_tokens == 0:
                             lane_entries[target_lane].append(
                                 _Entry(
                                     req_id=-1,
@@ -298,32 +365,34 @@ def generate_pcp_streaming_schedule(
                                     q_hbm_offset=q_hbm_offset,
                                     q_tile_size=tile_len,
                                     o_hbm_offset=q_hbm_offset,
+                                    kv_page_indices=tuple(page_indices),
                                 ))
                             lane_lengths[target_lane] += 1
                             continue
-                        local_page_index = global_page // pcp_size
-                        if local_page_index >= block_tables.shape[1]:
-                            raise ValueError(
-                                "block_tables does not cover requested KV page.")
-                        physical_page = int(block_tables[req_idx,
-                                                         local_page_index])
-                        kv_valid = min(page_size,
-                                       kv_len - global_token_start)
+                        if kv_pages_per_block == 1:
+                            is_first = int(kv_page_seq_idx == 0)
+                            is_last = int(kv_page_seq_idx ==
+                                          effective_kv_pages - 1)
+                        else:
+                            cur_block = kv_page_seq_idx // pcp_size
+                            is_first = int(cur_block == 0 and src_rank == 0)
+                            is_last = int(cur_block == last_block and
+                                          src_rank == last_store_src_rank)
                         lane_entries[target_lane].append(
                             _Entry(
                                 req_id=req_idx,
                                 kv_page_rank=src_rank,
-                                kv_page_idx=physical_page,
-                                is_first_kv=int(kv_page_seq_idx == 0),
-                                is_last_kv=int(
-                                    kv_page_seq_idx == effective_kv_pages - 1),
-                                load_q=int(kv_page_seq_idx == 0),
+                                kv_page_idx=page_indices[0],
+                                is_first_kv=is_first,
+                                is_last_kv=is_last,
+                                load_q=is_first,
                                 q_global_start=q_global,
                                 kv_global_start=global_token_start,
-                                kv_valid_len=kv_valid,
+                                kv_valid_len=valid_tokens,
                                 q_hbm_offset=q_hbm_offset,
                                 q_tile_size=tile_len,
                                 o_hbm_offset=q_hbm_offset,
+                                kv_page_indices=tuple(page_indices),
                             ))
                         lane_lengths[target_lane] += 1
 
@@ -343,6 +412,10 @@ def generate_pcp_streaming_schedule(
     shape = (pcp_size, max_steps, num_lanes)
 
     req_id = np.full(shape, -1, dtype=np.int32)
+    kv_page_indices = None
+    if kv_pages_per_block > 1:
+        kv_page_indices = np.zeros(shape + (kv_pages_per_block, ),
+                                   dtype=np.int32)
     fields = {
         "kv_page_rank": np.full(shape, -1, dtype=np.int32),
         "kv_page_idx": np.full(shape, -1, dtype=np.int32),
@@ -382,15 +455,30 @@ def generate_pcp_streaming_schedule(
                                       lane] = entry.q_tile_size
                 fields["o_hbm_offset"][consumer_rank, step,
                                        lane] = entry.o_hbm_offset
+                if kv_page_indices is not None:
+                    # The first page id is also present in kv_page_idx for
+                    # compatibility with the single-page schedule fields.
+                    page_indices = entry.kv_page_indices
+                    if page_indices is None:
+                        page_indices = (entry.kv_page_idx, )
+                    kv_page_indices[consumer_rank, step, lane, :len(
+                        page_indices)] = page_indices
 
     packed_schedule = pack_pcp_streaming_schedule_fields(req_id=req_id,
                                                          **fields)
+    if kv_page_indices is not None:
+        packed_schedule[
+            ...,
+            ScheduleField.KV_PAGE_INDICES_START:
+            ScheduleField.KV_PAGE_INDICES_START + kv_pages_per_block,
+        ] = np.transpose(kv_page_indices, (1, 0, 2, 3))
 
     return PcpStreamingSchedule(
         req_id=req_id,
         actual_steps=actual_steps,
         global_actual_steps=np.array([actual_max_steps], dtype=np.int32),
         packed_schedule=packed_schedule,
+        kv_page_indices=kv_page_indices,
         **fields,
     )
 

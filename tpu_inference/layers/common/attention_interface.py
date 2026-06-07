@@ -34,6 +34,8 @@ from tpu_inference.kernels.experimental.batched_rpa import \
     wrapper as batched_rpa_wrapper
 from tpu_inference.kernels.experimental.pcp_streaming_rpa import (
     pcp_streaming_attention_page_groups_packed_local)
+from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
+    ScheduleField)
 from tpu_inference.kernels.flash_attention.kernel import flash_attention
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from tpu_inference.layers.common.attention_metadata import (AttentionMetadata,
@@ -1006,6 +1008,14 @@ def sharded_pcp_ragged_paged_attention(
                                  cp_kv_cache_interleave_size),
                 sm_scale=sm_scale,
                 collective_id=23,
+                kv_pages_per_block=max(
+                    1,
+                    min(
+                        ScheduleField.MAX_KV_PAGES_PER_BLOCK,
+                        envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE //
+                        kv_cache.shape[1],
+                    ),
+                ),
                 mesh_axis_names=tuple(mesh.axis_names),
                 pcp_axis_name=pcp_axis,
             )

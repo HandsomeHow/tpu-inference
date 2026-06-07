@@ -1178,6 +1178,7 @@ def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
     monkeypatch.setattr(ShardingAxisName, "_cls", ShardingAxisNameBase)
     monkeypatch.setenv("USE_PCP_STREAMING_RPA_KERNEL", "1")
     monkeypatch.setenv("PCP_STREAMING_RPA_Q_BLOCK_SIZE", "2")
+    monkeypatch.setenv("PCP_STREAMING_RPA_KV_BLOCK_SIZE", "8")
     devices = np.array(jax.local_devices()[:1] * 2).reshape((1, 1, 1, 1, 1, 2))
     pcp_mesh = Mesh(
         devices,
@@ -1194,12 +1195,15 @@ def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
         captured["slot_ids"] = slot_ids_arg
         return kv_cache_arg + 5
 
-    def fake_streaming_kernel(q_arg, kv_cache_arg, schedule_arg, **kwargs):
+    def fake_streaming_kernel(q_arg, kv_cache_arg, schedule_arg,
+                              active_groups_arg, **kwargs):
         captured["q_shape"] = q_arg.shape
         captured["kv_cache"] = kv_cache_arg
         captured["schedule"] = schedule_arg
+        captured["active_groups"] = active_groups_arg
         captured["pcp_size"] = kwargs["pcp_size"]
         captured["q_block_size"] = kwargs["q_block_size"]
+        captured["kv_pages_per_block"] = kwargs["kv_pages_per_block"]
         captured["sm_scale"] = kwargs["sm_scale"]
         return jnp.full_like(q_arg, 7.0)
 
@@ -1243,6 +1247,7 @@ def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
         pcp_cu_k_lens=jnp.array([0, 0, 8], dtype=jnp.int32),
         pcp_slot_ids=jnp.array([0, 1, 2, 3], dtype=jnp.int32),
         pcp_streaming_schedule=streaming_schedule,
+        pcp_streaming_active_page_groups=jnp.array([1], dtype=jnp.int32),
     )
 
     assert out.shape == q.shape
@@ -1254,8 +1259,11 @@ def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
                                   np.array([0, 1, 2, 3], dtype=np.int32))
     np.testing.assert_array_equal(captured["schedule"],
                                   np.zeros((2, 2, 1, 128), dtype=np.int32))
+    np.testing.assert_array_equal(captured["active_groups"],
+                                  np.array([1], dtype=np.int32))
     assert captured["pcp_size"] == 2
     assert captured["q_block_size"] == 2
+    assert captured["kv_pages_per_block"] == 2
     assert captured["sm_scale"] == 0.25
 
 
