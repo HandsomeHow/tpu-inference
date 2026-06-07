@@ -25,21 +25,6 @@ from jax.experimental.pallas import tpu as pltpu
 from tpu_inference.kernels.experimental.batched_rpa import configs, utils
 
 
-def _q_global_position(q_global_start: jax.Array, q_local_offset: jax.Array,
-                       cfgs: configs.RpaConfigs) -> jax.Array:
-    if cfgs.serve.has_chunked_q_positions:
-        if (cfgs.serve.q_position_chunk_size
-                & (cfgs.serve.q_position_chunk_size - 1)) == 0:
-            shift = (cfgs.serve.q_position_chunk_size - 1).bit_length()
-            chunk = q_local_offset >> shift
-            offset = q_local_offset & (cfgs.serve.q_position_chunk_size - 1)
-        else:
-            chunk = q_local_offset // cfgs.serve.q_position_chunk_size
-            offset = q_local_offset - chunk * cfgs.serve.q_position_chunk_size
-        return q_global_start + chunk * cfgs.serve.q_position_chunk_stride + offset
-    return q_global_start + q_local_offset
-
-
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SmemWrapper:
@@ -176,8 +161,6 @@ class RpaSchedule:
 def compute_metadata(
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
-    q_start_offsets_ref: jax.Ref,
-    cu_k_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
     schedule: RpaSchedule,
     lane_lengths_ref: jax.Ref,
@@ -206,8 +189,6 @@ def compute_metadata(
         q_end,
         q_src,
         q_sz_task,
-        q_global_start,
-        k_src_start,
         k_len,
         q_len,
         end_k_idx,
@@ -226,9 +207,7 @@ def compute_metadata(
         kv_len_start = k_idx * cfgs.bkv_sz
         kv_p_start = k_idx * cfgs.bkv_p
         kv_left = k_len - kv_len_start
-        if cfgs.serve.use_full_kv_inputs:
-            kv_left_frm_cache = 0
-        elif update_kv_cache:
+        if update_kv_cache:
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         else:
             # KV-share: read everything from cache; the source layer's
@@ -256,15 +235,11 @@ def compute_metadata(
 
         # Writeback logic: each new k block is written back by the first q block
         # that attends to it.
-        q_wb = jnp.maximum(0, (kv_len_start - q_global_start)) // cfgs.bq_sz
+        q_wb = jnp.maximum(0, (kv_len_start - (k_len - q_len))) // cfgs.bq_sz
 
-        do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb)
-                                 & (not cfgs.serve.use_full_kv_inputs), 1, 0)
+        do_writeback = jnp.where((new_sz > 0) & (q_idx == q_wb), 1, 0)
         schedule.do_writeback[step, target_lane] = do_writeback
-        if cfgs.serve.use_full_kv_inputs:
-            src_hbm = k_src_start + kv_len_start + kv_left_frm_cache
-        else:
-            src_hbm = q_end - kv_left_frm_new
+        src_hbm = q_end - kv_left_frm_new
 
         if cfgs.bkv_p_new < cfgs.bkv_p:
             # Special case where we only need to write back one page.
@@ -305,8 +280,7 @@ def compute_metadata(
         return step + 1
 
     @jax.named_scope("q_loop")
-    def q_loop(q_idx, _, *, s_idx, q_start, q_end, q_global_start, k_src_start,
-               k_len, q_len, num_k):
+    def q_loop(q_idx, _, *, s_idx, q_start, q_end, k_len, q_len, num_k):
         target_lane = 0
         min_len = lane_lengths_ref[0]
         for b in range(1, cfgs.batch_size):
@@ -319,17 +293,12 @@ def compute_metadata(
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
 
         start_k_idx = 0
-        q_local_start = q_idx * cfgs.bq_sz
-        q_global_first = _q_global_position(q_global_start, q_local_start,
-                                            cfgs)
-        q_global_last = _q_global_position(
-            q_global_start, q_local_start + q_sz_task - 1, cfgs)
-
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            sw_start_idx = q_global_first - sliding_window + 1
+            sw_start_idx = k_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-        end_k_idx_causal = q_global_last // cfgs.bkv_sz + 1
+        end_k_idx_causal = (k_len - q_len + q_idx * cfgs.bq_sz + q_sz_task -
+                            1) // cfgs.bkv_sz + 1
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
         k_loop_fn = functools.partial(
@@ -340,8 +309,6 @@ def compute_metadata(
             q_end=q_end,
             q_src=q_src,
             q_sz_task=q_sz_task,
-            q_global_start=q_global_start,
-            k_src_start=k_src_start,
             k_len=k_len,
             q_len=q_len,
             end_k_idx=end_k_idx,
@@ -355,8 +322,6 @@ def compute_metadata(
         q_end = cu_q_lens_ref[s_idx + 1]
         k_len = kv_lens_ref[s_idx]
         q_len = q_end - q_start
-        q_global_start = q_start_offsets_ref[s_idx]
-        k_src_start = cu_k_lens_ref[s_idx]
 
         num_q = pl.cdiv(q_len, cfgs.bq_sz)
         num_k = pl.cdiv(k_len, cfgs.bkv_sz)
@@ -366,8 +331,6 @@ def compute_metadata(
             s_idx=s_idx,
             q_start=q_start,
             q_end=q_end,
-            q_global_start=q_global_start,
-            k_src_start=k_src_start,
             k_len=k_len,
             q_len=q_len,
             num_k=num_k,
@@ -383,8 +346,6 @@ def rpa_metadata_schedule_kernel(
     ## Scalar prefetch.
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
-    q_start_offsets_ref: jax.Ref,
-    cu_k_lens_ref: jax.Ref,
     distribution_ref: jax.Ref,
     # Outputs.
     schedule_hbm_ref: RpaSchedule,
@@ -432,8 +393,6 @@ def rpa_metadata_schedule_kernel(
     compute_metadata(
         cu_q_lens_ref,
         kv_lens_ref,
-        q_start_offsets_ref,
-        cu_k_lens_ref,
         distribution_ref,
         schedule_ref,
         lane_lengths_ref,
@@ -502,8 +461,6 @@ def rpa_metadata_schedule_kernel(
 def generate_rpa_metadata(
     cu_q_lens: jax.Array,
     kv_lens: jax.Array,
-    q_start_offsets: jax.Array,
-    cu_k_lens: jax.Array,
     distribution: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
@@ -518,7 +475,7 @@ def generate_rpa_metadata(
                           update_kv_cache=update_kv_cache),
         out_shape=schedule_shaped_dtype,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=5,
+            num_scalar_prefetch=3,
             in_specs=[],
             out_specs=schedule_shaped_dtype.out_specs(),
             scratch_shapes=[
@@ -529,4 +486,4 @@ def generate_rpa_metadata(
         ),
         interpret=interpret,
         name="rpa_metadata_schedule",
-    )(cu_q_lens, kv_lens, q_start_offsets, cu_k_lens, distribution)
+    )(cu_q_lens, kv_lens, distribution)

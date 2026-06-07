@@ -108,47 +108,12 @@ def calculate_and_store_out(
             _accum(b)
 
 
-def calculate_and_store_lse(
-    step_idx: jax.Array,
-    schedule_ref: schedule.RpaSchedule,
-    m_scratch_ref: jax.Ref,
-    l_scratch_ref: jax.Ref,
-    lse_vref: jax.Ref,
-    *,
-    cfgs: configs.RpaConfigs,
-):
-
-    def _store_lse(b_idx: int):
-        m = m_scratch_ref[b_idx][..., 0]
-        l = l_scratch_ref[b_idx][..., 0]
-        lse = jnp.where(l > 0, m + jnp.log(l), -jnp.inf)
-        lse = lse.astype(jnp.float32)
-        lse = lse.reshape(
-            cfgs.model.num_kv_heads,
-            cfgs.bq_sz,
-            cfgs.model.num_q_heads_per_kv_head // cfgs.serve.packing_q,
-            cfgs.serve.packing_q,
-        )
-        lse_vref[b_idx] = jnp.broadcast_to(lse[..., None],
-                                           cfgs.lse_vmem_shape[1:])
-
-    for b in range(cfgs.batch_size):
-        if not cfgs.fuse_accum:
-            is_last_k = schedule_ref.is_last_k[step_idx, b] == 1
-            jax.lax.cond(is_last_k, jax.named_call(_store_lse,
-                                                   name="store_lse"),
-                         lambda _: None, b)
-        else:
-            _store_lse(b)
-
-
 def rpa_body(
     # Inputs.
     q_vref: jax.Ref,
     kv_in_vref: jax.Ref,
     # Outputs
     o_vref: jax.Ref,
-    lse_vref: jax.Ref,
     # Scratches.
     schedule_ref: schedule.RpaSchedule,
     m_scratch_ref: jax.Ref,
@@ -158,15 +123,13 @@ def rpa_body(
     # Passed refs
     cu_q_lens_ref: jax.Ref,
     kv_lens_ref: jax.Ref,
-    q_start_offsets_ref: jax.Ref,
     # Configs.
     cfgs: configs.RpaConfigs,
 ):
     step = pl.program_id(0)
 
     # Step 1: Fetch metadata.
-    q_global_starts = []
-    q_local_starts = []
+    processed_q_len = []
     processed_kv_len = []
     effective_kv_len = []
     int_ty = cfgs.serve.int_ty
@@ -180,19 +143,15 @@ def rpa_body(
         q_start = jnp.where(is_valid, cu_q_lens_ref[s_idx], 0)
         q_end = jnp.where(is_valid, cu_q_lens_ref[s_idx + 1], 0)
         q_len = q_end - q_start
-        q_global_start = jnp.where(is_valid, q_start_offsets_ref[s_idx], 0)
+        offset = kv_len - q_len
 
-        q_global_starts.append(q_global_start.astype(int_ty))
-        q_local_start = q_idx * cfgs.bq_sz
-        q_local_starts.append(q_local_start.astype(int_ty))
+        processed_q_len.append((q_idx * cfgs.bq_sz + offset).astype(int_ty))
         processed_kv_len.append(k_id.astype(int_ty))
         effective_kv_len.append(kv_len.astype(int_ty))
 
         start_k_idx = 0
         if (sliding_window := cfgs.model.sliding_window) is not None:
-            q_global_first = schedule._q_global_position(
-                q_global_start, q_local_start, cfgs)
-            sw_start_idx = q_global_first - sliding_window + 1
+            sw_start_idx = kv_len - q_len + q_idx * cfgs.bq_sz - sliding_window + 1
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
         is_first_k_block = k_idx == start_k_idx
@@ -268,8 +227,7 @@ def rpa_body(
             k,
             m_val[:, :, q_slice],
             l_val[:, :, q_slice],
-            q_global_start=q_global_starts,
-            q_local_start=q_local_starts,
+            processed_q_len=processed_q_len,
             processed_kv_len=processed_kv_len,
             effective_kv_len=effective_kv_len,
             cfgs=cfgs,
@@ -311,30 +269,17 @@ def rpa_body(
         o_vref,
         cfgs=cfgs,
     )
-    if cfgs.serve.return_lse:
-        calculate_and_store_lse(
-            step,
-            schedule_ref,
-            m_scratch_ref,
-            l_scratch_ref,
-            lse_vref,
-            cfgs=cfgs,
-        )
 
 
 # Define main kernel.
 
 
 def create_allocs(
-    kv_cache_hbm_ref: jax.Ref,
-    o_hbm_ref: jax.Ref,
-    lse_hbm_ref: jax.Ref,
-    cfgs: configs.RpaConfigs,
+    kv_cache_hbm_ref: jax.Ref, o_hbm_ref: jax.Ref, cfgs: configs.RpaConfigs
 ) -> tuple[
         bref_override.BatchingQRef,
         bref_override.KVBufferedRef,
         bref_override.BatchingORef,
-        bref_override.BatchingLSERef,
 ]:
     kv_cache_spec = pl.BlockSpec(
         block_shape=cfgs.kv_vmem_shape,
@@ -352,12 +297,6 @@ def create_allocs(
     )
     o_spec = pl.BlockSpec(
         block_shape=cfgs.q_vmem_shape,
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
-        pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
-    )
-    lse_spec = pl.BlockSpec(
-        block_shape=cfgs.lse_vmem_shape,
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, ),
         pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
@@ -384,15 +323,8 @@ def create_allocs(
         use_lookahead=False,
         cfgs=cfgs,
     )
-    lse_alloc = bref_override.BatchingLSERef.output(
-        spec=lse_spec,
-        dtype_or_type=lse_hbm_ref,
-        buffer_count=2,
-        use_lookahead=False,
-        cfgs=cfgs,
-    )
 
-    return q_alloc, kv_cache_alloc, o_alloc, lse_alloc
+    return q_alloc, kv_cache_alloc, o_alloc
 
 
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
@@ -419,15 +351,13 @@ def rpa_kernel(
     cu_q_lens: jax.Array,
     kv_lens: jax.Array,
     page_indices: jax.Array,
-    q_start_offsets: jax.Array,
     schedule_hbm: schedule.RpaSchedule,
     q_hbm: jax.Array,
     new_kv_hbm: jax.Array,
     kv_cache_hbm: jax.Array,
-    lse_hbm: jax.Array,
     *,
     cfgs: configs.RpaConfigs,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention with scheduler data.
 
     Args:
@@ -461,23 +391,20 @@ def rpa_kernel(
         cu_q_lens_ref: jax.Ref,
         kv_lens_ref: jax.Ref,
         page_indices_ref: jax.Ref,
-        q_start_offsets_ref: jax.Ref,
         # Inputs.
         schedule_hbm_ref: schedule.RpaSchedule,
         q_hbm_ref: jax.Ref,
         new_kv_hbm_ref: jax.Ref,
         kv_cache_hbm_ref: jax.Ref,
-        lse_hbm_ref: jax.Ref,
         # Outputs.
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
-        o_lse_hbm_ref: jax.Ref,
     ):
 
         del o_kv_cache_hbm_ref
 
-        q_alloc, kv_cache_alloc, o_alloc, lse_alloc = create_allocs(
-            kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs)
+        q_alloc, kv_cache_alloc, o_alloc = create_allocs(
+            kv_cache_hbm_ref, q_hbm_ref, cfgs)
 
         actual_steps = schedule_hbm_ref.actual_steps[0]
         safe_steps = jnp.minimum(actual_steps, cfgs.max_steps_ub)
@@ -487,15 +414,14 @@ def rpa_kernel(
                 cfgs=cfgs,
                 cu_q_lens_ref=cu_q_lens_ref,
                 kv_lens_ref=kv_lens_ref,
-                q_start_offsets_ref=q_start_offsets_ref,
             ),
             grid=(safe_steps, ),
             in_specs=(q_alloc.spec, kv_cache_alloc.spec),
-            out_specs=(o_alloc.spec, lse_alloc.spec),
+            out_specs=(o_alloc.spec, ),
         )
 
         @pl.with_scoped(
-            final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
+            final_allocs=(q_alloc, kv_cache_alloc, o_alloc),
             schedule_ref=schedule_hbm_ref.scratch_shapes(),
             dma_sem=pltpu.SemaphoreType.DMA((1, )),
             scratches=(
@@ -556,7 +482,6 @@ def rpa_kernel(
                 (kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref,
                  page_indices_ref),
                 (o_hbm_ref, schedule_ref),
-                (o_lse_hbm_ref, schedule_ref),
                 scratches=(schedule_ref, ) + scratches,
                 allocations=final_allocs,
             )
@@ -565,21 +490,19 @@ def rpa_kernel(
 
     return pl.pallas_call(
         ragged_paged_attention_pipeline,
-        out_shape=[q_hbm, kv_cache_hbm, lse_hbm],
+        out_shape=[q_hbm, kv_cache_hbm],
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=3,
             in_specs=[
                 schedule_hbm.in_specs(),
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
-                pl.BlockSpec(memory_space=pltpu.HBM),  # lse_hbm_ref
             ],
             out_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
                 pl.BlockSpec(
                     memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
-                pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_lse_hbm_ref
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -587,9 +510,8 @@ def rpa_kernel(
             disable_bounds_checks=True,
         ),
         input_output_aliases={
-            13: 0,
-            15: 1,
-            16: 2,
+            12: 0,
+            14: 1
         },
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
@@ -597,10 +519,8 @@ def rpa_kernel(
         cu_q_lens,
         kv_lens,
         page_indices,
-        q_start_offsets,
         schedule_hbm,
         q_hbm,
         new_kv_hbm,
         kv_cache_hbm,
-        lse_hbm,
     )

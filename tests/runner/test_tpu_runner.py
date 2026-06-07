@@ -170,24 +170,11 @@ class TestPCPTokenPacking:
             block_size=4,
         )
 
-        np.testing.assert_array_equal(metadata.kv_lens,
-                                      np.array([8, 8, 8, 8], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.page_indices,
-            np.array([7, 8, 7, 8, 7, 8, 7, 8], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.query_start_loc,
-            np.array([0, 2, 4, 0, 2, 4], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.request_distribution,
-            np.array([0, 0, 2, 0, 0, 2], dtype=np.int32))
-        np.testing.assert_array_equal(metadata.q_start_offsets,
-                                      np.array([0, 4, 2, 6], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.cu_k_lens, np.array([0, 0, 8, 0, 0, 8], dtype=np.int32))
         np.testing.assert_array_equal(
             metadata.slot_ids,
             np.array([28, 29, 30, 31, 28, 29, 30, 31], dtype=np.int32))
+        assert metadata.streaming_schedule is None
+        assert metadata.streaming_active_page_groups is None
 
     def test_build_attention_metadata_adds_streaming_schedule(self):
         metadata = _build_pcp_attention_metadata(
@@ -269,22 +256,11 @@ class TestPCPTokenPacking:
             block_size=4,
         )
 
-        np.testing.assert_array_equal(metadata.kv_lens,
-                                      np.array([12, 12], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.page_indices,
-            np.array([7, 8, 9, 7, 8, 9], dtype=np.int32))
-        np.testing.assert_array_equal(metadata.query_start_loc,
-                                      np.array([0, 2, 0, 2], dtype=np.int32))
-        np.testing.assert_array_equal(metadata.q_start_offsets,
-                                      np.array([8, 10], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.cu_k_lens, np.array([0, 12, 0, 12], dtype=np.int32))
         np.testing.assert_array_equal(metadata.slot_ids,
                                       np.array([32, 33, 32, 33],
                                                dtype=np.int32))
 
-    def test_build_attention_metadata_adds_dummy_query_for_empty_pcp_rank(self):
+    def test_build_attention_metadata_pads_empty_pcp_rank_slot_ids(self):
         metadata = _build_pcp_attention_metadata(
             num_scheduled_tokens_per_req=[4],
             seq_lens_per_req=[12],
@@ -297,11 +273,12 @@ class TestPCPTokenPacking:
         )
 
         local_padded_tokens = 8
-        rank1_query_start = metadata.query_start_loc[3:]
-        np.testing.assert_array_equal(rank1_query_start,
-                                      np.array([0, 1, 1], dtype=np.int32))
-        assert metadata.q_start_offsets[2] == 0
-        assert metadata.slot_ids[local_padded_tokens] == -1
+        np.testing.assert_array_equal(
+            metadata.slot_ids[:local_padded_tokens],
+            np.array([60, 61, 62, 63, -1, -1, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(
+            metadata.slot_ids[local_padded_tokens:],
+            np.full(local_padded_tokens, -1, dtype=np.int32))
 
     def test_build_attention_metadata_rejects_invalid_seq_lens(self):
         with pytest.raises(ValueError, match="seq_lens_per_req"):
@@ -572,8 +549,7 @@ class TestPCPBatchSelection:
     def test_attention_metadata_uses_pcp_checks_actual_metadata(self):
         normal_md = AttentionMetadata(input_positions=jnp.array([0]))
         pcp_md = AttentionMetadata(input_positions=jnp.array([0]),
-                                   pcp_slot_ids=jnp.array([0]),
-                                   pcp_query_start_loc=jnp.array([0]))
+                                   pcp_slot_ids=jnp.array([0]))
         pcp_decode_md = AttentionMetadata(input_positions=jnp.array([0]),
                                           pcp_slot_ids=jnp.array([0]))
 

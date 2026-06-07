@@ -188,9 +188,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                                       "prefill_context_parallel_size", 1) > 1)
         pcp_mode = PcpMode.DISABLED
         if pcp_configured:
-            if attn_metadata.pcp_query_start_loc is not None:
-                pcp_mode = PcpMode.PREFILL_LOCAL_Q_FULL_KV
-            elif attn_metadata.pcp_slot_ids is not None:
+            if attn_metadata.pcp_streaming_schedule is not None:
+                pcp_mode = PcpMode.PREFILL_STREAMING
+            elif (attn_metadata.pcp_slot_ids is not None
+                  and attn_metadata.pcp_source_block_tables is not None):
                 pcp_mode = PcpMode.DECODE_SHARDED_KV
         use_pcp = pcp_mode != PcpMode.DISABLED
         shard_pcp_axis = not (pcp_configured and not use_pcp)

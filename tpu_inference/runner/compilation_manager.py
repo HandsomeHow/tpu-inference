@@ -234,6 +234,11 @@ class CompilationManager:
             PartitionSpec(ShardingAxisName.BATCH
                           if use_pcp_precompile else
                           ShardingAxisName.ATTN_DATA, ))
+        pcp_streaming_schedule_sharding = NamedSharding(
+            self.runner.mesh,
+            PartitionSpec(ShardingAxisName.BATCH, None, None, None, None))
+        pcp_streaming_active_page_groups_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.BATCH, None))
 
         # Keep existing pattern for complex array operations
         seq_lens = self._create_dummy_tensor((self.runner.max_num_reqs, ),
@@ -283,11 +288,16 @@ class CompilationManager:
             nonlocal pcp_gdn_reorder_indices
             if not use_pcp_precompile:
                 return
+            if not envs.USE_PCP_STREAMING_RPA_KERNEL:
+                return
 
             from tpu_inference.runner.tpu_runner import (  # pylint: disable=import-outside-toplevel
                 _build_pcp_attention_metadata,
                 _build_pcp_rank_major_token_order,
                 _merge_pcp_attention_metadata,
+            )
+            from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (  # pylint: disable=import-outside-toplevel
+                ScheduleField,
             )
 
             padded_num_tokens_per_dp = num_tokens // dp_size
@@ -314,6 +324,14 @@ class CompilationManager:
             scheduled_tokens_per_req.extend([0] *
                                             (active_reqs_per_dp_rank - 1))
             seq_lens_per_req = list(scheduled_tokens_per_req)
+            pcp_streaming_kv_pages_per_block = max(
+                1,
+                min(
+                    ScheduleField.MAX_KV_PAGES_PER_BLOCK,
+                    envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE //
+                    self.runner.block_size,
+                ),
+            )
 
             for gid, block_tables in host_block_tables_by_gid.items():
                 metadata_per_dp = []
@@ -330,29 +348,36 @@ class CompilationManager:
                             padded_num_tokens_per_dp,
                             max_num_reqs_per_dp_rank,
                             self.runner.block_size,
+                            build_streaming_schedule=True,
+                            streaming_num_lanes=(
+                                envs.PCP_STREAMING_RPA_NUM_LANES),
+                            streaming_q_block_size=(
+                                envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE),
+                            streaming_kv_pages_per_block=(
+                                pcp_streaming_kv_pages_per_block),
                         ))
                 host_pcp_metadata = _merge_pcp_attention_metadata(
                     metadata_per_dp)
-                (pcp_kv_lens, pcp_page_indices, pcp_query_start_loc,
-                 pcp_request_distribution, pcp_q_start_offsets,
-                 pcp_cu_k_lens, pcp_slot_ids) = device_array(
-                     self.runner.mesh,
-                     (host_pcp_metadata.kv_lens,
-                      host_pcp_metadata.page_indices,
-                      host_pcp_metadata.query_start_loc,
-                      host_pcp_metadata.request_distribution,
-                      host_pcp_metadata.q_start_offsets,
-                      host_pcp_metadata.cu_k_lens,
-                      host_pcp_metadata.slot_ids),
-                     sharding=token_data_sharding)
+                if host_pcp_metadata.streaming_schedule is None:
+                    raise ValueError(
+                        "PCP precompile metadata is missing the streaming "
+                        "schedule.")
+                pcp_slot_ids = device_array(self.runner.mesh,
+                                            host_pcp_metadata.slot_ids,
+                                            sharding=token_data_sharding)
+                pcp_streaming_schedule = device_array(
+                    self.runner.mesh,
+                    host_pcp_metadata.streaming_schedule,
+                    sharding=pcp_streaming_schedule_sharding)
+                pcp_streaming_active_page_groups = device_array(
+                    self.runner.mesh,
+                    host_pcp_metadata.streaming_active_page_groups,
+                    sharding=pcp_streaming_active_page_groups_sharding)
                 pcp_attention_metadata_by_gid[gid] = {
-                    "pcp_kv_lens": pcp_kv_lens,
-                    "pcp_page_indices": pcp_page_indices,
-                    "pcp_query_start_loc": pcp_query_start_loc,
-                    "pcp_request_distribution": pcp_request_distribution,
-                    "pcp_q_start_offsets": pcp_q_start_offsets,
-                    "pcp_cu_k_lens": pcp_cu_k_lens,
                     "pcp_slot_ids": pcp_slot_ids,
+                    "pcp_streaming_schedule": pcp_streaming_schedule,
+                    "pcp_streaming_active_page_groups": (
+                        pcp_streaming_active_page_groups),
                 }
 
             if self.runner.kv_cache_config.has_mamba_layers:
@@ -381,14 +406,11 @@ class CompilationManager:
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
-                pcp_kv_lens=pcp_metadata.get("pcp_kv_lens"),
-                pcp_page_indices=pcp_metadata.get("pcp_page_indices"),
-                pcp_query_start_loc=pcp_metadata.get("pcp_query_start_loc"),
-                pcp_request_distribution=pcp_metadata.get(
-                    "pcp_request_distribution"),
-                pcp_q_start_offsets=pcp_metadata.get("pcp_q_start_offsets"),
-                pcp_cu_k_lens=pcp_metadata.get("pcp_cu_k_lens"),
                 pcp_slot_ids=pcp_metadata.get("pcp_slot_ids"),
+                pcp_streaming_schedule=pcp_metadata.get(
+                    "pcp_streaming_schedule"),
+                pcp_streaming_active_page_groups=pcp_metadata.get(
+                    "pcp_streaming_active_page_groups"),
                 pcp_gdn_reorder_indices=pcp_gdn_reorder_indices,
                 padded_num_reqs=num_reqs,
             )

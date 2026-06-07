@@ -24,7 +24,7 @@ class PcpMode(enum.Enum):
     """Static PCP attention execution mode."""
 
     DISABLED = 0
-    PREFILL_LOCAL_Q_FULL_KV = 1
+    PREFILL_STREAMING = 1
     DECODE_SHARDED_KV = 2
 
 
@@ -37,12 +37,6 @@ class PcpMode(enum.Enum):
         "query_start_loc",
         "request_distribution",
         "mamba_state_indices",
-        "pcp_kv_lens",
-        "pcp_page_indices",
-        "pcp_query_start_loc",
-        "pcp_request_distribution",
-        "pcp_q_start_offsets",
-        "pcp_cu_k_lens",
         "pcp_slot_ids",
         "pcp_source_block_tables",
         "pcp_streaming_schedule",
@@ -73,15 +67,8 @@ class AttentionMetadata(object):
     # None for models without mamba layers; pure-mamba models would also
     # use this field, only hybrid models exercise it today.
     mamba_state_indices: jax.Array | None = None
-    # Optional PCP-local metadata. When present, the runner has already applied
-    # the PCP sequence split policy and attention kernels consume only the
-    # resulting local-Q/global-position metadata.
-    pcp_kv_lens: jax.Array | None = None
-    pcp_page_indices: jax.Array | None = None
-    pcp_query_start_loc: jax.Array | None = None
-    pcp_request_distribution: jax.Array | None = None
-    pcp_q_start_offsets: jax.Array | None = None
-    pcp_cu_k_lens: jax.Array | None = None
+    # Optional PCP metadata. PCP prefill is supported only through the streaming
+    # RPA kernel; materialized decode KV is retained for correctness testing.
     pcp_slot_ids: jax.Array | None = None
     pcp_source_block_tables: jax.Array | None = None
     pcp_streaming_schedule: jax.Array | None = None

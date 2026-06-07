@@ -18,7 +18,9 @@ from unittest.mock import MagicMock, patch
 import jax
 import numpy as np
 import pytest
+import torch
 from jax.sharding import Mesh
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.runner.tpu_runner import (
@@ -74,6 +76,11 @@ class TestTPUJaxRunnerDPInputsLightweight:
         # mock kv cache group
         mock_kv_cache_config = MagicMock()
         mock_kv_cache_group = MagicMock()
+        mock_kv_cache_group.kv_cache_spec = FullAttentionSpec(
+            block_size=self.runner.block_size,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.bfloat16)
         mock_kv_cache_config.kv_cache_groups = [mock_kv_cache_group]
         mock_kv_cache_config.has_mamba_layers = False
         self.runner.kv_cache_config = mock_kv_cache_config
@@ -140,9 +147,10 @@ class TestTPUJaxRunnerDPInputsLightweight:
     def test_prepare_inputs_pcp_config_initial_prefill_builds_pcp_metadata(
             self, mock_sampling_metadata, mock_device_array, mock_runner_utils,
             mock_named_sharding, mock_device_put):
-        self._enable_pcp_config()
+        self._enable_pcp_config(interleave_size=16)
         self.runner.input_batch.num_reqs = 2
         self.runner.input_batch.num_computed_tokens_cpu = np.array([0, 0, 5, 15])
+        self.runner.input_batch.num_prompt_tokens = np.array([4, 4, 5, 15])
         mock_runner_utils.get_padded_token_len.return_value = 16
         mock_sampling_metadata.from_input_batch.return_value = MagicMock()
         mock_named_sharding.return_value = MagicMock()
@@ -158,11 +166,18 @@ class TestTPUJaxRunnerDPInputsLightweight:
             },
         )
 
-        result = self.runner._prepare_inputs(scheduler_output)
+        with patch.dict(
+                "os.environ", {
+                    "USE_PCP_STREAMING_RPA_KERNEL": "1",
+                    "PCP_STREAMING_RPA_Q_BLOCK_SIZE": "2",
+                    "PCP_STREAMING_RPA_KV_BLOCK_SIZE": "16",
+                }):
+            result = self.runner._prepare_inputs(scheduler_output)
         attention_metadata = result[2]
 
-        assert attention_metadata.pcp_query_start_loc is not None
         assert attention_metadata.pcp_slot_ids is not None
+        assert attention_metadata.pcp_streaming_schedule is not None
+        assert attention_metadata.pcp_streaming_active_page_groups is not None
 
     @patch('jax.device_put', side_effect=lambda x, *args, **kwargs: x)
     @patch('tpu_inference.runner.tpu_runner.NamedSharding')
@@ -173,10 +188,11 @@ class TestTPUJaxRunnerDPInputsLightweight:
     def test_prepare_inputs_pcp_mamba_prefill_builds_gdn_reorder_indices(
             self, mock_sampling_metadata, mock_device_array, mock_runner_utils,
             mock_named_sharding, mock_device_put):
-        self._enable_pcp_config()
+        self._enable_pcp_config(interleave_size=16)
         self.runner.input_batch.num_reqs = 2
         self.runner.input_batch.num_computed_tokens_cpu = np.array([0, 0, 5,
                                                                     15])
+        self.runner.input_batch.num_prompt_tokens = np.array([4, 4, 5, 15])
         self.runner.input_batch._mamba_local_slots = 16
         self.runner.input_batch.mamba_state_indices_cpu = np.arange(
             self.runner.max_num_reqs, dtype=np.int32)
@@ -196,19 +212,25 @@ class TestTPUJaxRunnerDPInputsLightweight:
             },
         )
 
-        result = self.runner._prepare_inputs(scheduler_output)
+        with patch.dict(
+                "os.environ", {
+                    "USE_PCP_STREAMING_RPA_KERNEL": "1",
+                    "PCP_STREAMING_RPA_Q_BLOCK_SIZE": "2",
+                    "PCP_STREAMING_RPA_KV_BLOCK_SIZE": "16",
+                }):
+            result = self.runner._prepare_inputs(scheduler_output)
         attention_metadata = result[2]
 
         expected_dp0, _ = _build_pcp_rank_major_token_order(
             [4],
             pcp_size=2,
-            interleave_size=2,
+            interleave_size=16,
             padded_num_tokens=16,
         )
         expected_dp1, _ = _build_pcp_rank_major_token_order(
             [4],
             pcp_size=2,
-            interleave_size=2,
+            interleave_size=16,
             padded_num_tokens=16,
         )
         expected = np.concatenate([expected_dp0, expected_dp1]).astype(
@@ -229,6 +251,9 @@ class TestTPUJaxRunnerDPInputsLightweight:
             mock_named_sharding, mock_device_put):
         self._enable_pcp_config()
         self.runner.input_batch.num_reqs = 2
+        self.runner.input_batch.num_computed_tokens_cpu = np.array(
+            [8, 10, 5, 15])
+        self.runner.input_batch.num_prompt_tokens = np.array([8, 10, 5, 15])
         mock_runner_utils.get_padded_token_len.return_value = 16
         mock_sampling_metadata.from_input_batch.return_value = MagicMock()
         mock_named_sharding.return_value = MagicMock()
@@ -248,11 +273,10 @@ class TestTPUJaxRunnerDPInputsLightweight:
         attention_metadata = result[2]
         logits_indices = result[4]
 
-        assert attention_metadata.pcp_query_start_loc is None
-        assert attention_metadata.pcp_kv_lens is None
-        assert attention_metadata.pcp_page_indices is None
         assert attention_metadata.pcp_slot_ids is not None
         assert attention_metadata.pcp_source_block_tables is not None
+        assert attention_metadata.pcp_streaming_schedule is None
+        assert attention_metadata.pcp_streaming_active_page_groups is None
         assert attention_metadata.pcp_source_block_tables.shape == (8, 4)
         expected_source_block_tables = np.zeros((8, 4), dtype=np.int32)
         expected_source_block_tables[0] = np.arange(4, dtype=np.int32)
@@ -280,6 +304,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         self.runner.input_batch.num_reqs = 2
         self.runner.input_batch.num_computed_tokens_cpu = np.array(
             computed_tokens)
+        self.runner.input_batch.num_prompt_tokens = np.array([8, 8, 5, 15])
 
         scheduler_output = self._create_mock_scheduler_output(
             scheduled_tokens,
@@ -290,7 +315,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         )
 
         with pytest.raises(NotImplementedError,
-                           match="mixed prefill/decode"):
+                           match="mixed prompt/decode"):
             self.runner._prepare_inputs(scheduler_output)
 
     @patch('jax.device_put')

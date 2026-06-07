@@ -433,22 +433,9 @@ def _logits_indices_require_global_gather(
 
 @dataclass(frozen=True)
 class _PCPAttentionMetadataHost:
-    kv_lens: np.ndarray
-    page_indices: np.ndarray
-    query_start_loc: np.ndarray
-    request_distribution: np.ndarray
-    q_start_offsets: np.ndarray
-    cu_k_lens: np.ndarray
     slot_ids: np.ndarray
     streaming_schedule: np.ndarray | None = None
     streaming_active_page_groups: np.ndarray | None = None
-
-
-def _pcp_chunks_per_seq(max_num_tokens: int, pcp_size: int,
-                        interleave_size: int) -> int:
-    if interleave_size <= 0:
-        raise ValueError("cp_kv_cache_interleave_size must be positive.")
-    return max(1, cdiv(max_num_tokens, pcp_size * interleave_size))
 
 
 def _build_pcp_local_slot_ids(
@@ -710,70 +697,7 @@ def _build_pcp_attention_metadata(
     else:
         raise ValueError("block_tables must be rank 1 or 2.")
 
-    cycle = pcp_size * interleave_size
     q_global_base = kv_lens_full - q_lens_full
-    chunks_per_seq = _pcp_chunks_per_seq(padded_num_tokens, pcp_size,
-                                         interleave_size)
-    if np.any((q_global_base[:q_lens.size] % cycle) != 0):
-        chunks_per_seq += 1
-    k_start_offsets = np.pad(np.cumsum(kv_lens_full, dtype=np.int32),
-                             (1, 0))[:-1]
-    total_kv_len = np.array([np.sum(kv_lens_full, dtype=np.int32)],
-                            dtype=np.int32)
-    pseudo_seq_count = max_num_reqs_per_dp_rank * chunks_per_seq
-
-    rank_kv_lens = []
-    rank_page_indices = []
-    rank_query_start_loc = []
-    rank_request_distribution = []
-    rank_q_start_offsets = []
-    rank_cu_k_lens = []
-    for pcp_rank in range(pcp_size):
-        local_q_lens = np.zeros((max_num_reqs_per_dp_rank, chunks_per_seq),
-                                dtype=np.int32)
-        q_start_offsets = np.zeros_like(local_q_lens)
-        for req_idx in range(max_num_reqs_per_dp_rank):
-            chunk_idx = 0
-            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
-                    int(q_lens_full[req_idx]), int(q_global_base[req_idx]),
-                    pcp_rank, pcp_size, interleave_size):
-                if chunk_idx >= chunks_per_seq:
-                    raise ValueError("PCP metadata chunk capacity exceeded.")
-                local_q_lens[req_idx, chunk_idx] = chunk_end - chunk_start
-                q_start_offsets[req_idx, chunk_idx] = chunk_start
-                chunk_idx += 1
-        if q_lens.size and int(local_q_lens.sum()) == 0:
-            # Continuation chunks can be shorter than a PCP interleave cycle,
-            # leaving some PCP ranks with no local queries. The RPA prefill
-            # kernel expects at least one query row per shard; use a padding
-            # query that is never selected as logits and has slot_id=-1.
-            local_q_lens[0, 0] = 1
-            q_start_offsets[0, 0] = 0
-
-        # TODO(xiaohao.yxh): This models every interleaved chunk as a pseudo
-        # sequence. Small interleave sizes can create many tiny RPA sequences;
-        # replace this with native multi-chunk scheduling inside the kernel.
-        flat_local_q_lens = local_q_lens.reshape(-1)
-        rank_query_start_loc.append(
-            np.pad(np.cumsum(flat_local_q_lens, dtype=np.int32),
-                   (1, 0)).astype(np.int32))
-
-        rank_q_start_offsets.append(
-            np.where(local_q_lens > 0, q_start_offsets, 0).reshape(-1).astype(
-                np.int32))
-        rank_kv_lens.append(
-            np.where(local_q_lens > 0, kv_lens_full[:, None],
-                     0).reshape(-1).astype(np.int32))
-        cu_k_lens = np.where(local_q_lens > 0, k_start_offsets[:, None],
-                             0).reshape(-1).astype(np.int32)
-        rank_cu_k_lens.append(np.concatenate([cu_k_lens, total_kv_len]))
-        rank_page_indices.append(
-            np.broadcast_to(
-                block_tables[:, None, :],
-                (max_num_reqs_per_dp_rank, chunks_per_seq, pages_per_seq),
-            ).reshape(-1).astype(np.int32))
-        rank_request_distribution.append(
-            np.array([0, 0, pseudo_seq_count], dtype=np.int32))
 
     streaming_schedule = None
     streaming_active_page_groups = None
@@ -820,12 +744,6 @@ def _build_pcp_attention_metadata(
                                                 dtype=np.int32)
 
     return _PCPAttentionMetadataHost(
-        kv_lens=np.concatenate(rank_kv_lens),
-        page_indices=np.concatenate(rank_page_indices),
-        query_start_loc=np.concatenate(rank_query_start_loc),
-        request_distribution=np.concatenate(rank_request_distribution),
-        q_start_offsets=np.concatenate(rank_q_start_offsets),
-        cu_k_lens=np.concatenate(rank_cu_k_lens),
         slot_ids=_build_pcp_local_slot_ids(
             q_lens_full,
             kv_lens_full,
@@ -873,15 +791,6 @@ def _merge_pcp_attention_metadata(
             streaming_active_page_groups, axis=0).astype(np.int32)
 
     return _PCPAttentionMetadataHost(
-        kv_lens=np.concatenate([m.kv_lens for m in metadata_per_dp]),
-        page_indices=np.concatenate([m.page_indices for m in metadata_per_dp]),
-        query_start_loc=np.concatenate(
-            [m.query_start_loc for m in metadata_per_dp]),
-        request_distribution=np.concatenate(
-            [m.request_distribution for m in metadata_per_dp]),
-        q_start_offsets=np.concatenate(
-            [m.q_start_offsets for m in metadata_per_dp]),
-        cu_k_lens=np.concatenate([m.cu_k_lens for m in metadata_per_dp]),
         slot_ids=np.concatenate([m.slot_ids for m in metadata_per_dp]),
         streaming_schedule=merged_streaming_schedule,
         streaming_active_page_groups=merged_streaming_active_page_groups,
@@ -2296,6 +2205,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 raise ValueError(
                     "PCP runner path requires cp_kv_cache_interleave_size > 0."
                 )
+            if use_pcp and not envs.USE_PCP_STREAMING_RPA_KERNEL:
+                raise NotImplementedError(
+                    "PCP prefill requires USE_PCP_STREAMING_RPA_KERNEL=1. "
+                    "Only the materialized decode KV path is supported "
+                    "without the streaming prefill kernel.")
 
         token_data_sharding = NamedSharding(
             self.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
@@ -2671,35 +2585,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                             ))
                     host_pcp_metadata = _merge_pcp_attention_metadata(
                         metadata_per_dp)
-                    (pcp_kv_lens, pcp_page_indices, pcp_query_start_loc,
-                     pcp_request_distribution, pcp_q_start_offsets,
-                     pcp_cu_k_lens, pcp_slot_ids) = device_array(
-                         self.mesh, (host_pcp_metadata.kv_lens,
-                                     host_pcp_metadata.page_indices,
-                                     host_pcp_metadata.query_start_loc,
-                                     host_pcp_metadata.request_distribution,
-                                     host_pcp_metadata.q_start_offsets,
-                                     host_pcp_metadata.cu_k_lens,
-                                     host_pcp_metadata.slot_ids),
-                         sharding=token_data_sharding)
-                    pcp_streaming_schedule = None
-                    pcp_streaming_active_page_groups = None
-                    if host_pcp_metadata.streaming_schedule is not None:
-                        pcp_streaming_schedule = device_array(
-                            self.mesh,
-                            host_pcp_metadata.streaming_schedule,
-                            sharding=pcp_streaming_schedule_sharding)
-                        pcp_streaming_active_page_groups = device_array(
-                            self.mesh,
-                            host_pcp_metadata.streaming_active_page_groups,
-                            sharding=pcp_streaming_active_page_groups_sharding)
+                    if host_pcp_metadata.streaming_schedule is None:
+                        raise ValueError(
+                            "PCP prefill metadata is missing the streaming "
+                            "schedule.")
+                    pcp_slot_ids = device_array(
+                        self.mesh,
+                        host_pcp_metadata.slot_ids,
+                        sharding=token_data_sharding)
+                    pcp_streaming_schedule = device_array(
+                        self.mesh,
+                        host_pcp_metadata.streaming_schedule,
+                        sharding=pcp_streaming_schedule_sharding)
+                    pcp_streaming_active_page_groups = device_array(
+                        self.mesh,
+                        host_pcp_metadata.streaming_active_page_groups,
+                        sharding=pcp_streaming_active_page_groups_sharding)
                     pcp_attention_metadata_by_gid[gid] = {
-                        "pcp_kv_lens": pcp_kv_lens,
-                        "pcp_page_indices": pcp_page_indices,
-                        "pcp_query_start_loc": pcp_query_start_loc,
-                        "pcp_request_distribution": pcp_request_distribution,
-                        "pcp_q_start_offsets": pcp_q_start_offsets,
-                        "pcp_cu_k_lens": pcp_cu_k_lens,
                         "pcp_slot_ids": pcp_slot_ids,
                         "pcp_streaming_schedule": pcp_streaming_schedule,
                         "pcp_streaming_active_page_groups": (
@@ -2820,13 +2722,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
-                pcp_kv_lens=pcp_metadata.get("pcp_kv_lens"),
-                pcp_page_indices=pcp_metadata.get("pcp_page_indices"),
-                pcp_query_start_loc=pcp_metadata.get("pcp_query_start_loc"),
-                pcp_request_distribution=pcp_metadata.get(
-                    "pcp_request_distribution"),
-                pcp_q_start_offsets=pcp_metadata.get("pcp_q_start_offsets"),
-                pcp_cu_k_lens=pcp_metadata.get("pcp_cu_k_lens"),
                 pcp_slot_ids=pcp_metadata.get("pcp_slot_ids"),
                 pcp_source_block_tables=pcp_metadata.get(
                     "pcp_source_block_tables"),

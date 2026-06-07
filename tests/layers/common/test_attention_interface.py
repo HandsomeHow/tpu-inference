@@ -21,10 +21,9 @@ import pytest
 from jax.sharding import Mesh, PartitionSpec as P
 
 from tpu_inference.layers.common.attention_interface import (
-    _make_pcp_interleaved_metadata, _make_pcp_interleaved_token_indices,
-    _pcp_lse_merge_weight, _update_local_paged_kv_cache, attention,
-    compute_pcp_local_mapping, materialize_pcp_kv_for_decode, mla_attention,
-    pcp_lse_merge, sharded_ragged_paged_attention)
+    _update_local_paged_kv_cache, attention, compute_pcp_local_mapping,
+    materialize_pcp_kv_for_decode, mla_attention,
+    sharded_ragged_paged_attention)
 from tpu_inference.layers.common.attention_metadata import (AttentionMetadata,
                                                             PcpMode)
 from tpu_inference.layers.common.sharding import (ShardingAxisName,
@@ -49,83 +48,6 @@ NUM_BLOCKS = 32
 BLOCK_SIZE = 16
 # Maximum number of blocks a single sequence can occupy
 MAX_BLOCKS_PER_SEQ = 8
-
-
-def _reference_pcp_lse_merge(partial_out, partial_lse):
-    max_lse = jnp.max(partial_lse, axis=0)
-    valid = max_lse != -jnp.inf
-    safe_diffs = jnp.where(valid[None], partial_lse - max_lse[None], 0.0)
-    weights = jnp.exp(safe_diffs)
-    weights = weights / jnp.maximum(jnp.sum(weights, axis=0), 1e-30)
-    weights = jnp.where(valid[None], weights, 0.0)
-    return jnp.sum(partial_out.astype(jnp.float32) * weights[..., None],
-                   axis=0)
-
-
-def test_pcp_lse_merge_weight_handles_empty_and_padding_rows():
-    all_lses = jnp.array([
-        [[0.0, -jnp.inf], [1.0, 2.0], [-jnp.inf, -jnp.inf]],
-        [[jnp.log(3.0), 0.0], [-jnp.inf, 3.0], [-jnp.inf, -jnp.inf]],
-    ],
-                         dtype=jnp.float32)
-
-    rank0_weight = _pcp_lse_merge_weight(all_lses[0], all_lses)
-    rank1_weight = _pcp_lse_merge_weight(all_lses[1], all_lses)
-
-    expected_rank0 = jnp.array([[0.25, 0.0], [1.0, 1.0 /
-                                              (1.0 + jnp.e)], [0.0, 0.0]],
-                               dtype=jnp.float32)
-    expected_rank1 = jnp.array([[0.75, 1.0], [0.0, jnp.e /
-                                              (1.0 + jnp.e)], [0.0, 0.0]],
-                               dtype=jnp.float32)
-    np.testing.assert_allclose(np.asarray(rank0_weight),
-                               np.asarray(expected_rank0),
-                               rtol=1e-6,
-                               atol=1e-6)
-    np.testing.assert_allclose(np.asarray(rank1_weight),
-                               np.asarray(expected_rank1),
-                               rtol=1e-6,
-                               atol=1e-6)
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_pcp_lse_merge_matches_reference_with_real_collectives(dtype):
-    pcp_size = 2
-    if len(jax.local_devices()) < pcp_size:
-        pytest.skip(f"requires at least {pcp_size} local devices")
-
-    partial_lse = jnp.array([
-        [[0.0, -jnp.inf], [1.0, 2.0], [-jnp.inf, -jnp.inf]],
-        [[jnp.log(3.0), 0.0], [-jnp.inf, 3.0], [-jnp.inf, -jnp.inf]],
-    ],
-                            dtype=jnp.float32)
-    partial_out = jnp.arange(pcp_size * 3 * 2 * 4,
-                             dtype=jnp.float32).reshape(pcp_size, 3, 2,
-                                                        4).astype(dtype)
-    expected = _reference_pcp_lse_merge(partial_out, partial_lse).astype(dtype)
-
-    mesh = Mesh(np.array(jax.local_devices()[:pcp_size]), ("pcp", ))
-
-    def merge_one_rank(out_shard, lse_shard):
-        return pcp_lse_merge(out_shard[0], lse_shard[0], "pcp")
-
-    merged = jax.jit(
-        jax.shard_map(
-            merge_one_rank,
-            mesh=mesh,
-            in_specs=(P("pcp", None, None, None), P("pcp", None, None)),
-            out_specs=P(None, None, None),
-            check_vma=False,
-        ))(partial_out, partial_lse)
-
-    np.testing.assert_allclose(np.asarray(merged),
-                               np.asarray(expected),
-                               rtol=2e-2 if dtype == jnp.bfloat16 else 1e-6,
-                               atol=2e-2 if dtype == jnp.bfloat16 else 1e-6)
-    assert not np.isnan(np.asarray(merged)).any()
-    np.testing.assert_array_equal(
-        np.asarray(merged[2]), np.zeros((2, 4),
-                                        dtype=np.asarray(merged).dtype))
 
 
 def _reference_vllm_cp_slot_mapping(positions, token_req_indices, block_tables,
@@ -891,59 +813,6 @@ def test_sharded_rpa_default_path_does_not_forward_pcp_metadata(
     assert "cu_k_lens" not in captured
 
 
-def test_make_pcp_interleaved_metadata_for_middle_rank(monkeypatch):
-    monkeypatch.setattr("jax.lax.axis_index", lambda axis_name: 1)
-
-    (expanded_kv_lens, expanded_page_indices, local_cu_q_lens, _,
-     q_start_offsets, cu_k_lens) = _make_pcp_interleaved_metadata(
-         jnp.array([0, 6, 12], dtype=jnp.int32),
-         jnp.array([6, 6], dtype=jnp.int32),
-         jnp.array([0, 1], dtype=jnp.int32),
-         local_num_tokens=6,
-         interleave_size=3,
-         pcp_size=2,
-         axis_name="pcp",
-     )
-
-    np.testing.assert_array_equal(local_cu_q_lens, np.array([0, 3, 3, 6, 6]))
-    np.testing.assert_array_equal(q_start_offsets, np.array([3, 0, 3, 0]))
-    np.testing.assert_array_equal(expanded_kv_lens, np.array([6, 0, 6, 0]))
-    np.testing.assert_array_equal(cu_k_lens, np.array([0, 0, 6, 0, 12]))
-    np.testing.assert_array_equal(expanded_page_indices, np.array([0, 0, 1,
-                                                                   1]))
-
-
-def test_make_pcp_interleaved_metadata_for_split_sequence(monkeypatch):
-    monkeypatch.setattr("jax.lax.axis_index", lambda axis_name: 1)
-
-    (expanded_kv_lens, _, local_cu_q_lens, _, q_start_offsets,
-     cu_k_lens) = _make_pcp_interleaved_metadata(
-         jnp.array([0, 8], dtype=jnp.int32),
-         jnp.array([8], dtype=jnp.int32),
-         jnp.array([0], dtype=jnp.int32),
-         local_num_tokens=4,
-         interleave_size=2,
-         pcp_size=2,
-         axis_name="pcp",
-     )
-
-    np.testing.assert_array_equal(local_cu_q_lens, np.array([0, 2, 4]))
-    np.testing.assert_array_equal(q_start_offsets, np.array([2, 6]))
-    np.testing.assert_array_equal(expanded_kv_lens, np.array([8, 8]))
-    np.testing.assert_array_equal(cu_k_lens, np.array([0, 0, 8]))
-
-
-def test_make_pcp_interleaved_token_indices():
-    indices = _make_pcp_interleaved_token_indices(
-        jnp.array([8], dtype=jnp.int32),
-        local_num_tokens=4,
-        interleave_size=2,
-        pcp_size=2,
-    )
-
-    np.testing.assert_array_equal(indices, np.array([0, 1, 4, 5, 2, 3, 6, 7]))
-
-
 def test_update_local_paged_kv_cache_writes_local_slots_only(monkeypatch):
     packed_kv = jnp.arange(6, dtype=jnp.float32).reshape(6, 1, 1, 1)
 
@@ -969,209 +838,6 @@ def test_update_local_paged_kv_cache_writes_local_slots_only(monkeypatch):
     expected[1, 3, 0, 0, 0] = 3
     expected[2, 0, 0, 0, 0] = 4
     np.testing.assert_array_equal(np.asarray(updated), expected)
-
-
-def test_sharded_rpa_pcp_path_gathers_kv_on_pcp_axis_and_forwards_metadata(
-        monkeypatch, gqa_mesh):
-    monkeypatch.setattr(ShardingAxisName, "_cls", ShardingAxisNameBase)
-    devices = np.array(jax.local_devices()[:1] * 2).reshape((1, 1, 1, 1, 1, 2))
-    pcp_mesh = Mesh(
-        devices,
-        ("data", "attn_dp", "attn_dp_expert", "expert", "model", "pcp"))
-
-    head_dim = 128
-    num_kv_heads = 4
-    q = jnp.ones((4, NUM_HEADS, head_dim), dtype=jnp.float32)
-    k = jnp.ones((4, num_kv_heads, head_dim), dtype=jnp.float32)
-    v = jnp.full((4, num_kv_heads, head_dim), 2.0, dtype=jnp.float32)
-    kv_cache = jnp.zeros((num_kv_heads, NUM_BLOCKS, BLOCK_SIZE, head_dim),
-                         dtype=jnp.float32)
-    kv_lens = jnp.array([8], dtype=jnp.int32)
-    page_indices = jnp.zeros((MAX_BLOCKS_PER_SEQ, ), dtype=jnp.int32)
-    cu_q_lens = jnp.array([0, 8], dtype=jnp.int32)
-    distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
-
-    captured = {"all_gather_axes": []}
-
-    def fake_kernel(q_arg, k_arg, v_arg, kv_cache_arg, *_args, **kwargs):
-        captured["q_shape"] = q_arg.shape
-        captured["k_shape"] = k_arg.shape
-        captured["v_shape"] = v_arg.shape
-        captured["kv_lens"] = _args[0]
-        captured["page_indices"] = _args[1]
-        captured["cu_q_lens"] = _args[2]
-        captured["distribution"] = _args[3]
-        captured["q_start_offsets"] = kwargs["q_start_offsets"]
-        captured["cu_k_lens"] = kwargs["cu_k_lens"]
-        captured["update_kv_cache"] = kwargs["update_kv_cache"]
-        return jnp.ones_like(q_arg), kv_cache_arg
-
-    def fake_all_gather(x, axis_name, axis, tiled):
-        captured["all_gather_axes"].append(axis_name)
-        return jnp.concatenate([x, x], axis=axis)
-
-    monkeypatch.setattr(
-        "tpu_inference.layers.common.attention_interface.ragged_paged_attention",
-        fake_kernel,
-    )
-    monkeypatch.setattr("jax.lax.axis_index", lambda axis_name: 1)
-    monkeypatch.setattr("jax.lax.all_gather", fake_all_gather)
-
-    def passthrough_shard_map(inner_fn, **kwargs):
-        captured["in_specs"] = kwargs["in_specs"]
-        return inner_fn
-
-    monkeypatch.setattr("jax.shard_map", passthrough_shard_map)
-
-    out, new_cache = sharded_ragged_paged_attention(
-        mesh=pcp_mesh,
-        q=q,
-        k=k,
-        v=v,
-        kv_cache=kv_cache,
-        kv_lens=kv_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        attention_sink=None,
-        sm_scale=1.0,
-        update_kv_cache=False,
-        pcp_mode=PcpMode.PREFILL_LOCAL_Q_FULL_KV,
-        cp_kv_cache_interleave_size=2,
-    )
-
-    assert out.shape == q.shape
-    assert new_cache.shape == kv_cache.shape
-    assert captured["in_specs"][3] == P(ShardingAxisName.KV_CACHE_BLOCK, None,
-                                        ShardingAxisName.KV_CACHE_HEAD, None,
-                                        None)
-    assert captured["all_gather_axes"] == ["pcp", "pcp"]
-    assert captured["q_shape"] == q.shape
-    assert captured["k_shape"] == (8, num_kv_heads, head_dim)
-    assert captured["v_shape"] == (8, num_kv_heads, head_dim)
-    np.testing.assert_array_equal(captured["kv_lens"], np.array([8, 8]))
-    np.testing.assert_array_equal(captured["page_indices"],
-                                  np.zeros((16, ), dtype=np.int32))
-    np.testing.assert_array_equal(captured["cu_q_lens"], np.array([0, 2, 4]))
-    np.testing.assert_array_equal(captured["distribution"], np.array([0, 0,
-                                                                      2]))
-    np.testing.assert_array_equal(captured["q_start_offsets"], np.array([2,
-                                                                         6]))
-    np.testing.assert_array_equal(captured["cu_k_lens"], np.array([0, 0, 8]))
-    assert captured["update_kv_cache"] is False
-
-
-def test_sharded_rpa_pcp_path_consumes_precomputed_metadata(monkeypatch):
-    monkeypatch.setattr(ShardingAxisName, "_cls", ShardingAxisNameBase)
-    devices = np.array(jax.local_devices()[:1] * 2).reshape((1, 1, 1, 1, 1, 2))
-    pcp_mesh = Mesh(
-        devices,
-        ("data", "attn_dp", "attn_dp_expert", "expert", "model", "pcp"))
-
-    head_dim = 128
-    q = jnp.ones((4, 1, head_dim), dtype=jnp.float32)
-    row_values = jnp.arange(4, dtype=jnp.float32)[:, None, None]
-    k = jnp.broadcast_to(row_values, (4, 1, head_dim))
-    v = k + 100
-    kv_cache = jnp.zeros((1, NUM_BLOCKS, BLOCK_SIZE, head_dim),
-                         dtype=jnp.float32)
-    kv_lens = jnp.array([8], dtype=jnp.int32)
-    page_indices = jnp.zeros((MAX_BLOCKS_PER_SEQ, ), dtype=jnp.int32)
-    cu_q_lens = jnp.array([0, 8], dtype=jnp.int32)
-    distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
-
-    captured = {}
-
-    def fail_if_called(*_, **__):
-        raise AssertionError("PCP metadata should be supplied by the runner.")
-
-    def fake_cache_update(kv_cache_arg, k_arg, v_arg, slot_ids_arg):
-        captured["cache_update_k_rows"] = k_arg[:, 0, 0]
-        captured["cache_update_v_rows"] = v_arg[:, 0, 0]
-        captured["cache_update_slot_ids"] = slot_ids_arg
-        return kv_cache_arg + 3
-
-    def fake_kernel(q_arg, k_arg, v_arg, kv_cache_arg, *_args, **kwargs):
-        captured["k_rows"] = k_arg[:, 0, 0]
-        captured["v_rows"] = v_arg[:, 0, 0]
-        captured["kv_cache"] = kv_cache_arg
-        captured["kv_lens"] = _args[0]
-        captured["page_indices"] = _args[1]
-        captured["cu_q_lens"] = _args[2]
-        captured["distribution"] = _args[3]
-        captured["q_start_offsets"] = kwargs["q_start_offsets"]
-        captured["cu_k_lens"] = kwargs["cu_k_lens"]
-        captured["update_kv_cache"] = kwargs["update_kv_cache"]
-        return jnp.ones_like(q_arg), kv_cache_arg
-
-    def fake_all_gather(x, axis_name, axis, tiled):
-        assert axis_name == "pcp"
-        assert axis == 0
-        assert tiled is True
-        return jnp.concatenate([x, x + 10], axis=axis)
-
-    monkeypatch.setattr(
-        "tpu_inference.layers.common.attention_interface._make_pcp_interleaved_metadata",
-        fail_if_called,
-    )
-    monkeypatch.setattr(
-        "tpu_inference.layers.common.attention_interface.ragged_paged_attention",
-        fake_kernel,
-    )
-    monkeypatch.setattr(
-        "tpu_inference.layers.common.attention_interface._update_local_paged_kv_cache",
-        fake_cache_update,
-    )
-    monkeypatch.setattr("jax.lax.all_gather", fake_all_gather)
-    monkeypatch.setattr("jax.shard_map", lambda inner_fn, **_: inner_fn)
-
-    sharded_ragged_paged_attention(
-        mesh=pcp_mesh,
-        q=q,
-        k=k,
-        v=v,
-        kv_cache=kv_cache,
-        kv_lens=kv_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        attention_sink=None,
-        sm_scale=1.0,
-        pcp_mode=PcpMode.PREFILL_LOCAL_Q_FULL_KV,
-        cp_kv_cache_interleave_size=2,
-        pcp_kv_lens=jnp.array([8, 8], dtype=jnp.int32),
-        pcp_page_indices=jnp.arange(16, dtype=jnp.int32),
-        pcp_query_start_loc=jnp.array([0, 2, 4], dtype=jnp.int32),
-        pcp_request_distribution=jnp.array([0, 0, 2], dtype=jnp.int32),
-        pcp_q_start_offsets=jnp.array([2, 6], dtype=jnp.int32),
-        pcp_cu_k_lens=jnp.array([0, 0, 8], dtype=jnp.int32),
-        pcp_slot_ids=jnp.array([7, 8, 9, 10], dtype=jnp.int32),
-    )
-
-    np.testing.assert_array_equal(captured["cache_update_k_rows"],
-                                  np.array([0, 1, 2, 3], dtype=np.float32))
-    np.testing.assert_array_equal(
-        captured["cache_update_v_rows"],
-        np.array([100, 101, 102, 103], dtype=np.float32))
-    np.testing.assert_array_equal(captured["cache_update_slot_ids"],
-                                  np.array([7, 8, 9, 10], dtype=np.int32))
-    np.testing.assert_array_equal(
-        captured["k_rows"],
-        np.array([0, 1, 10, 11, 2, 3, 12, 13], dtype=np.float32))
-    np.testing.assert_array_equal(
-        captured["v_rows"],
-        np.array([100, 101, 110, 111, 102, 103, 112, 113], dtype=np.float32))
-    np.testing.assert_array_equal(captured["kv_lens"], np.array([8, 8]))
-    np.testing.assert_array_equal(captured["page_indices"], np.arange(16))
-    np.testing.assert_array_equal(captured["cu_q_lens"], np.array([0, 2, 4]))
-    np.testing.assert_array_equal(captured["distribution"], np.array([0, 0,
-                                                                      2]))
-    np.testing.assert_array_equal(captured["q_start_offsets"], np.array([2,
-                                                                         6]))
-    np.testing.assert_array_equal(captured["cu_k_lens"], np.array([0, 0, 8]))
-    assert captured["update_kv_cache"] is False
-    np.testing.assert_array_equal(captured["kv_cache"],
-                                  np.asarray(kv_cache) + 3)
 
 
 def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
@@ -1237,14 +903,8 @@ def test_sharded_rpa_pcp_streaming_path_uses_packed_kernel(monkeypatch):
         distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
         attention_sink=None,
         sm_scale=0.25,
-        pcp_mode=PcpMode.PREFILL_LOCAL_Q_FULL_KV,
+        pcp_mode=PcpMode.PREFILL_STREAMING,
         cp_kv_cache_interleave_size=4,
-        pcp_kv_lens=jnp.array([8, 8], dtype=jnp.int32),
-        pcp_page_indices=jnp.arange(4, dtype=jnp.int32),
-        pcp_query_start_loc=jnp.array([0, 2, 4], dtype=jnp.int32),
-        pcp_request_distribution=jnp.array([0, 0, 2], dtype=jnp.int32),
-        pcp_q_start_offsets=jnp.array([0, 4], dtype=jnp.int32),
-        pcp_cu_k_lens=jnp.array([0, 0, 8], dtype=jnp.int32),
         pcp_slot_ids=jnp.array([0, 1, 2, 3], dtype=jnp.int32),
         pcp_streaming_schedule=streaming_schedule,
         pcp_streaming_active_page_groups=jnp.array([1], dtype=jnp.int32),
@@ -1355,7 +1015,7 @@ def test_sharded_rpa_rejects_conflicting_legacy_pcp_flags(mesh):
     with pytest.raises(ValueError, match="Conflicting PCP mode"):
         sharded_ragged_paged_attention(
             **kwargs,
-            pcp_mode=PcpMode.PREFILL_LOCAL_Q_FULL_KV,
+            pcp_mode=PcpMode.PREFILL_STREAMING,
             use_pcp_decode=True,
         )
 
@@ -1421,10 +1081,6 @@ def test_sharded_rpa_pcp_decode_path_materializes_kv(monkeypatch):
     monkeypatch.setattr(
         "tpu_inference.layers.common.attention_interface.ragged_paged_attention",
         fake_kernel,
-    )
-    monkeypatch.setattr(
-        "tpu_inference.layers.common.attention_interface.pcp_lse_merge",
-        lambda *args, **kwargs: pytest.fail("pcp_lse_merge must not be called"),
     )
 
     def passthrough_shard_map(inner_fn, **kwargs):
@@ -1528,17 +1184,12 @@ def test_attention_forwards_precomputed_pcp_metadata(monkeypatch, mesh):
     kv_cache = jnp.zeros((NUM_KV_HEADS, NUM_BLOCKS, BLOCK_SIZE, 128),
                          dtype=jnp.float32)
     pcp_metadata = {
-        "pcp_kv_lens": jnp.array([5, 5], dtype=jnp.int32),
-        "pcp_page_indices": jnp.arange(16, dtype=jnp.int32),
-        "pcp_query_start_loc": jnp.array([0, 5, 10], dtype=jnp.int32),
-        "pcp_request_distribution": jnp.array([0, 0, 2], dtype=jnp.int32),
-        "pcp_q_start_offsets": jnp.array([0, 0], dtype=jnp.int32),
-        "pcp_cu_k_lens": jnp.array([0, 5, 10], dtype=jnp.int32),
         "pcp_slot_ids": jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),
         "pcp_source_block_tables": jnp.arange(16,
                                               dtype=jnp.int32).reshape(4, 4),
         "pcp_streaming_schedule": jnp.zeros((1, 2, 2, 1, 128),
                                             dtype=jnp.int32),
+        "pcp_streaming_active_page_groups": jnp.array([1], dtype=jnp.int32),
     }
     attention_metadata = AttentionMetadata(
         input_positions=jnp.arange(TOTAL_TOKENS, dtype=jnp.int32),
@@ -1566,7 +1217,7 @@ def test_attention_forwards_precomputed_pcp_metadata(monkeypatch, mesh):
         v=v,
         attention_metadata=attention_metadata,
         mesh=mesh,
-        pcp_mode=PcpMode.PREFILL_LOCAL_Q_FULL_KV,
+        pcp_mode=PcpMode.PREFILL_STREAMING,
         cp_kv_cache_interleave_size=2,
     )
 

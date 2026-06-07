@@ -65,15 +65,6 @@ class ServingConfigs:
     scale_q: int | None = None
     scale_k: int | None = None
     scale_v: int | None = None
-    use_full_kv_inputs: bool = False
-    q_position_chunk_size: int = 0
-    q_position_chunk_stride: int = 0
-    return_lse: bool = False
-
-    @property
-    def has_chunked_q_positions(self) -> bool:
-        return (self.q_position_chunk_size > 0
-                and self.q_position_chunk_stride > 0)
 
     @property
     def pages_per_seq(self) -> int:
@@ -268,13 +259,6 @@ class RpaConfigs:
         )
 
     @property
-    def lse_vmem_shape(self):
-        q_per_kv_packing = (self.model.num_q_heads_per_kv_head //
-                            self.serve.packing_q)
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        return self.q_vmem_shape[:-1] + (num_lanes, )
-
-    @property
     def kv_vmem_shape(self):
         return (
             self.block.batch_size,
@@ -316,24 +300,12 @@ class RpaConfigs:
     ):
         """Validate inputs to the RPA kernel statically."""
 
-        if self.serve.page_size <= 0 or (self.serve.page_size
-                                         & (self.serve.page_size - 1)) != 0:
-            raise ValueError(f"Expected {self.serve.page_size=} to be a "
-                             "positive power of two.")
-        if self.block.bkv_sz < self.serve.page_size:
-            raise ValueError(f"Expected {self.block.bkv_sz=} to be at least "
-                             f"{self.serve.page_size=}.")
-        if self.block.bkv_sz % self.serve.page_size != 0:
-            raise ValueError(f"Expected {self.block.bkv_sz=} to be divisible "
-                             f"by {self.serve.page_size=}.")
-
         if not q.ndim == k.ndim == v.ndim == 3:
             raise ValueError(
                 f"Expected 3D array for {q.shape=}, {k.shape=}, {v.shape=}")
         if k.shape != v.shape:
             raise ValueError(f"Expected {k.shape=} to be equal to {v.shape=}")
-        if not self.serve.use_full_kv_inputs and not (q.shape[0] == k.shape[0]
-                                                      == v.shape[0]):
+        if not (q.shape[0] == k.shape[0] == v.shape[0]):
             raise ValueError(
                 "Expected number of sequences in Q, K, and V to be the same, but got"
                 f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}")

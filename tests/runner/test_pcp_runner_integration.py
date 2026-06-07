@@ -348,7 +348,7 @@ def _install_synthetic_qwen3_attention_stack(runner: SimpleNamespace,
                 None,
                 None,
                 None,
-                PcpMode.PREFILL_LOCAL_Q_FULL_KV,
+                PcpMode.PREFILL_STREAMING,
                 True,
                 interleave_size,
             )
@@ -362,7 +362,7 @@ def _install_synthetic_qwen3_attention_stack(runner: SimpleNamespace,
 
 def test_runner_to_four_layer_qwen3_pcp_attention_output(monkeypatch):
     if not jtu.is_device_tpu_at_least(version=4):
-        pytest.skip("Batched RPA requires TPUv4+")
+        pytest.skip("PCP streaming RPA requires TPUv4+")
     if len(jax.local_devices()) < 2:
         pytest.skip("PCP runner integration test requires 2 local devices")
 

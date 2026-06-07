@@ -29,8 +29,6 @@ scheduler.py kernel. Kernel is calculated once and ammortized across different l
 Note: batched_rpa is build on top / derived from RPA3. 
 """
 
-import math
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -50,7 +48,7 @@ def prepare_inputs(
 ) -> tuple[jax.Array, jax.Array]:
 
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
-    total_kv_tokens, actual_num_kv_heads, _ = k.shape
+    _, actual_num_kv_heads, _ = k.shape
     num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
 
     q_packing = utils.get_dtype_packing(q_dtype)
@@ -120,7 +118,7 @@ def prepare_inputs(
                 constant_values=0,
             ), Layout(major_to_minor=(0, 1, 2, 3)))
         new_kv_hbm = kv_padded.reshape(
-            total_kv_tokens,
+            total_q_tokens,
             num_kv_heads_x2_aligned // kv_packing,
             kv_packing,
             aligned_head_dim,
@@ -129,7 +127,7 @@ def prepare_inputs(
         # Most performant for {2,0,1} minor-to-major layout
         # avoiding copies from the layout constraint above.
         new_kv_hbm = jnp.pad(
-            jnp.concatenate([k, v], axis=-1).reshape(total_kv_tokens,
+            jnp.concatenate([k, v], axis=-1).reshape(total_q_tokens,
                                                      actual_num_kv_heads_x2,
                                                      actual_head_dim),
             (
@@ -139,25 +137,18 @@ def prepare_inputs(
             ),
             constant_values=0,
         ).reshape(
-            total_kv_tokens,
+            total_q_tokens,
             num_kv_heads_x2_aligned // kv_packing,
             kv_packing,
             aligned_head_dim,
         )
+
     return o_hbm_alias_q_hbm, new_kv_hbm
 
 
 def prepare_outputs(out: jax.Array) -> jax.Array:
     kv_heads, max_tokens, q_per_kv_packed, q_packing, d = out.shape
     return out.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing, d)
-
-
-def prepare_lse_outputs(lse: jax.Array, num_q_heads: int) -> jax.Array:
-    lse = lse[..., 0]
-    kv_heads, max_tokens, q_per_kv_packed, q_packing = lse.shape
-    lse = lse.reshape(kv_heads, max_tokens, q_per_kv_packed * q_packing)
-    lse = lse[:, :, :num_q_heads // kv_heads]
-    return lse.swapaxes(1, 0).reshape(max_tokens, num_q_heads)
 
 
 def get_kv_cache_shape(
@@ -270,22 +261,16 @@ def calculate_block_sizes(
     def find_best_block_sizes(
             max_batch_size: int,
             max_n_buffer: int,
-            fixed_bq_sz: int | None = None,
-            vmem_safety_factor: float = 0.8) -> configs.BlockSizes:
+            fixed_bq_sz: int | None = None) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
-        # Even if we lose some potential performance, avoid OOM at all costs.
-        # Different call sites can choose extra headroom when the static
-        # estimate is known to miss compiler spill pressure.
-        capped_vmem_limit_bytes = vmem_limit_bytes * vmem_safety_factor
+        # Even if we loose some potential performance, we want to avoid OOM at all
+        # costs. Therefore, we conservatively only use 80% of the VMEM budget.
+        capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
-        bkv_stride = math.lcm(mxu_column_size, serve_cfgs.page_size)
-        bkv_sz = bkv_stride
+        bkv_sz = bkv_stride = mxu_column_size
         if fixed_bq_sz is None:
-            bq_stride = mxu_column_size
-            # PCP uses enlarged KV pages. Keep KV tiles page aligned, but allow
-            # smaller Q tiles so large PCP page sizes still fit in VMEM.
-            bq_sz = bq_stride if bkv_stride > mxu_column_size else bkv_sz
+            bq_sz = bq_stride = bkv_sz
         else:
             bq_sz = fixed_bq_sz
             bq_stride = 0
@@ -297,39 +282,39 @@ def calculate_block_sizes(
 
         # If current batch size triggers OOM, decrease batch size until the kernel
         # fits within VMEM limit.
-        while (batch_size > 1
-               and calculate_vmem_usage(batch_size, n_buffer, bq_sz,
-                                        bkv_sz) > capped_vmem_limit_bytes):
+        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+               > capped_vmem_limit_bytes):
             batch_size -= 1
 
         # As a last resort, attempt to decrease number of buffers to avoid OOM.
-        while (n_buffer > 1
-               and calculate_vmem_usage(batch_size, n_buffer, bq_sz,
-                                        bkv_sz) > capped_vmem_limit_bytes):
+        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+               > capped_vmem_limit_bytes):
             n_buffer -= 1
 
         # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
         # NOTE: If the function does not exit at this point even when either values
         # are zero, it will trigger infinite loop at the next while loop.
-        if (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
-                > capped_vmem_limit_bytes):
+        if batch_size == 0 or n_buffer == 0:
             raise ValueError(
                 "Cannot find batch size that fits within VMEM limit.")
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
-        grow_kv = (fixed_bq_sz is not None or not serve_cfgs.use_full_kv_inputs
-                   or bkv_stride == mxu_column_size)
-        while True:
-            next_bkv_sz = bkv_sz + bkv_stride if grow_kv else bkv_sz
-            next_bq_sz = bq_sz + bq_stride
-            if (calculate_vmem_usage(batch_size, n_buffer, next_bq_sz,
-                                     next_bkv_sz) >= capped_vmem_limit_bytes):
-                break
-            bkv_sz = next_bkv_sz
-            bq_sz = next_bq_sz
+        while (calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+               < capped_vmem_limit_bytes):
+            # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
+            # size. When using causal masking, if bq size is larger than bkv size,
+            # entire kv tile can be masked out for some query tokens. Similarly, if
+            # bkv size is larger than bq size, entire query tile can be masked out for
+            # some kv tokens.
+            bkv_sz += bkv_stride
+            bq_sz += bq_stride
+
+        # Rollback one step since the last attempted value triggered OOM.
+        bkv_sz -= bkv_stride
+        bq_sz -= bq_stride
 
         # Indicates OOM was triggered from the starting bkv size.
-        if bkv_sz == 0 or bq_sz == 0:
+        if bkv_sz == 0:
             raise ValueError(
                 "Cannot find block sizes that fit within VMEM limit.")
 
@@ -365,154 +350,9 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
-    # Some prefill shapes have extra register allocator spill pressure that is
-    # not captured by the static VMEM estimate. Full-KV PCP prefill and decode
-    # LSE merge need the largest headroom. Qwen-like TP prefill shapes also
-    # spill when q768/k768 is selected, while fp8 KV unpacking still needs
-    # enough headroom to avoid selecting q512/k512 tiles that spill past the
-    # 64 MiB TPU VMEM limit.
-    if serve_cfgs.use_full_kv_inputs or serve_cfgs.return_lse:
-        prefill_vmem_safety_factor = 0.7
-    elif (model_cfgs.head_dim >= 128 and model_cfgs.num_q_heads >= 8
-          and model_cfgs.num_kv_heads >= 4):
-        prefill_vmem_safety_factor = 0.7
-    elif jnp.dtype(serve_cfgs.dtype_kv).itemsize == 1:
-        prefill_vmem_safety_factor = 0.75
-    else:
-        prefill_vmem_safety_factor = 0.8
-    prefill_block_sizes = find_best_block_sizes(
-        prefill_batch_size,
-        n_buffer,
-        vmem_safety_factor=prefill_vmem_safety_factor)
+    prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
     return decode_block_sizes, prefill_block_sizes
-
-
-def _maybe_coalesce_pcp_pseudo_sequences(
-    queries: jax.Array,
-    keys: jax.Array,
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
-    distribution: jax.Array,
-    q_start_offsets: jax.Array,
-    cu_k_lens: jax.Array,
-    block_sizes: configs.BlockSizes,
-    *,
-    use_full_kv_inputs: bool,
-    update_kv_cache: bool,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array,
-           int, int, configs.BlockSizes]:
-    """Coalesce PCP chunk pseudo-sequences without changing the public API."""
-
-    def _static_int(value) -> int | None:
-        try:
-            return int(value)
-        except Exception:  # Traced metadata values are not compile-time ints.
-            return None
-
-    if not use_full_kv_inputs or update_kv_cache:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-    if keys.shape[0] <= queries.shape[0] or keys.shape[0] % queries.shape[0]:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-    pcp_size = keys.shape[0] // queries.shape[0]
-    if pcp_size < 4 or (pcp_size & (pcp_size - 1)):
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-
-    old_num_seqs = kv_lens.shape[0]
-    active_num_seqs = _static_int(distribution[2])
-    if active_num_seqs is None:
-        active_num_seqs = old_num_seqs
-    else:
-        dist0 = _static_int(distribution[0])
-        dist1 = _static_int(distribution[1])
-        if dist0 not in (None, 0) or dist1 not in (None, 0):
-            return (kv_lens, page_indices, cu_q_lens, distribution,
-                    q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-        if active_num_seqs <= 1 or active_num_seqs > old_num_seqs:
-            return (kv_lens, page_indices, cu_q_lens, distribution,
-                    q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-
-    if old_num_seqs <= 1 or queries.shape[0] % active_num_seqs:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-
-    q_chunk_size = queries.shape[0] // active_num_seqs
-    if q_chunk_size <= 0:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-    try:
-        active_q_lens = jax.device_get(cu_q_lens[1:active_num_seqs + 1] -
-                                       cu_q_lens[:active_num_seqs])
-        if active_q_lens.size and not (active_q_lens == q_chunk_size).all():
-            return (kv_lens, page_indices, cu_q_lens, distribution,
-                    q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-    except Exception:
-        # TODO(xiaohao.yxh): This correctness fallback can skip PCP
-        # pseudo-sequence coalescing when q-len metadata is traced. That has a
-        # performance risk for long PCP prefill; revisit with static padding or
-        # partial-chunk-safe coalescing.
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-
-    target_bq_sz = block_sizes.bq_sz
-    if q_chunk_size < block_sizes.bq_sz:
-        target_bq_sz = max(q_chunk_size, block_sizes.bq_sz // 2)
-        target_bq_sz -= target_bq_sz % q_chunk_size
-
-    if q_chunk_size > target_bq_sz:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-    if target_bq_sz % q_chunk_size:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-
-    group_size = target_bq_sz // q_chunk_size
-    if active_num_seqs % group_size or old_num_seqs % group_size:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-    if page_indices.shape[0] % old_num_seqs:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, block_sizes)
-
-    new_num_seqs = old_num_seqs // group_size
-    pages_per_seq = page_indices.shape[0] // old_num_seqs
-    q_position_chunk_stride = pcp_size * q_chunk_size
-    bq_c_sz = min(block_sizes.bq_c_sz, target_bq_sz)
-    while target_bq_sz % bq_c_sz:
-        bq_c_sz //= 2
-    coalesced_block_sizes = configs.BlockSizes(
-        bq_sz=target_bq_sz,
-        bq_c_sz=bq_c_sz,
-        bkv_sz=block_sizes.bkv_sz,
-        batch_size=block_sizes.batch_size,
-        n_buffer=block_sizes.n_buffer,
-    )
-    if group_size == 1:
-        return (kv_lens, page_indices, cu_q_lens, distribution,
-                q_start_offsets, cu_k_lens, 0, 0, coalesced_block_sizes)
-
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    q_lens = q_lens.reshape(new_num_seqs, group_size).sum(axis=1)
-    new_cu_q_lens = jnp.pad(jnp.cumsum(q_lens), (1, 0))
-
-    new_kv_lens = kv_lens.reshape(new_num_seqs, group_size)[:, 0]
-    new_q_start_offsets = q_start_offsets.reshape(new_num_seqs, group_size)[:,
-                                                                            0]
-    new_cu_k_lens = cu_k_lens[:-1].reshape(new_num_seqs, group_size)[:, 0]
-    new_cu_k_lens = jnp.concatenate([new_cu_k_lens, cu_k_lens[-1:]])
-    new_page_indices = page_indices.reshape(new_num_seqs, group_size,
-                                            pages_per_seq)[:, 0, :]
-    new_page_indices = new_page_indices.reshape(new_num_seqs * pages_per_seq)
-    new_distribution = jnp.array([0, 0, distribution[2] // group_size],
-                                 dtype=distribution.dtype)
-
-    return (new_kv_lens, new_page_indices, new_cu_q_lens, new_distribution,
-            new_q_start_offsets, new_cu_k_lens, q_chunk_size,
-            q_position_chunk_stride, coalesced_block_sizes)
 
 
 @jax.jit(
@@ -532,7 +372,6 @@ def _maybe_coalesce_pcp_pseudo_sequences(
         "out_dtype",
         "use_causal_mask",
         "update_kv_cache",
-        "return_lse",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -561,11 +400,7 @@ def ragged_paged_attention(
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
-    q_start_offsets: jax.Array | None = None,
-    cu_k_lens: jax.Array | None = None,
-    return_lse: bool = False,
-) -> tuple[jax.Array, jax.Array] | tuple[tuple[jax.Array, jax.Array],
-                                         jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
     Args:
@@ -579,11 +414,8 @@ def ragged_paged_attention(
             page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
             sequence.
         cu_q_lens: [max_num_seqs + 1]. Cumulative sum of each sequence's query
-            length. queries[a:b] where a=cu_q_lens[i] and b=cu_q_lens[i+1]
-            represents q of sequence i. By default keys[a:b] and values[a:b]
-            use the same range. Supplying q_start_offsets/cu_k_lens enables a
-            local-Q/full-KV mode where keys and values contain the full KV
-            sequence and queries contain only the local query slice.
+            length. queries[a:b], keys[a:b], and values[a:b] where a=cu_q_lens[i] and
+            b=cu_q_lens[i+1] represents q/k/v of sequence i.
         distribution: [3]. Cumulative sum of number of decode, prefill, and mixed
             sequences. distribution[2] represents total number of sequences.
         sm_scale: Softmax scale value.
@@ -604,19 +436,9 @@ def ragged_paged_attention(
         debug_mode: Not used.
         out_dtype: Dtype of output. Defaults to dtype of queries.
         use_causal_mask: Not used.
-        q_start_offsets: Optional [max_num_seqs] global query start offset per
-            sequence. Defaults to kv_len - q_len, preserving the existing suffix-Q
-            semantics.
-        cu_k_lens: Optional [max_num_seqs + 1] K/V source offsets. This is
-            cumulative for ordinary local-Q/full-KV calls, but PCP pseudo
-            sequences may repeat the same K/V start offset across chunks that
-            share one full K/V sequence.
-        return_lse: If true, also return per-query/head log-sum-exp values.
 
     Returns:
-        out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention,
-            or (out, lse) when return_lse=True.
-        lse: [max_num_tokens, num_q_heads]. Only returned when return_lse=True.
+        out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
             kv_packing, head_dim]. Result of new kv cache where k & vs are
             concatenated along num kv heads dim.
@@ -643,19 +465,6 @@ def ragged_paged_attention(
     head_dim = queries.shape[2]
     num_kv_heads = keys.shape[1]
     num_page_indices = page_indices.shape[0]
-    use_full_kv_inputs = keys.shape[0] != queries.shape[
-        0] or cu_k_lens is not None
-
-    if q_start_offsets is None:
-        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-        q_start_offsets = kv_lens - q_lens
-    if cu_k_lens is None:
-        if use_full_kv_inputs:
-            cu_k_lens = jnp.concatenate(
-                [jnp.zeros((1, ), dtype=kv_lens.dtype),
-                 jnp.cumsum(kv_lens)])
-        else:
-            cu_k_lens = cu_q_lens
 
     model_cfgs = configs.ModelConfigs(
         num_q_heads=num_q_heads,
@@ -677,62 +486,18 @@ def ragged_paged_attention(
         scale_q=q_scale,
         scale_k=k_scale,
         scale_v=v_scale,
-        use_full_kv_inputs=use_full_kv_inputs,
-        return_lse=return_lse,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(queries, keys, values, queries.dtype,
                                        kv_cache.dtype)
-    lse_hbm = jnp.full(q_hbm.shape[:-1] + (pltpu.get_tpu_info().num_lanes, ),
-                       -jnp.inf,
-                       dtype=jnp.float32)
 
     default_decode, default_prefill = calculate_block_sizes(
         model_cfgs, serve_cfgs, vmem_limit_bytes)
-    (kv_lens, page_indices, cu_q_lens, distribution, q_start_offsets,
-     cu_k_lens, q_position_chunk_size, q_position_chunk_stride,
-     coalesced_prefill) = _maybe_coalesce_pcp_pseudo_sequences(
-         queries,
-         keys,
-         kv_lens,
-         page_indices,
-         cu_q_lens,
-         distribution,
-         q_start_offsets,
-         cu_k_lens,
-         prefill_block_sizes or default_prefill,
-         use_full_kv_inputs=use_full_kv_inputs,
-         update_kv_cache=update_kv_cache,
-     )
-    default_prefill = coalesced_prefill
-    if q_position_chunk_size:
-        max_num_seqs = kv_lens.shape[0]
-        num_page_indices = page_indices.shape[0]
-        serve_cfgs = configs.ServingConfigs(
-            num_seqs=max_num_seqs,
-            num_page_indices=num_page_indices,
-            total_q_tokens=queries.shape[0],
-            dtype_q=queries.dtype,
-            dtype_kv=kv_cache.dtype,
-            dtype_out=out_dtype,
-            page_size=page_size,
-            scale_q=q_scale,
-            scale_k=k_scale,
-            scale_v=v_scale,
-            use_full_kv_inputs=use_full_kv_inputs,
-            q_position_chunk_size=q_position_chunk_size,
-            q_position_chunk_stride=q_position_chunk_stride,
-            return_lse=return_lse,
-        )
-        default_decode, _ = calculate_block_sizes(model_cfgs, serve_cfgs,
-                                                  vmem_limit_bytes)
-        default_prefill = coalesced_prefill
 
     def run_rpa_kernel(
         mode: configs.RpaCase,
         o_hbm_alias_q_hbm: jax.Array,
         kv_cache: jax.Array,
-        lse_hbm: jax.Array,
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
@@ -760,8 +525,6 @@ def ragged_paged_attention(
         schedule_hbm = schedule.generate_rpa_metadata(
             cu_q_lens,
             kv_lens,
-            q_start_offsets,
-            cu_k_lens,
             distribution,
             cfgs=cfgs,
             update_kv_cache=update_kv_cache,
@@ -770,19 +533,17 @@ def ragged_paged_attention(
             cu_q_lens,
             kv_lens,
             page_indices,
-            q_start_offsets,
             schedule_hbm,
             o_hbm_alias_q_hbm,
             new_kv_hbm,
             kv_cache,
-            lse_hbm,
             cfgs=cfgs,
         )
 
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm)
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm)
+    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.DECODE, q_hbm,
+                                                 kv_cache)
+    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(configs.RpaCase.MIXED,
+                                                 o_hbm_alias_q_hbm, kv_cache)
 
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
@@ -792,11 +553,5 @@ def ragged_paged_attention(
     num_q_heads_per_kv_head = num_q_heads // num_kv_heads
     o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
     o_hbm = o_hbm.swapaxes(1, 0).reshape(queries.shape)
-    if return_lse:
-        lse_hbm = prepare_lse_outputs(lse_hbm, num_q_heads)
-        o_hbm = jnp.where(
-            jnp.isneginf(lse_hbm)[..., None], jnp.zeros((), dtype=o_hbm.dtype),
-            o_hbm)
-        return (o_hbm, lse_hbm), kv_cache
 
     return o_hbm, kv_cache

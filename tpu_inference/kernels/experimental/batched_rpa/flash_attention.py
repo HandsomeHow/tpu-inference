@@ -26,8 +26,7 @@ def flash_attention_qk_softmax(
     m_prev: jax.Array,  # [B, KV, TQ, 128]
     l_prev: jax.Array,  # [B, KV, TQ, 128]
     *,
-    q_global_start: list[jax.Array],  # [B]
-    q_local_start: list[jax.Array],  # [B]
+    processed_q_len: list[jax.Array],  # [B]
     processed_kv_len: list[jax.Array],  # [B]
     effective_kv_len: list[jax.Array],  # [B]
     cfgs: configs.RpaConfigs,
@@ -70,35 +69,9 @@ def flash_attention_qk_softmax(
     for b_idx in range(cfgs.block.batch_size):
         kv_idx_b = (lax.broadcasted_iota(int_ty, (k_heads, tq, s), 2) +
                     processed_kv_len[b_idx])
-        if (cfgs.model.num_q_heads_per_kv_head
-                & (cfgs.model.num_q_heads_per_kv_head - 1)) == 0:
-            q_head_shift = (
-                cfgs.model.num_q_heads_per_kv_head - 1).bit_length()
-            q_local_idx_b = (
-                lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) >>
-                q_head_shift) + bq_start
-            q_local_idx_b = q_local_idx_b + q_local_start[b_idx].astype(
-                jnp.int32)
-        else:
-            q_local_idx_b = (
-                lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) //
-                cfgs.model.num_q_heads_per_kv_head + bq_start)
-            q_local_idx_b = q_local_idx_b + q_local_start[b_idx].astype(
-                jnp.int32)
-        if cfgs.serve.has_chunked_q_positions:
-            if (cfgs.serve.q_position_chunk_size
-                    & (cfgs.serve.q_position_chunk_size - 1)) == 0:
-                shift = (cfgs.serve.q_position_chunk_size - 1).bit_length()
-                chunk = q_local_idx_b >> shift
-                offset = q_local_idx_b & (cfgs.serve.q_position_chunk_size - 1)
-            else:
-                chunk = q_local_idx_b // cfgs.serve.q_position_chunk_size
-                offset = q_local_idx_b - chunk * cfgs.serve.q_position_chunk_size
-            q_idx_b = (q_global_start[b_idx] +
-                       chunk * cfgs.serve.q_position_chunk_stride + offset)
-        else:
-            q_idx_b = q_global_start[b_idx] + q_local_idx_b
-        q_idx_b = q_idx_b.astype(int_ty)
+        q_idx_b = (lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1) //
+                   cfgs.model.num_q_heads_per_kv_head +
+                   bq_start).astype(int_ty) + processed_q_len[b_idx]
 
         eff_kv_len_b = effective_kv_len[b_idx]
         mask_b = q_idx_b < eff_kv_len_b

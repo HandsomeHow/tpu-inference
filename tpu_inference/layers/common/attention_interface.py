@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import functools
-import inspect
 import math
 from typing import Any, Callable, Optional, Tuple
 
@@ -65,15 +64,6 @@ get_kv_cache_shape = rpa.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
-
-
-@functools.lru_cache(maxsize=None)
-def _ragged_paged_attention_accepts_pcp_metadata(
-        func: Callable[..., Any]) -> bool:
-    rpa_params = inspect.signature(func).parameters
-    return ("q_start_offsets" in rpa_params
-            or any(param.kind == inspect.Parameter.VAR_KEYWORD
-                   for param in rpa_params.values()))
 
 
 def sharded_flash_attention(
@@ -362,12 +352,6 @@ def sharded_ragged_paged_attention(
     use_pcp_decode: bool = False,
     shard_pcp_axis: bool = True,
     cp_kv_cache_interleave_size: int = 0,
-    pcp_kv_lens: jax.Array | None = None,
-    pcp_page_indices: jax.Array | None = None,
-    pcp_query_start_loc: jax.Array | None = None,
-    pcp_request_distribution: jax.Array | None = None,
-    pcp_q_start_offsets: jax.Array | None = None,
-    pcp_cu_k_lens: jax.Array | None = None,
     pcp_slot_ids: jax.Array | None = None,
     pcp_source_block_tables: jax.Array | None = None,
     pcp_streaming_schedule: jax.Array | None = None,
@@ -379,9 +363,9 @@ def sharded_ragged_paged_attention(
             raise ValueError("Conflicting PCP mode and use_pcp_decode=True.")
         pcp_mode = PcpMode.DECODE_SHARDED_KV
     elif use_pcp:
-        if pcp_mode not in (PcpMode.DISABLED, PcpMode.PREFILL_LOCAL_Q_FULL_KV):
+        if pcp_mode not in (PcpMode.DISABLED, PcpMode.PREFILL_STREAMING):
             raise ValueError("Conflicting PCP mode and use_pcp=True.")
-        pcp_mode = PcpMode.PREFILL_LOCAL_Q_FULL_KV
+        pcp_mode = PcpMode.PREFILL_STREAMING
 
     # Handle GQA/MQA where num_kv_heads < tp_size
     # We replicate KV heads to match tp_size so that we can shard them evenly.
@@ -420,7 +404,7 @@ def sharded_ragged_paged_attention(
             pcp_source_block_tables=pcp_source_block_tables,
         )
 
-    if pcp_mode == PcpMode.PREFILL_LOCAL_Q_FULL_KV:
+    if pcp_mode == PcpMode.PREFILL_STREAMING:
         return sharded_pcp_ragged_paged_attention(
             mesh=mesh,
             q=q,
@@ -439,12 +423,6 @@ def sharded_ragged_paged_attention(
             v_scale=v_scale,
             update_kv_cache=update_kv_cache,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            pcp_kv_lens=pcp_kv_lens,
-            pcp_page_indices=pcp_page_indices,
-            pcp_query_start_loc=pcp_query_start_loc,
-            pcp_request_distribution=pcp_request_distribution,
-            pcp_q_start_offsets=pcp_q_start_offsets,
-            pcp_cu_k_lens=pcp_cu_k_lens,
             pcp_slot_ids=pcp_slot_ids,
             pcp_streaming_schedule=pcp_streaming_schedule,
             pcp_streaming_active_page_groups=(
@@ -511,115 +489,6 @@ def sharded_ragged_paged_attention(
         out_specs=out_specs,
         check_vma=False,
     )(*args)
-
-
-def _pcp_chunks_per_seq(max_num_tokens: int, pcp_size: int,
-                        interleave_size: int) -> int:
-    if interleave_size <= 0:
-        raise ValueError("PCP requires cp_kv_cache_interleave_size > 0.")
-    return max(1, math.ceil(max_num_tokens / (pcp_size * interleave_size)))
-
-
-def _make_pcp_interleaved_token_indices(
-    seq_lens: jax.Array,
-    local_num_tokens: int,
-    interleave_size: int,
-    *,
-    pcp_size: int,
-) -> jax.Array:
-    """Map contiguous sequence token order to rank-major interleaved order."""
-    max_num_seqs = seq_lens.shape[0]
-    max_total_tokens = local_num_tokens * pcp_size
-    chunks_per_seq = _pcp_chunks_per_seq(max_total_tokens, pcp_size,
-                                         interleave_size)
-    token_idx = jnp.arange(max_total_tokens, dtype=jnp.int32)
-
-    seq_starts = jnp.pad(jnp.cumsum(seq_lens), (1, 0))[:-1]
-    seq_ends = seq_starts + seq_lens
-    seq_mask = ((token_idx[:, None] >= seq_starts[None, :])
-                & (token_idx[:, None] < seq_ends[None, :]))
-    valid = jnp.any(seq_mask, axis=1)
-    seq_idx = jnp.argmax(seq_mask.astype(jnp.int32), axis=1)
-
-    token_offset = jnp.where(valid, token_idx - seq_starts[seq_idx], 0)
-    token_rank = (token_offset // interleave_size) % pcp_size
-    token_chunk = token_offset // (interleave_size * pcp_size)
-    token_chunk = jnp.minimum(token_chunk, chunks_per_seq - 1)
-    token_offset_in_chunk = token_offset % interleave_size
-
-    ranks = jnp.arange(pcp_size, dtype=jnp.int32)[:, None, None]
-    chunks = jnp.arange(chunks_per_seq, dtype=jnp.int32)[None, None, :]
-    chunk_starts = (chunks * pcp_size + ranks) * interleave_size
-    chunk_lens = jnp.clip(seq_lens[None, :, None] - chunk_starts, 0,
-                          interleave_size)
-    local_cu_lens_by_rank = jnp.pad(
-        jnp.cumsum(chunk_lens.reshape(pcp_size, -1), axis=1),
-        ((0, 0), (1, 0)),
-    )
-
-    chunk_seq_idx = seq_idx * chunks_per_seq + token_chunk
-    local_offset = (local_cu_lens_by_rank[token_rank, chunk_seq_idx] +
-                    token_offset_in_chunk)
-    src_idx = token_rank * local_num_tokens + local_offset
-    return jnp.where(valid, src_idx, 0)
-
-
-def _make_pcp_interleaved_metadata(
-    cu_q_lens: jax.Array,
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    local_num_tokens: int,
-    interleave_size: int,
-    *,
-    pcp_size: int,
-    axis_name: str,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Build chunked local-Q/full-KV metadata for one PCP shard."""
-    pcp_rank = jax.lax.axis_index(axis_name)
-    max_num_seqs = kv_lens.shape[0]
-    chunks_per_seq = _pcp_chunks_per_seq(local_num_tokens * pcp_size, pcp_size,
-                                         interleave_size)
-
-    global_q_starts = cu_q_lens[:-1]
-    global_q_ends = cu_q_lens[1:]
-    global_q_lens = global_q_ends - global_q_starts
-
-    chunk_ids = jnp.arange(chunks_per_seq, dtype=jnp.int32)
-    chunk_offsets = (chunk_ids * pcp_size + pcp_rank) * interleave_size
-    local_q_lens = jnp.clip(global_q_lens[:, None] - chunk_offsets[None, :], 0,
-                            interleave_size)
-
-    # TODO(xiaohao.yxh): Treating every interleaved chunk as a pseudo sequence
-    # can create many tiny sequences when the interleave size is small. That
-    # hurts RPA schedule overhead and tile utilization; replace this with native
-    # multi-chunk-per-sequence support in the kernel scheduler.
-    flat_local_q_lens = local_q_lens.reshape(-1)
-    local_cu_q_lens = jnp.pad(jnp.cumsum(flat_local_q_lens), (1, 0))
-
-    q_start_offsets = ((kv_lens - global_q_lens)[:, None] +
-                       chunk_offsets[None, :])
-    q_start_offsets = jnp.where(local_q_lens > 0, q_start_offsets, 0)
-    q_start_offsets = q_start_offsets.reshape(-1)
-
-    expanded_kv_lens = jnp.where(local_q_lens > 0, kv_lens[:, None],
-                                 0).reshape(-1)
-    k_start_offsets = jnp.pad(jnp.cumsum(kv_lens), (1, 0))[:-1]
-    cu_k_lens = jnp.where(local_q_lens > 0, k_start_offsets[:, None],
-                          0).reshape(-1)
-    cu_k_lens = jnp.concatenate(
-        [cu_k_lens,
-         jnp.array([jnp.sum(kv_lens)], dtype=cu_k_lens.dtype)])
-
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
-    page_indices_by_seq = page_indices.reshape(max_num_seqs, pages_per_seq)
-    expanded_page_indices = jnp.broadcast_to(
-        page_indices_by_seq[:, None, :],
-        (max_num_seqs, chunks_per_seq, pages_per_seq),
-    ).reshape(-1)
-    expanded_distribution = jnp.array([0, 0, max_num_seqs * chunks_per_seq],
-                                      dtype=kv_lens.dtype)
-    return (expanded_kv_lens, expanded_page_indices, local_cu_q_lens,
-            expanded_distribution, q_start_offsets, cu_k_lens)
 
 
 def _update_local_paged_kv_cache(
@@ -744,40 +613,6 @@ def materialize_pcp_kv_for_decode(
     )
 
 
-def _pcp_lse_merge_weight(partial_lse: jax.Array,
-                          all_lses: jax.Array) -> jax.Array:
-    max_lse = jnp.max(all_lses, axis=0)
-    valid = max_lse != -jnp.inf
-    safe_local_diff = jnp.where(valid, partial_lse - max_lse, 0.0)
-    local_exp = jnp.exp(safe_local_diff)
-
-    safe_all_diffs = jnp.where(valid[None], all_lses - max_lse[None], 0.0)
-    denom = jnp.sum(jnp.exp(safe_all_diffs), axis=0)
-    weight = local_exp / jnp.maximum(denom, 1e-30)
-    return jnp.where(valid, weight, 0.0)
-
-
-def pcp_lse_merge(
-    partial_out: jax.Array,
-    partial_lse: jax.Array,
-    pcp_axis_name: str,
-) -> jax.Array:
-    """Merge PCP partial attention outputs using log-sum-exp weights.
-
-    This runs inside a shard_map over the PCP axis. Each rank supplies the
-    attention result for its local KV shard. Rows where all ranks are empty
-    produce zero output instead of NaNs.
-    """
-    all_lses = jax.lax.all_gather(partial_lse,
-                                  axis_name=pcp_axis_name,
-                                  axis=0,
-                                  tiled=False)
-    weight = _pcp_lse_merge_weight(partial_lse, all_lses)
-    weighted_out = partial_out.astype(jnp.float32) * weight[..., None]
-    merged = jax.lax.psum(weighted_out, axis_name=pcp_axis_name)
-    return merged.astype(partial_out.dtype)
-
-
 def compute_pcp_local_mapping(
     positions: jax.Array,
     token_req_indices: jax.Array,
@@ -833,17 +668,11 @@ def sharded_pcp_ragged_paged_attention(
     v_scale: float | None = None,
     update_kv_cache: bool = True,
     cp_kv_cache_interleave_size: int = 0,
-    pcp_kv_lens: jax.Array | None = None,
-    pcp_page_indices: jax.Array | None = None,
-    pcp_query_start_loc: jax.Array | None = None,
-    pcp_request_distribution: jax.Array | None = None,
-    pcp_q_start_offsets: jax.Array | None = None,
-    pcp_cu_k_lens: jax.Array | None = None,
     pcp_slot_ids: jax.Array | None = None,
     pcp_streaming_schedule: jax.Array | None = None,
     pcp_streaming_active_page_groups: jax.Array | None = None,
 ):
-    """Runs local-query/full-KV RPA over the prefill context axis."""
+    """Runs streaming PCP RPA over the prefill context axis."""
     if attention_sink is not None:
         raise NotImplementedError("PCP RPA does not support attention sinks.")
     if q.shape[-1] == 64:
@@ -857,50 +686,29 @@ def sharded_pcp_ragged_paged_attention(
     if get_mesh_shape_product(mesh, ShardingAxisName.CONTEXT) > 1:
         raise NotImplementedError("PCP RPA does not support DCP yet.")
 
-    precomputed_pcp_metadata = (
-        pcp_kv_lens,
-        pcp_page_indices,
-        pcp_query_start_loc,
-        pcp_request_distribution,
-        pcp_q_start_offsets,
-        pcp_cu_k_lens,
-        pcp_slot_ids,
-    )
-    has_precomputed_pcp_metadata = any(x is not None
-                                       for x in precomputed_pcp_metadata)
-    if has_precomputed_pcp_metadata and not all(
-            x is not None for x in precomputed_pcp_metadata):
-        raise ValueError(
-            "PCP RPA requires all precomputed PCP metadata fields when any "
-            "one of them is provided.")
-
     streaming_requested = (envs.USE_PCP_STREAMING_RPA_KERNEL
                            and pcp_streaming_schedule is not None)
-    if streaming_requested:
-        if pcp_streaming_active_page_groups is None:
-            raise ValueError("PCP streaming RPA requires active page groups.")
-        if not has_precomputed_pcp_metadata:
-            raise ValueError(
-                "PCP streaming RPA requires precomputed PCP metadata from "
-                "the runner.")
-        if attention_chunk_size is not None:
-            raise NotImplementedError(
-                "PCP streaming RPA supports full attention only.")
-        if q_scale is not None or k_scale is not None or v_scale is not None:
-            raise NotImplementedError(
-                "PCP streaming RPA does not support quantized Q/K/V scales.")
-        if not update_kv_cache:
-            raise NotImplementedError(
-                "PCP streaming RPA requires update_kv_cache=True.")
-        if cp_kv_cache_interleave_size != kv_cache.shape[1]:
-            raise NotImplementedError(
-                "PCP streaming RPA currently requires "
-                "cp_kv_cache_interleave_size == page_size.")
-    elif not _ragged_paged_attention_accepts_pcp_metadata(
-            ragged_paged_attention):
+    if not streaming_requested:
+        raise ValueError(
+            "PCP prefill requires USE_PCP_STREAMING_RPA_KERNEL=1 and a "
+            "runner-provided streaming schedule.")
+    if pcp_streaming_active_page_groups is None:
+        raise ValueError("PCP streaming RPA requires active page groups.")
+    if pcp_slot_ids is None:
+        raise ValueError("PCP streaming RPA requires pcp_slot_ids.")
+    if attention_chunk_size is not None:
         raise NotImplementedError(
-            "PCP RPA requires the batched RPA wrapper with local-Q/full-KV "
-            "metadata support.")
+            "PCP streaming RPA supports full attention only.")
+    if q_scale is not None or k_scale is not None or v_scale is not None:
+        raise NotImplementedError(
+            "PCP streaming RPA does not support quantized Q/K/V scales.")
+    if not update_kv_cache:
+        raise NotImplementedError(
+            "PCP streaming RPA requires update_kv_cache=True.")
+    if cp_kv_cache_interleave_size != kv_cache.shape[1]:
+        raise NotImplementedError(
+            "PCP streaming RPA currently requires "
+            "cp_kv_cache_interleave_size == page_size.")
 
     qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.KV_CACHE_HEAD,
                  None)
@@ -930,123 +738,49 @@ def sharded_pcp_ragged_paged_attention(
     )
     out_specs = (qkv_spec, kv_cache_spec)
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
-    if has_precomputed_pcp_metadata:
-        in_specs += (
-            pcp_metadata_spec,  # pcp_kv_lens
-            pcp_metadata_spec,  # pcp_page_indices
-            pcp_metadata_spec,  # pcp_query_start_loc
-            pcp_metadata_spec,  # pcp_request_distribution
-            pcp_metadata_spec,  # pcp_q_start_offsets
-            pcp_metadata_spec,  # pcp_cu_k_lens
-            pcp_metadata_spec,  # pcp_slot_ids
-        )
-        args += precomputed_pcp_metadata
-    if streaming_requested:
-        in_specs += (pcp_streaming_schedule_spec,
-                     pcp_streaming_active_page_groups_spec)
-        args += (pcp_streaming_schedule, pcp_streaming_active_page_groups)
+    in_specs += (pcp_metadata_spec, pcp_streaming_schedule_spec,
+                 pcp_streaming_active_page_groups_spec)
+    args += (pcp_slot_ids, pcp_streaming_schedule,
+             pcp_streaming_active_page_groups)
 
     def _pcp_ragged_paged_attention(q_local, k_local, v_local, kv_cache,
                                     kv_lens, page_indices, cu_q_lens,
-                                    distribution, *extra_pcp_args):
-        num_pcp_metadata_args = (len(precomputed_pcp_metadata)
-                                 if has_precomputed_pcp_metadata else 0)
-        pcp_metadata_args = extra_pcp_args[:num_pcp_metadata_args]
-        streaming_schedule_arg = (extra_pcp_args[num_pcp_metadata_args]
-                                  if streaming_requested else None)
-        streaming_active_page_groups_arg = (
-            extra_pcp_args[num_pcp_metadata_args + 1]
-            if streaming_requested else None)
-        kv_indices = _make_pcp_interleaved_token_indices(
-            kv_lens,
-            k_local.shape[0],
-            cp_kv_cache_interleave_size,
-            pcp_size=pcp_size,
-        )
-        if pcp_metadata_args:
-            (expanded_kv_lens, expanded_page_indices, local_cu_q_lens,
-             expanded_distribution, q_start_offsets, cu_k_lens,
-             slot_ids) = pcp_metadata_args
-        else:
-            if update_kv_cache:
-                raise ValueError(
-                    "PCP local KV cache updates require precomputed "
-                    "pcp_slot_ids from the runner.")
-            (expanded_kv_lens, expanded_page_indices, local_cu_q_lens,
-             expanded_distribution, q_start_offsets,
-             cu_k_lens) = _make_pcp_interleaved_metadata(
-                 cu_q_lens,
-                 kv_lens,
-                 page_indices,
-                 local_num_tokens=q_local.shape[0],
-                 interleave_size=cp_kv_cache_interleave_size,
-                 pcp_size=pcp_size,
-                 axis_name=pcp_axis,
-             )
-            slot_ids = None
-        if update_kv_cache:
-            kv_cache = _update_local_paged_kv_cache(kv_cache, k_local, v_local,
-                                                    slot_ids)
-        if streaming_requested:
-            if q_local.shape[1] % k_local.shape[1] != 0:
-                raise ValueError("Q heads must be divisible by KV heads.")
-            q_per_kv = q_local.shape[1] // k_local.shape[1]
-            q_streaming = q_local.reshape(q_local.shape[0], k_local.shape[1],
-                                          q_per_kv, q_local.shape[2])
-            if streaming_schedule_arg.ndim == 5:
-                streaming_schedule_arg = streaming_schedule_arg[0]
-            if streaming_active_page_groups_arg.ndim == 2:
-                streaming_active_page_groups_arg = (
-                    streaming_active_page_groups_arg[0])
-            output = pcp_streaming_attention_page_groups_packed_local(
-                q_streaming,
-                kv_cache,
-                streaming_schedule_arg,
-                streaming_active_page_groups_arg,
-                pcp_size=pcp_size,
-                q_block_size=envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
-                sm_scale=sm_scale,
-                collective_id=23,
-                kv_pages_per_block=max(
-                    1,
-                    min(
-                        ScheduleField.MAX_KV_PAGES_PER_BLOCK,
-                        envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE //
-                        kv_cache.shape[1],
-                    ),
-                ),
-                mesh_axis_names=tuple(mesh.axis_names),
-                pcp_axis_name=pcp_axis,
-            )
-            return output.reshape(q_local.shape), kv_cache
-        full_k = jax.lax.all_gather(k_local,
-                                    axis_name=pcp_axis,
-                                    axis=0,
-                                    tiled=True)
-        full_v = jax.lax.all_gather(v_local,
-                                    axis_name=pcp_axis,
-                                    axis=0,
-                                    tiled=True)
-        full_k = full_k[kv_indices]
-        full_v = full_v[kv_indices]
-        return ragged_paged_attention(
-            q_local,
-            full_k,
-            full_v,
+                                    distribution, slot_ids,
+                                    streaming_schedule_arg,
+                                    streaming_active_page_groups_arg):
+        del kv_lens, page_indices, cu_q_lens, distribution
+        kv_cache = _update_local_paged_kv_cache(kv_cache, k_local, v_local,
+                                                slot_ids)
+        if q_local.shape[1] % k_local.shape[1] != 0:
+            raise ValueError("Q heads must be divisible by KV heads.")
+        q_per_kv = q_local.shape[1] // k_local.shape[1]
+        q_streaming = q_local.reshape(q_local.shape[0], k_local.shape[1],
+                                      q_per_kv, q_local.shape[2])
+        if streaming_schedule_arg.ndim == 5:
+            streaming_schedule_arg = streaming_schedule_arg[0]
+        if streaming_active_page_groups_arg.ndim == 2:
+            streaming_active_page_groups_arg = (
+                streaming_active_page_groups_arg[0])
+        output = pcp_streaming_attention_page_groups_packed_local(
+            q_streaming,
             kv_cache,
-            expanded_kv_lens,
-            expanded_page_indices,
-            local_cu_q_lens,
-            expanded_distribution,
+            streaming_schedule_arg,
+            streaming_active_page_groups_arg,
+            pcp_size=pcp_size,
+            q_block_size=envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
             sm_scale=sm_scale,
-            sliding_window=attention_chunk_size,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            update_kv_cache=False,
-            q_start_offsets=q_start_offsets,
-            cu_k_lens=cu_k_lens,
+            collective_id=23,
+            kv_pages_per_block=max(
+                1,
+                min(
+                    ScheduleField.MAX_KV_PAGES_PER_BLOCK,
+                    envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE // kv_cache.shape[1],
+                ),
+            ),
+            mesh_axis_names=tuple(mesh.axis_names),
+            pcp_axis_name=pcp_axis,
         )
+        return output.reshape(q_local.shape), kv_cache
 
     return jax.shard_map(
         _pcp_ragged_paged_attention,
@@ -1231,12 +965,6 @@ def attention(
         use_pcp_decode=use_pcp_decode,
         shard_pcp_axis=shard_pcp_axis,
         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-        pcp_kv_lens=md.pcp_kv_lens,
-        pcp_page_indices=md.pcp_page_indices,
-        pcp_query_start_loc=md.pcp_query_start_loc,
-        pcp_request_distribution=md.pcp_request_distribution,
-        pcp_q_start_offsets=md.pcp_q_start_offsets,
-        pcp_cu_k_lens=md.pcp_cu_k_lens,
         pcp_slot_ids=md.pcp_slot_ids,
         pcp_source_block_tables=md.pcp_source_block_tables,
         pcp_streaming_schedule=md.pcp_streaming_schedule,
