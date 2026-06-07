@@ -14,6 +14,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import jax
 import torch
 
 from tpu_inference.layers.vllm.custom_ops.linear import VllmQKVParallelLinear
@@ -117,6 +118,22 @@ def test_replicas_tp_equals_kv_heads():
     assert layer.tp_size == 2
     assert layer.num_kv_head_replicas == 1
     assert parent_kv_heads == [2]
+
+
+def test_mesh_with_kv_replica_axis_supports_tuple_attn_head():
+    mesh = jax.sharding.AbstractMesh(
+        (1, 1, 1, 1, 8, 1, 1),
+        ("data", "attn_dp", "attn_dp_expert", "expert", "model", "dcp",
+         "pcp"),
+    )
+
+    new_mesh = VllmQKVParallelLinear._mesh_with_kv_replica_axis(
+        mesh, ("model", "expert", "dcp"), replicas=4, replica_axis="replica")
+
+    assert new_mesh.axis_names == ("data", "attn_dp", "attn_dp_expert",
+                                   "expert", "model", "replica", "dcp",
+                                   "pcp")
+    assert new_mesh.axis_sizes == (1, 1, 1, 1, 2, 4, 1, 1)
 
 
 def test_tile_kv_along_output_dim_1():

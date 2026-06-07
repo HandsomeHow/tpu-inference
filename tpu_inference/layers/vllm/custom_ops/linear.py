@@ -148,6 +148,40 @@ class VllmQKVParallelLinear(QKVParallelLinear):
         w = w.repeat_interleave(r, dim=dim)
         return w.reshape(front + (n * r * rows_per_head, ) + back)
 
+    @staticmethod
+    def _axis_tuple(axis) -> tuple[str, ...]:
+        if axis is None:
+            return ()
+        if isinstance(axis, str):
+            return (axis, )
+        return tuple(axis)
+
+    @classmethod
+    def _mesh_with_kv_replica_axis(cls, mesh, kv_head_axis, replicas: int,
+                                   replica_axis: str):
+        kv_head_axes = cls._axis_tuple(kv_head_axis)
+        for axis in kv_head_axes:
+            if axis not in mesh.axis_names:
+                continue
+            i = mesh.axis_names.index(axis)
+            kv_size = mesh.axis_sizes[i]
+            if kv_size % replicas != 0:
+                continue
+            kv_type = mesh.axis_types[i]
+            return jax.sharding.AbstractMesh(
+                mesh.axis_sizes[:i] + (kv_size // replicas, replicas) +
+                mesh.axis_sizes[i + 1:],
+                mesh.axis_names[:i] + (axis, replica_axis) +
+                mesh.axis_names[i + 1:],
+                mesh.axis_types[:i] + (kv_type, kv_type) +
+                mesh.axis_types[i + 1:],
+            )
+
+        raise ValueError(
+            f"Cannot split any ATTN_HEAD axis {kv_head_axes} in mesh "
+            f"{mesh.axis_names} with sizes {mesh.axis_sizes} by replicas="
+            f"{replicas}.")
+
     def forward(
         self,
         x: torch.Tensor,
@@ -181,19 +215,12 @@ class VllmQKVParallelLinear(QKVParallelLinear):
         # data movement, since `_tile_kv` already placed identical KV-head
         # copies on each replica-group of devices when TP > total_num_kv_heads.
         replicas = self.num_kv_head_replicas
-        i = mesh.axis_names.index(kv_head_axis)
-        kv_size = mesh.axis_sizes[i]
-        kv_type = mesh.axis_types[i]
-        new_mesh = jax.sharding.AbstractMesh(
-            mesh.axis_sizes[:i] + (kv_size // replicas, replicas) +
-            mesh.axis_sizes[i + 1:],
-            mesh.axis_names[:i] + (kv_head_axis, replica_axis) +
-            mesh.axis_names[i + 1:],
-            mesh.axis_types[:i] + (kv_type, kv_type) + mesh.axis_types[i + 1:],
-        )
+        new_mesh = self._mesh_with_kv_replica_axis(mesh, kv_head_axis,
+                                                   replicas, replica_axis)
+        replicated_kv_axes = (*self._axis_tuple(kv_head_axis), replica_axis)
 
         @shard_map(mesh=new_mesh,
-                   in_specs=P(data_axis, (kv_head_axis, replica_axis)),
+                   in_specs=P(data_axis, replicated_kv_axes),
                    out_specs=P(data_axis, kv_head_axis),
                    check_vma=False)
         def _mark_kv_head_replicated(t):
