@@ -60,6 +60,7 @@ def _consume_scheduled_kv_page(
     acc,
     *,
     sm_scale,
+    pcp_size,
 ):
     q = q_vmem_ref[...].astype(jnp.float32)
     k = kv_vmem_ref.at[slot, :, 0, :][...].astype(jnp.float32)
@@ -76,7 +77,12 @@ def _consume_scheduled_kv_page(
                                  ScheduleField.Q_TILE_SIZE]
 
     scores = jnp.matmul(q, k.T, preferred_element_type=jnp.float32) * sm_scale
-    q_pos = q_global_start + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
+    q_row = lax.broadcasted_iota(jnp.int32, scores.shape, 0)
+    q_interleave = kv_vmem_ref.shape[1]
+    q_chunk_idx = lax.div(q_row, q_interleave)
+    q_chunk_offset = lax.rem(q_row, q_interleave)
+    q_pos = (q_global_start +
+             q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
     kv_pos = kv_global_start + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
     kv_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 1) < kv_valid_len
     q_valid = lax.broadcasted_iota(jnp.int32, scores.shape, 0) < q_tile_size
@@ -154,7 +160,11 @@ def _consume_scheduled_kv_page_multi_head(
             lax.broadcasted_iota(jnp.int32, scores.shape, 0),
             q_per_kv,
         )
-        q_pos = q_global_start + q_row
+        q_interleave = page_size
+        q_chunk_idx = lax.div(q_row, q_interleave)
+        q_chunk_offset = lax.rem(q_row, q_interleave)
+        q_pos = (q_global_start +
+                 q_chunk_idx * pcp_size * q_interleave + q_chunk_offset)
         kv_local_pos = lax.broadcasted_iota(jnp.int32, scores.shape, 1)
         kv_page_offset = lax.div(kv_local_pos, page_size)
         kv_token_offset = lax.rem(kv_local_pos, page_size)
@@ -430,6 +440,7 @@ def _pcp_streaming_attention_page_groups_kernel(
                     l,
                     acc,
                     sm_scale=sm_scale,
+                    pcp_size=pcp_size,
                 )
 
                 if round_idx < pcp_size - 1:

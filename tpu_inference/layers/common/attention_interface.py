@@ -1004,8 +1004,7 @@ def sharded_pcp_ragged_paged_attention(
                 streaming_schedule_arg,
                 streaming_active_page_groups_arg,
                 pcp_size=pcp_size,
-                q_block_size=min(envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
-                                 cp_kv_cache_interleave_size),
+                q_block_size=envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
                 sm_scale=sm_scale,
                 collective_id=23,
                 kv_pages_per_block=max(

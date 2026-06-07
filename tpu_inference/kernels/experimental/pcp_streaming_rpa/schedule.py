@@ -60,6 +60,65 @@ def _cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _q_global_last_for_strided_tile(q_global_start: int, q_tile_len: int, *,
+                                    pcp_size: int,
+                                    interleave_size: int) -> int:
+    last_row = q_tile_len - 1
+    return (q_global_start +
+            (last_row // interleave_size) * pcp_size * interleave_size +
+            (last_row % interleave_size))
+
+
+def _iter_pcp_q_tiles(q_len: int, q_global_base: int, consumer_rank: int, *,
+                      pcp_size: int, interleave_size: int, bq_sz: int):
+    """Yield local-contiguous Q tiles for one rank.
+
+    The original schedule emitted one tile per PCP interleave chunk. For small
+    interleave sizes that forces tiny Q tiles and repeats the same streamed KV
+    traffic. When adjacent rank-owned chunks are full interleave chunks, they
+    are contiguous in local HBM and can be consumed as one larger tile. The
+    kernel reconstructs each row's strided global Q position from the first
+    chunk's global start.
+    """
+    ranges = list(
+        pcp_query_chunk_ranges(q_len, q_global_base, consumer_rank, pcp_size,
+                               interleave_size))
+    if bq_sz <= interleave_size:
+        for chunk_start, chunk_end in ranges:
+            chunk_len = chunk_end - chunk_start
+            for tile_start in range(0, chunk_len, bq_sz):
+                tile_len = min(bq_sz, chunk_len - tile_start)
+                yield chunk_start + tile_start, tile_len
+        return
+
+    range_idx = 0
+    while range_idx < len(ranges):
+        chunk_start, chunk_end = ranges[range_idx]
+        chunk_len = chunk_end - chunk_start
+        if chunk_len != interleave_size:
+            for tile_start in range(0, chunk_len, bq_sz):
+                tile_len = min(bq_sz, chunk_len - tile_start)
+                yield chunk_start + tile_start, tile_len
+            range_idx += 1
+            continue
+
+        tile_global_start = chunk_start
+        tile_len = 0
+        expected_chunk_start = chunk_start
+        while range_idx < len(ranges):
+            next_start, next_end = ranges[range_idx]
+            next_len = next_end - next_start
+            if (next_len != interleave_size
+                    or next_start != expected_chunk_start
+                    or tile_len + next_len > bq_sz):
+                break
+            tile_len += next_len
+            range_idx += 1
+            expected_chunk_start += pcp_size * interleave_size
+
+        yield tile_global_start, tile_len
+
+
 @dataclasses.dataclass(frozen=True)
 class PcpStreamingSchedule:
     """PCP streaming schedule arrays.
@@ -278,125 +337,125 @@ def generate_pcp_streaming_schedule(
                 raise ValueError("kv_lens must include all scheduled Q tokens.")
             num_kv_pages = _cdiv(kv_len, page_size)
 
-            for chunk_start, chunk_end in pcp_query_chunk_ranges(
-                    q_len, q_global_base, consumer_rank, pcp_size,
-                    interleave_size):
-                chunk_len = chunk_end - chunk_start
-                num_tiles = _cdiv(chunk_len, bq_sz)
+            for q_global, tile_len in _iter_pcp_q_tiles(
+                    q_len,
+                    q_global_base,
+                    consumer_rank,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                    bq_sz=bq_sz):
+                q_global_last = _q_global_last_for_strided_tile(
+                    q_global,
+                    tile_len,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size)
+                q_hbm_offset = rank_q_offset
+                target_lane = int(np.argmin(lane_lengths))
+                effective_kv_pages = min(num_kv_pages,
+                                         q_global_last // page_size + 1)
 
-                for tile_idx in range(num_tiles):
-                    tile_start = tile_idx * bq_sz
-                    tile_len = min(bq_sz, chunk_len - tile_start)
-                    q_global = chunk_start + tile_start
-                    q_global_last = q_global + tile_len - 1
-                    q_hbm_offset = rank_q_offset
-                    target_lane = int(np.argmin(lane_lengths))
-                    effective_kv_pages = min(num_kv_pages,
-                                             q_global_last // page_size + 1)
-
-                    if kv_pages_per_block == 1:
-                        scheduled_kv_pages = effective_kv_pages
-                        if pad_kv_pages_to_pcp_group:
-                            scheduled_kv_pages = _cdiv(
-                                effective_kv_pages, pcp_size) * pcp_size
-                        last_block = -1
-                        last_store_src_rank = -1
-                    else:
-                        block_span_pages = pcp_size * kv_pages_per_block
-                        scheduled_kv_blocks = _cdiv(effective_kv_pages,
-                                                     block_span_pages)
-                        scheduled_kv_pages = scheduled_kv_blocks * pcp_size
-                        last_global_page = effective_kv_pages - 1
-                        last_local_page = last_global_page // pcp_size
-                        last_block = last_local_page // kv_pages_per_block
-                        last_store_src_rank = 0
-                        last_local_page_start = last_block * kv_pages_per_block
-                        for candidate_src_rank in range(pcp_size):
-                            for page_offset in range(kv_pages_per_block):
-                                candidate_global_page = (
-                                    (last_local_page_start + page_offset) *
-                                    pcp_size + candidate_src_rank)
-                                if candidate_global_page < effective_kv_pages:
-                                    last_store_src_rank = candidate_src_rank
-
-                    for kv_page_seq_idx in range(scheduled_kv_pages):
-                        if kv_pages_per_block == 1:
-                            src_rank = kv_page_seq_idx % pcp_size
-                            local_page_start = kv_page_seq_idx // pcp_size
-                        else:
-                            src_rank = kv_page_seq_idx % pcp_size
-                            local_page_start = (kv_page_seq_idx // pcp_size *
-                                                kv_pages_per_block)
-                        global_page = local_page_start * pcp_size + src_rank
-                        global_token_start = global_page * page_size
-                        valid_tokens = 0
-                        page_indices = []
+                if kv_pages_per_block == 1:
+                    scheduled_kv_pages = effective_kv_pages
+                    if pad_kv_pages_to_pcp_group:
+                        scheduled_kv_pages = _cdiv(effective_kv_pages,
+                                                   pcp_size) * pcp_size
+                    last_block = -1
+                    last_store_src_rank = -1
+                else:
+                    block_span_pages = pcp_size * kv_pages_per_block
+                    scheduled_kv_blocks = _cdiv(effective_kv_pages,
+                                                 block_span_pages)
+                    scheduled_kv_pages = scheduled_kv_blocks * pcp_size
+                    last_global_page = effective_kv_pages - 1
+                    last_local_page = last_global_page // pcp_size
+                    last_block = last_local_page // kv_pages_per_block
+                    last_store_src_rank = 0
+                    last_local_page_start = last_block * kv_pages_per_block
+                    for candidate_src_rank in range(pcp_size):
                         for page_offset in range(kv_pages_per_block):
-                            page_global = ((local_page_start + page_offset) *
-                                           pcp_size + src_rank)
-                            if page_global < effective_kv_pages:
-                                local_page_index = page_global // pcp_size
-                                if local_page_index >= block_tables.shape[1]:
-                                    raise ValueError(
-                                        "block_tables does not cover requested "
-                                        "KV page.")
-                                physical_page = int(block_tables[
-                                    req_idx, local_page_index])
-                                page_valid = min(
-                                    page_size,
-                                    kv_len - page_global * page_size,
-                                )
-                                valid_tokens += max(page_valid, 0)
-                            else:
-                                physical_page = 0
-                            page_indices.append(physical_page)
-                        if valid_tokens == 0:
-                            lane_entries[target_lane].append(
-                                _Entry(
-                                    req_id=-1,
-                                    kv_page_rank=src_rank,
-                                    kv_page_idx=0,
-                                    is_first_kv=0,
-                                    is_last_kv=0,
-                                    load_q=0,
-                                    q_global_start=q_global,
-                                    kv_global_start=global_token_start,
-                                    kv_valid_len=0,
-                                    q_hbm_offset=q_hbm_offset,
-                                    q_tile_size=tile_len,
-                                    o_hbm_offset=q_hbm_offset,
-                                    kv_page_indices=tuple(page_indices),
-                                ))
-                            lane_lengths[target_lane] += 1
-                            continue
-                        if kv_pages_per_block == 1:
-                            is_first = int(kv_page_seq_idx == 0)
-                            is_last = int(kv_page_seq_idx ==
-                                          effective_kv_pages - 1)
+                            candidate_global_page = (
+                                (last_local_page_start + page_offset) *
+                                pcp_size + candidate_src_rank)
+                            if candidate_global_page < effective_kv_pages:
+                                last_store_src_rank = candidate_src_rank
+
+                for kv_page_seq_idx in range(scheduled_kv_pages):
+                    if kv_pages_per_block == 1:
+                        src_rank = kv_page_seq_idx % pcp_size
+                        local_page_start = kv_page_seq_idx // pcp_size
+                    else:
+                        src_rank = kv_page_seq_idx % pcp_size
+                        local_page_start = (kv_page_seq_idx // pcp_size *
+                                            kv_pages_per_block)
+                    global_page = local_page_start * pcp_size + src_rank
+                    global_token_start = global_page * page_size
+                    valid_tokens = 0
+                    page_indices = []
+                    for page_offset in range(kv_pages_per_block):
+                        page_global = ((local_page_start + page_offset) *
+                                       pcp_size + src_rank)
+                        if page_global < effective_kv_pages:
+                            local_page_index = page_global // pcp_size
+                            if local_page_index >= block_tables.shape[1]:
+                                raise ValueError(
+                                    "block_tables does not cover requested "
+                                    "KV page.")
+                            physical_page = int(block_tables[req_idx,
+                                                             local_page_index])
+                            page_valid = min(
+                                page_size,
+                                kv_len - page_global * page_size,
+                            )
+                            valid_tokens += max(page_valid, 0)
                         else:
-                            cur_block = kv_page_seq_idx // pcp_size
-                            is_first = int(cur_block == 0 and src_rank == 0)
-                            is_last = int(cur_block == last_block and
-                                          src_rank == last_store_src_rank)
+                            physical_page = 0
+                        page_indices.append(physical_page)
+                    if valid_tokens == 0:
                         lane_entries[target_lane].append(
                             _Entry(
-                                req_id=req_idx,
+                                req_id=-1,
                                 kv_page_rank=src_rank,
-                                kv_page_idx=page_indices[0],
-                                is_first_kv=is_first,
-                                is_last_kv=is_last,
-                                load_q=is_first,
+                                kv_page_idx=0,
+                                is_first_kv=0,
+                                is_last_kv=0,
+                                load_q=0,
                                 q_global_start=q_global,
                                 kv_global_start=global_token_start,
-                                kv_valid_len=valid_tokens,
+                                kv_valid_len=0,
                                 q_hbm_offset=q_hbm_offset,
                                 q_tile_size=tile_len,
                                 o_hbm_offset=q_hbm_offset,
                                 kv_page_indices=tuple(page_indices),
                             ))
                         lane_lengths[target_lane] += 1
+                        continue
+                    if kv_pages_per_block == 1:
+                        is_first = int(kv_page_seq_idx == 0)
+                        is_last = int(kv_page_seq_idx == effective_kv_pages - 1)
+                    else:
+                        cur_block = kv_page_seq_idx // pcp_size
+                        is_first = int(cur_block == 0 and src_rank == 0)
+                        is_last = int(cur_block == last_block
+                                      and src_rank == last_store_src_rank)
+                    lane_entries[target_lane].append(
+                        _Entry(
+                            req_id=req_idx,
+                            kv_page_rank=src_rank,
+                            kv_page_idx=page_indices[0],
+                            is_first_kv=is_first,
+                            is_last_kv=is_last,
+                            load_q=is_first,
+                            q_global_start=q_global,
+                            kv_global_start=global_token_start,
+                            kv_valid_len=valid_tokens,
+                            q_hbm_offset=q_hbm_offset,
+                            q_tile_size=tile_len,
+                            o_hbm_offset=q_hbm_offset,
+                            kv_page_indices=tuple(page_indices),
+                        ))
+                    lane_lengths[target_lane] += 1
 
-                    rank_q_offset += tile_len
+                rank_q_offset += tile_len
 
         actual_steps[consumer_rank] = int(lane_lengths.max(initial=0))
         schedules.append(lane_entries)

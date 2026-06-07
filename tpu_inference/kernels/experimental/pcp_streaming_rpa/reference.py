@@ -126,7 +126,11 @@ def execute_pcp_streaming_reference(
                               local_kv_pos % page_size)
 
                 scores = np.einsum("thqd,shd->thqs", q_tile, k) * sm_scale
-                q_pos = q_global_start + np.arange(q_tile_size)
+                q_rows = np.arange(q_tile_size)
+                page_size = kv_cache_by_rank.shape[2]
+                q_pos = (q_global_start +
+                         (q_rows // page_size) * schedule.pcp_size *
+                         page_size + q_rows % page_size)
                 mask = q_pos[:, None] >= kv_pos[None, :]
                 scores = np.where(mask[:, None, None, :], scores, -np.inf)
 

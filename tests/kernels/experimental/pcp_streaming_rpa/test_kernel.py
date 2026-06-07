@@ -725,6 +725,98 @@ def test_page_group_packed_local_kernel_handles_page32_interleave():
                                atol=5e-4)
 
 
+def test_page_group_packed_local_kernel_merges_page32_q_chunks():
+    if jax.local_device_count() < 8:
+        pytest.skip("merged page32 PCP streaming regression requires 8 devices.")
+
+    pcp_size = 8
+    q_tile = 256
+    page_size = 32
+    kv_heads = 1
+    q_per_kv = 1
+    q_len = 2048
+    local_q_len = q_len // pcp_size
+    local_pages = q_len // (pcp_size * page_size)
+    rng = np.random.default_rng(64209)
+    q_by_rank = rng.normal(size=(pcp_size, local_q_len, kv_heads, q_per_kv,
+                                 HEAD_DIM)).astype(np.float32) * 0.1
+    q_global = q_by_rank.reshape(pcp_size * local_q_len, kv_heads, q_per_kv,
+                                 HEAD_DIM)
+    native_kv_np = rng.normal(size=(pcp_size, local_pages, page_size, kv_heads,
+                                    2, HEAD_DIM)).astype(np.float32) * 0.1
+    native_kv = jnp.asarray(native_kv_np, dtype=jnp.bfloat16)
+    native_kv_host = np.asarray(jax.device_get(native_kv))
+    packed_kv = jnp.asarray(_pack_native_kv_cache(native_kv_host, 2),
+                            dtype=jnp.bfloat16)
+    merged_schedule = generate_pcp_streaming_schedule(
+        kv_lens=[q_len],
+        cu_q_lens=[0, q_len],
+        q_start_offsets=[0],
+        block_tables=np.arange(local_pages, dtype=np.int32)[None, :],
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=page_size,
+        num_lanes=1,
+        bq_sz=q_tile,
+        pad_kv_pages_to_pcp_group=True,
+    )
+    unmerged_schedule = generate_pcp_streaming_schedule(
+        kv_lens=[q_len],
+        cu_q_lens=[0, q_len],
+        q_start_offsets=[0],
+        block_tables=np.arange(local_pages, dtype=np.int32)[None, :],
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=page_size,
+        num_lanes=1,
+        bq_sz=page_size,
+        pad_kv_pages_to_pcp_group=True,
+    )
+    assert int(merged_schedule.global_actual_steps[0]) < int(
+        unmerged_schedule.global_actual_steps[0])
+    assert np.max(merged_schedule.q_tile_size) == q_tile
+
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    mesh = jax.sharding.Mesh(jax.local_devices()[:pcp_size], (AXIS, ))
+
+    def _call(q_local, kv_cache_local, packed_schedule):
+        return pcp_streaming_attention_page_groups_packed_local(
+            q_local,
+            kv_cache_local[0],
+            packed_schedule,
+            pcp_size=pcp_size,
+            q_block_size=q_tile,
+            sm_scale=sm_scale,
+            collective_id=27,
+        )
+
+    fn = jax.jit(
+        jax.shard_map(
+            _call,
+            mesh=mesh,
+            in_specs=(
+                P(AXIS, None, None, None),
+                P(AXIS, None, None, None, None, None),
+                P(None, None, None, None),
+            ),
+            out_specs=P(AXIS, None, None, None),
+            check_vma=False,
+        ))
+    out = fn(jnp.asarray(q_global, dtype=jnp.bfloat16), packed_kv,
+             jnp.asarray(merged_schedule.packed_schedule))
+    out.block_until_ready()
+
+    expected = execute_pcp_streaming_reference(q_by_rank,
+                                               native_kv_host,
+                                               merged_schedule,
+                                               sm_scale=sm_scale)
+    expected = expected.reshape(q_global.shape)
+    np.testing.assert_allclose(np.asarray(jax.device_get(out)),
+                               expected,
+                               rtol=5e-3,
+                               atol=5e-4)
+
+
 def test_page_group_packed_local_kernel_handles_kv_page_blocks():
     if jax.local_device_count() < 8:
         pytest.skip("KV page block PCP streaming regression requires 8 devices.")

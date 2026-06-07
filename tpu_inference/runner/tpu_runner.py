@@ -51,7 +51,8 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    ScheduleField, generate_pcp_streaming_schedule)
+    ScheduleField, _iter_pcp_q_tiles, _q_global_last_for_strided_tile,
+    generate_pcp_streaming_schedule)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.pcp_layout import (
     apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order,
@@ -527,22 +528,25 @@ def _estimate_pcp_streaming_schedule_steps_ub(
             if q_len <= 0:
                 continue
             q_global_base = max(0, capacity_tokens - q_len)
-            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
-                    q_len, q_global_base, consumer_rank, pcp_size,
-                    interleave_size):
-                chunk_len = chunk_end - chunk_start
-                num_tiles = cdiv(chunk_len, q_block_size)
-                for tile_idx in range(num_tiles):
-                    tile_start = tile_idx * q_block_size
-                    tile_len = min(q_block_size, chunk_len - tile_start)
-                    q_global_last = chunk_start + tile_start + tile_len - 1
-                    effective_pages = min(max_global_pages,
-                                          q_global_last // block_size + 1)
-                    scheduled_pages = (
-                        cdiv(effective_pages,
-                             pcp_size * kv_pages_per_block) * pcp_size)
-                    target_lane = int(np.argmin(lane_lengths))
-                    lane_lengths[target_lane] += scheduled_pages
+            for q_global, tile_len in _iter_pcp_q_tiles(
+                    q_len,
+                    q_global_base,
+                    consumer_rank,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size,
+                    bq_sz=q_block_size):
+                q_global_last = _q_global_last_for_strided_tile(
+                    q_global,
+                    tile_len,
+                    pcp_size=pcp_size,
+                    interleave_size=interleave_size)
+                effective_pages = min(max_global_pages,
+                                      q_global_last // block_size + 1)
+                scheduled_pages = (
+                    cdiv(effective_pages,
+                         pcp_size * kv_pages_per_block) * pcp_size)
+                target_lane = int(np.argmin(lane_lengths))
+                lane_lengths[target_lane] += scheduled_pages
         max_steps = max(max_steps, int(lane_lengths.max(initial=0)))
     return max_steps
 
@@ -2627,10 +2631,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if (use_pcp or use_pcp_decode) and block_table_views_by_gid:
             build_pcp_streaming_schedule = envs.USE_PCP_STREAMING_RPA_KERNEL
             pcp_streaming_num_lanes = envs.PCP_STREAMING_RPA_NUM_LANES
-            pcp_streaming_q_block_size = min(
-                envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE,
-                cp_kv_cache_interleave_size,
-            )
+            pcp_streaming_q_block_size = envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE
             pcp_streaming_kv_pages_per_block = max(
                 1,
                 min(
