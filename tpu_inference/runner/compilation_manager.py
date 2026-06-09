@@ -34,7 +34,8 @@ from tpu_inference.models.jax.jax_intermediate_tensor import \
 from tpu_inference.runner.utils import SpecDecodeMetadata
 from tpu_inference.spec_decode.jax.utils import (
     concat_last_sampled_tokens_and_draft_tokens, extract_last_sampled_tokens)
-from tpu_inference.utils import device_array, to_jax_dtype
+from tpu_inference.utils import (device_array, get_mesh_shape_product,
+                                 to_jax_dtype)
 
 if TYPE_CHECKING:
     from tpu_inference.runner.tpu_runner import TPUModelRunner
@@ -294,6 +295,7 @@ class CompilationManager:
             from tpu_inference.runner.tpu_runner import (  # pylint: disable=import-outside-toplevel
                 _build_pcp_attention_metadata,
                 _build_pcp_rank_major_token_order,
+                _get_local_kv_cache_num_blocks,
                 _merge_pcp_attention_metadata,
             )
             from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (  # pylint: disable=import-outside-toplevel
@@ -332,6 +334,11 @@ class CompilationManager:
                     self.runner.block_size,
                 ),
             )
+            local_kv_cache_num_blocks = _get_local_kv_cache_num_blocks(
+                self.runner.kv_cache_config.num_blocks,
+                get_mesh_shape_product(self.runner.mesh,
+                                       ShardingAxisName.KV_CACHE_BLOCK),
+            )
 
             for gid, block_tables in host_block_tables_by_gid.items():
                 metadata_per_dp = []
@@ -348,6 +355,7 @@ class CompilationManager:
                             padded_num_tokens_per_dp,
                             max_num_reqs_per_dp_rank,
                             self.runner.block_size,
+                            local_kv_cache_num_blocks,
                             build_streaming_schedule=True,
                             streaming_num_lanes=(
                                 envs.PCP_STREAMING_RPA_NUM_LANES),

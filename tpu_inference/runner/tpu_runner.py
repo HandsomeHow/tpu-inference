@@ -439,6 +439,41 @@ class _PCPAttentionMetadataHost:
     streaming_active_page_groups: np.ndarray | None = None
 
 
+def _localize_pcp_block_tables(
+    block_tables: np.ndarray,
+    local_kv_cache_num_blocks: int,
+) -> np.ndarray:
+    """Map scheduler global block ids to this shard's PCP-local page ids."""
+    local_kv_cache_num_blocks = int(local_kv_cache_num_blocks)
+    if local_kv_cache_num_blocks <= 0:
+        raise ValueError(
+            "PCP metadata requires local_kv_cache_num_blocks > 0.")
+
+    local_block_tables = block_tables.copy()
+    valid = local_block_tables >= 0
+    local_block_tables[valid] %= local_kv_cache_num_blocks
+    return local_block_tables.astype(np.int32)
+
+
+def _get_local_kv_cache_num_blocks(
+    kv_cache_num_blocks: int,
+    kv_cache_block_shard_count: int,
+) -> int:
+    kv_cache_num_blocks = int(kv_cache_num_blocks)
+    kv_cache_block_shard_count = int(kv_cache_block_shard_count)
+    if kv_cache_num_blocks <= 0:
+        raise ValueError("PCP metadata requires kv_cache_num_blocks > 0.")
+    if kv_cache_block_shard_count <= 0:
+        raise ValueError(
+            "PCP metadata requires kv_cache_block_shard_count > 0.")
+    if kv_cache_num_blocks % kv_cache_block_shard_count != 0:
+        raise ValueError(
+            "PCP metadata requires kv_cache_num_blocks to be divisible by "
+            "kv_cache_block_shard_count: "
+            f"{kv_cache_num_blocks=} {kv_cache_block_shard_count=}.")
+    return kv_cache_num_blocks // kv_cache_block_shard_count
+
+
 def _build_pcp_local_slot_ids(
     q_lens: np.ndarray,
     seq_lens: np.ndarray,
@@ -467,6 +502,7 @@ def _build_pcp_decode_attention_metadata(
     interleave_size: int,
     padded_num_tokens: int,
     max_num_reqs_per_dp_rank: int,
+    local_kv_cache_num_blocks: int,
     num_scheduled_tokens_per_req: list[int] | np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Build runner-owned replicated-Q/local-KV metadata for PCP materialize."""
@@ -528,7 +564,11 @@ def _build_pcp_decode_attention_metadata(
             f"block_size={int(block_size)}, "
             f"block_tables_shape={tuple(block_tables.shape)}.")
     virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
-    source_block_tables = block_tables[:, :virtual_blocks_per_req]
+    local_block_tables = _localize_pcp_block_tables(
+        block_tables,
+        local_kv_cache_num_blocks,
+    )
+    source_block_tables = local_block_tables[:, :virtual_blocks_per_req]
 
     rank_slot_ids = []
     virtual_block_size = block_size * pcp_size
@@ -552,7 +592,7 @@ def _build_pcp_decode_attention_metadata(
                     (virtual_offset //
                      (pcp_size * interleave_size)) * interleave_size +
                     (virtual_offset % interleave_size))
-                block_number = block_tables[req_idx, block_index]
+                block_number = local_block_tables[req_idx, block_index]
                 rank_slots[dst_index] = np.int32(block_number * block_size +
                                                  local_offset)
             token_offset += q_len
@@ -573,6 +613,7 @@ def _build_pcp_attention_metadata(
     padded_num_tokens: int,
     max_num_reqs_per_dp_rank: int,
     block_size: int,
+    local_kv_cache_num_blocks: int,
     build_streaming_schedule: bool = False,
     streaming_num_lanes: int = 1,
     streaming_q_block_size: int = 256,
@@ -619,6 +660,10 @@ def _build_pcp_attention_metadata(
         raise ValueError("block_tables must be rank 1 or 2.")
 
     q_global_base = kv_lens_full - q_lens_full
+    local_block_tables = _localize_pcp_block_tables(
+        block_tables,
+        local_kv_cache_num_blocks,
+    )
 
     streaming_schedule = None
     streaming_active_page_groups = None
@@ -629,7 +674,7 @@ def _build_pcp_attention_metadata(
             q_block_size=streaming_q_block_size,
         )
         virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
-        source_block_tables = block_tables[:, :virtual_blocks_per_req]
+        source_block_tables = local_block_tables[:, :virtual_blocks_per_req]
         max_streaming_steps = estimate_pcp_streaming_schedule_steps_ub(
             q_lens_full,
             capacity_tokens=virtual_blocks_per_req * pcp_size * block_size,
@@ -663,7 +708,7 @@ def _build_pcp_attention_metadata(
         slot_ids=_build_pcp_local_slot_ids(
             q_lens_full,
             kv_lens_full,
-            block_tables,
+            local_block_tables,
             block_size,
             pcp_size,
             interleave_size,
@@ -2469,6 +2514,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE // self.block_size,
                 ),
             )
+            local_kv_cache_num_blocks = _get_local_kv_cache_num_blocks(
+                self.kv_cache_config.num_blocks,
+                common_utils.get_mesh_shape_product(
+                    self.mesh, ShardingAxisName.KV_CACHE_BLOCK),
+            )
             for gid, block_tables_view in block_table_views_by_gid.items():
                 kv_cache_group = self.kv_cache_config.kv_cache_groups[gid]
                 if not _kv_cache_group_supports_pcp_attention_metadata(
@@ -2491,6 +2541,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 padded_num_scheduled_tokens_per_dp_rank,
                                 max_num_reqs_per_dp_rank,
                                 self.block_size,
+                                local_kv_cache_num_blocks,
                                 build_streaming_schedule=(
                                     build_pcp_streaming_schedule),
                                 streaming_num_lanes=pcp_streaming_num_lanes,
@@ -2539,6 +2590,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                 cp_kv_cache_interleave_size,
                                 padded_num_scheduled_tokens_per_dp_rank,
                                 max_num_reqs_per_dp_rank,
+                                local_kv_cache_num_blocks,
                                 scheduled_tokens_per_dp_rank[dp_rank],
                             ))
                     host_slot_ids = np.concatenate(

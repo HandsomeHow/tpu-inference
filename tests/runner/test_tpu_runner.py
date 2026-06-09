@@ -44,6 +44,8 @@ from tpu_inference.runner.tpu_runner import (TPUModelRunner,
                                              _logits_indices_require_global_gather,
                                              _pcp_local_token_counts)
 
+TEST_LOCAL_KV_CACHE_NUM_BLOCKS = 10000
+
 
 def _build_expected_pcp_local_slot_ids(
     q_lens: np.ndarray,
@@ -84,6 +86,56 @@ def _build_expected_pcp_local_slot_ids(
                 rank_offsets[pcp_rank] += local_slots.shape[0]
 
     return slot_ids
+
+
+def _max_active_pcp_streaming_page_id(packed_schedule: np.ndarray,
+                                      kv_pages_per_block: int) -> int:
+    req_id = unpack_pcp_streaming_schedule_field(packed_schedule,
+                                                 ScheduleField.REQ_ID)
+    active = np.transpose(req_id != -1, (1, 0, 2))
+    if not np.any(active):
+        return -1
+    if kv_pages_per_block == 1:
+        page_idx = unpack_pcp_streaming_schedule_field(
+            packed_schedule, ScheduleField.KV_PAGE_IDX)
+        return int(page_idx[req_id != -1].max())
+    start = ScheduleField.KV_PAGE_INDICES_START
+    page_indices = packed_schedule[..., start:start + kv_pages_per_block]
+    return int(page_indices[active].max())
+
+
+def _build_qwen397b_pcp_streaming_metadata_after_warmup(
+        warmup_tokens: int,
+        request_seq_len: int,
+        *,
+        max_model_len: int = 263168):
+    pcp_size = 8
+    block_size = 32
+    q_chunk_tokens = 4096
+    max_reqs_per_dp_rank = 8
+    local_kv_blocks = 9704 // pcp_size
+    pages_per_seq = (max_model_len + block_size - 1) // block_size
+    warmup_virtual_blocks = warmup_tokens // (block_size * pcp_size)
+    block_tables = np.zeros((max_reqs_per_dp_rank, pages_per_seq),
+                            dtype=np.int32)
+    block_tables[0] = np.arange(warmup_virtual_blocks,
+                                warmup_virtual_blocks + pages_per_seq,
+                                dtype=np.int32)
+    return _build_pcp_attention_metadata(
+        num_scheduled_tokens_per_req=[q_chunk_tokens],
+        seq_lens_per_req=[request_seq_len],
+        block_tables=block_tables,
+        pcp_size=pcp_size,
+        interleave_size=block_size,
+        padded_num_tokens=q_chunk_tokens,
+        max_num_reqs_per_dp_rank=max_reqs_per_dp_rank,
+        block_size=block_size,
+        local_kv_cache_num_blocks=local_kv_blocks,
+        build_streaming_schedule=True,
+        streaming_num_lanes=1,
+        streaming_q_block_size=256,
+        streaming_kv_pages_per_block=8,
+    )
 
 
 class TestPCPTokenPacking:
@@ -211,6 +263,7 @@ class TestPCPTokenPacking:
             padded_num_tokens=8,
             max_num_reqs_per_dp_rank=1,
             block_size=2,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
         )
 
         np.testing.assert_array_equal(
@@ -229,6 +282,7 @@ class TestPCPTokenPacking:
             padded_num_tokens=8,
             max_num_reqs_per_dp_rank=1,
             block_size=4,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
             build_streaming_schedule=True,
             streaming_num_lanes=1,
             streaming_q_block_size=4,
@@ -260,6 +314,7 @@ class TestPCPTokenPacking:
             padded_num_tokens=4096,
             max_num_reqs_per_dp_rank=8,
             block_size=32,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
             build_streaming_schedule=True,
             streaming_num_lanes=1,
             streaming_q_block_size=32,
@@ -273,6 +328,7 @@ class TestPCPTokenPacking:
             padded_num_tokens=4096,
             max_num_reqs_per_dp_rank=8,
             block_size=32,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
             build_streaming_schedule=True,
             streaming_num_lanes=1,
             streaming_q_block_size=32,
@@ -287,6 +343,39 @@ class TestPCPTokenPacking:
         assert (second_chunk.streaming_active_page_groups[0] <
                 second_chunk.streaming_schedule.shape[0] // 8)
 
+    def test_build_attention_metadata_streaming_schedule_stays_local_after_32k_warmup(
+            self):
+        local_kv_blocks = 9704 // 8
+        metadata = (
+            _build_qwen397b_pcp_streaming_metadata_after_warmup(
+                warmup_tokens=32 * 1024,
+                request_seq_len=256 * 1024,
+            ))
+
+        assert metadata.streaming_schedule is not None
+        assert (_max_active_pcp_streaming_page_id(
+            metadata.streaming_schedule,
+            kv_pages_per_block=8,
+        ) < local_kv_blocks)
+        valid_slot_ids = metadata.slot_ids[metadata.slot_ids >= 0]
+        assert int((valid_slot_ids // 32).max()) < local_kv_blocks
+
+    def test_build_attention_metadata_streaming_schedule_uses_local_kv_blocks_after_256k_warmup(
+            self):
+        local_kv_blocks = 9704 // 8
+        metadata = (
+            _build_qwen397b_pcp_streaming_metadata_after_warmup(
+                warmup_tokens=256 * 1024,
+                request_seq_len=12 * 4096,
+            ))
+        assert metadata.streaming_schedule is not None
+        assert (_max_active_pcp_streaming_page_id(
+            metadata.streaming_schedule,
+            kv_pages_per_block=8,
+        ) < local_kv_blocks)
+        valid_slot_ids = metadata.slot_ids[metadata.slot_ids >= 0]
+        assert int((valid_slot_ids // 32).max()) < local_kv_blocks
+
     def test_build_attention_metadata_chunked_prefill_continuation(self):
         metadata = _build_pcp_attention_metadata(
             num_scheduled_tokens_per_req=[4],
@@ -297,6 +386,7 @@ class TestPCPTokenPacking:
             padded_num_tokens=4,
             max_num_reqs_per_dp_rank=1,
             block_size=2,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
         )
 
         np.testing.assert_array_equal(metadata.slot_ids,
@@ -315,6 +405,7 @@ class TestPCPTokenPacking:
                 padded_num_tokens=16,
                 max_num_reqs_per_dp_rank=1,
                 block_size=8,
+                local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
             )
 
     def test_build_pcp_local_slot_ids_vectorized_matches_reference_for_64_chunks(
@@ -357,6 +448,7 @@ class TestPCPTokenPacking:
                 padded_num_tokens=4,
                 max_num_reqs_per_dp_rank=1,
                 block_size=4,
+                local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
             )
 
     def test_build_pcp_decode_attention_metadata(self):
@@ -368,6 +460,7 @@ class TestPCPTokenPacking:
             interleave_size=2,
             padded_num_tokens=4,
             max_num_reqs_per_dp_rank=2,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
         )
 
         np.testing.assert_array_equal(
@@ -388,6 +481,7 @@ class TestPCPTokenPacking:
             interleave_size=4,
             padded_num_tokens=8,
             max_num_reqs_per_dp_rank=1,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
             num_scheduled_tokens_per_req=[4],
         )
 
@@ -401,6 +495,27 @@ class TestPCPTokenPacking:
                       -1, -1, -1],
                      dtype=np.int32),
         )
+
+    def test_build_pcp_decode_attention_metadata_uses_local_kv_blocks(self):
+        metadata = _build_pcp_decode_attention_metadata(
+            seq_lens_per_req=[5],
+            block_tables=np.array([[1215, 1216]], dtype=np.int32),
+            block_size=32,
+            pcp_size=8,
+            interleave_size=32,
+            padded_num_tokens=8,
+            max_num_reqs_per_dp_rank=1,
+            local_kv_cache_num_blocks=1213,
+        )
+
+        np.testing.assert_array_equal(
+            metadata["source_block_tables"],
+            np.array([[2]], dtype=np.int32),
+        )
+        expected_slot_ids = np.full(64, -1, dtype=np.int32)
+        expected_slot_ids[0] = 2 * 32 + 4
+        np.testing.assert_array_equal(metadata["slot_ids"],
+                                      expected_slot_ids)
 
     def test_build_pcp_decode_attention_metadata_pcp8_nonzero_owner_rank(self):
         block_tables = np.array(
@@ -425,6 +540,7 @@ class TestPCPTokenPacking:
             interleave_size=4,
             padded_num_tokens=8,
             max_num_reqs_per_dp_rank=4,
+            local_kv_cache_num_blocks=TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
         )
 
         np.testing.assert_array_equal(
@@ -466,6 +582,7 @@ class TestPCPTokenPacking:
             "interleave_size": 4,
             "padded_num_tokens": 4,
             "max_num_reqs_per_dp_rank": 1,
+            "local_kv_cache_num_blocks": TEST_LOCAL_KV_CACHE_NUM_BLOCKS,
         }
         args.update(kwargs)
 
