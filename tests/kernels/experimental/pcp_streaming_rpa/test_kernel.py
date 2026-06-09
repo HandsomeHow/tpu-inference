@@ -27,8 +27,9 @@ from tpu_inference.kernels.experimental.pcp_streaming_rpa.kernel import (
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.reference import (
     execute_pcp_streaming_reference)
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    PcpStreamingSchedule, generate_pcp_streaming_schedule,
-    pack_pcp_streaming_schedule_fields)
+    PcpStreamingSchedule, pack_pcp_streaming_schedule_fields)
+from tests.kernels.experimental.pcp_streaming_rpa.schedule_reference import (
+    generate_pcp_streaming_schedule_reference as generate_pcp_streaming_schedule)
 
 PCP_SIZE = 4
 Q_TILE = 8

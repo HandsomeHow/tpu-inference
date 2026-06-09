@@ -25,6 +25,7 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.pcp_layout import pcp_query_chunk_ranges
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField, unpack_pcp_streaming_schedule_field)
 from tpu_inference.models.common.interface import (ModelInterface,
@@ -36,11 +37,53 @@ from tpu_inference.runner.tpu_runner import (TPUModelRunner,
                                              _batch_uses_pcp_prefill,
                                              _build_pcp_decode_attention_metadata,
                                              _build_pcp_attention_metadata,
+                                             _build_pcp_local_slot_ids,
                                              _build_pcp_logits_indices,
                                              _build_pcp_rank_major_token_order,
                                              _kv_cache_group_supports_pcp_attention_metadata,
                                              _logits_indices_require_global_gather,
                                              _pcp_local_token_counts)
+
+
+def _build_expected_pcp_local_slot_ids(
+    q_lens: np.ndarray,
+    seq_lens: np.ndarray,
+    block_tables: np.ndarray,
+    block_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    padded_num_tokens: int,
+) -> np.ndarray:
+    local_padded_num_tokens = padded_num_tokens // pcp_size
+    slot_ids = np.full(padded_num_tokens, -1, dtype=np.int32)
+    rank_offsets = np.zeros(pcp_size, dtype=np.int64)
+    virtual_block_size = block_size * pcp_size
+
+    for req_idx, q_len in enumerate(q_lens):
+        q_len = int(q_len)
+        q_global_base = int(seq_lens[req_idx]) - q_len
+        for pcp_rank in range(pcp_size):
+            for chunk_start, chunk_end in pcp_query_chunk_ranges(
+                    q_len, q_global_base, pcp_rank, pcp_size,
+                    interleave_size):
+                positions = np.arange(chunk_start, chunk_end, dtype=np.int64)
+                block_indices = positions // virtual_block_size
+                virtual_offsets = positions - block_indices * virtual_block_size
+                local_offsets = (
+                    (virtual_offsets //
+                     (pcp_size * interleave_size)) * interleave_size +
+                    (virtual_offsets % interleave_size))
+                block_numbers = block_tables[req_idx,
+                                             block_indices].astype(np.int32)
+                local_slots = (block_numbers * block_size +
+                               local_offsets).astype(np.int32)
+                dst_start = (pcp_rank * local_padded_num_tokens +
+                             rank_offsets[pcp_rank])
+                dst_end = dst_start + local_slots.shape[0]
+                slot_ids[dst_start:dst_end] = local_slots
+                rank_offsets[pcp_rank] += local_slots.shape[0]
+
+    return slot_ids
 
 
 class TestPCPTokenPacking:
@@ -167,12 +210,12 @@ class TestPCPTokenPacking:
             interleave_size=2,
             padded_num_tokens=8,
             max_num_reqs_per_dp_rank=1,
-            block_size=4,
+            block_size=2,
         )
 
         np.testing.assert_array_equal(
             metadata.slot_ids,
-            np.array([28, 29, 30, 31, 28, 29, 30, 31], dtype=np.int32))
+            np.array([14, 15, 16, 17, 14, 15, 16, 17], dtype=np.int32))
         assert metadata.streaming_schedule is None
         assert metadata.streaming_active_page_groups is None
 
@@ -188,14 +231,14 @@ class TestPCPTokenPacking:
             block_size=4,
             build_streaming_schedule=True,
             streaming_num_lanes=1,
-            streaming_q_block_size=2,
+            streaming_q_block_size=4,
         )
 
         schedule = metadata.streaming_schedule
         assert schedule is not None
-        assert schedule.shape == (4, 2, 1, ScheduleField.PACKED_NUM_FIELDS)
+        assert schedule.shape == (2, 2, 1, ScheduleField.PACKED_NUM_FIELDS)
         np.testing.assert_array_equal(metadata.streaming_active_page_groups,
-                                      np.array([2], dtype=np.int32))
+                                      np.array([1], dtype=np.int32))
         req_id = unpack_pcp_streaming_schedule_field(schedule,
                                                      ScheduleField.REQ_ID)
         kv_page_idx = unpack_pcp_streaming_schedule_field(
@@ -253,32 +296,55 @@ class TestPCPTokenPacking:
             interleave_size=2,
             padded_num_tokens=4,
             max_num_reqs_per_dp_rank=1,
-            block_size=4,
+            block_size=2,
         )
 
         np.testing.assert_array_equal(metadata.slot_ids,
-                                      np.array([32, 33, 32, 33],
+                                      np.array([18, 19, 18, 19],
                                                dtype=np.int32))
 
-    def test_build_attention_metadata_pads_empty_pcp_rank_slot_ids(self):
-        metadata = _build_pcp_attention_metadata(
-            num_scheduled_tokens_per_req=[4],
-            seq_lens_per_req=[12],
-            block_tables=np.array([[7, 8, 9]], dtype=np.int32),
-            pcp_size=2,
-            interleave_size=4,
-            padded_num_tokens=16,
-            max_num_reqs_per_dp_rank=1,
-            block_size=8,
-        )
+    def test_build_attention_metadata_rejects_unsupported_pcp_slot_shape(self):
+        with pytest.raises(NotImplementedError,
+                           match="block_size == interleave_size"):
+            _build_pcp_attention_metadata(
+                num_scheduled_tokens_per_req=[4],
+                seq_lens_per_req=[12],
+                block_tables=np.array([[7, 8, 9]], dtype=np.int32),
+                pcp_size=2,
+                interleave_size=4,
+                padded_num_tokens=16,
+                max_num_reqs_per_dp_rank=1,
+                block_size=8,
+            )
 
-        local_padded_tokens = 8
-        np.testing.assert_array_equal(
-            metadata.slot_ids[:local_padded_tokens],
-            np.array([60, 61, 62, 63, -1, -1, -1, -1], dtype=np.int32))
-        np.testing.assert_array_equal(
-            metadata.slot_ids[local_padded_tokens:],
-            np.full(local_padded_tokens, -1, dtype=np.int32))
+    def test_build_pcp_local_slot_ids_vectorized_matches_reference_for_64_chunks(
+            self):
+        q_lens = np.zeros(8, dtype=np.int32)
+        seq_lens = np.zeros(8, dtype=np.int32)
+        q_lens[0] = 4096
+        block_tables = np.tile(np.arange(8224, dtype=np.int32), (8, 1))
+
+        for chunk_idx in range(64):
+            seq_lens[0] = (chunk_idx + 1) * 4096
+            actual = _build_pcp_local_slot_ids(
+                q_lens,
+                seq_lens,
+                block_tables,
+                block_size=32,
+                pcp_size=8,
+                interleave_size=32,
+                padded_num_tokens=4096,
+            )
+            expected = _build_expected_pcp_local_slot_ids(
+                q_lens,
+                seq_lens,
+                block_tables,
+                block_size=32,
+                pcp_size=8,
+                interleave_size=32,
+                padded_num_tokens=4096,
+            )
+            np.testing.assert_array_equal(actual, expected)
 
     def test_build_attention_metadata_rejects_invalid_seq_lens(self):
         with pytest.raises(ValueError, match="seq_lens_per_req"):

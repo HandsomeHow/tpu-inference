@@ -51,15 +51,16 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    ScheduleField, _iter_pcp_q_tiles, _q_global_last_for_strided_tile,
-    generate_pcp_streaming_schedule)
+    ScheduleField, build_pcp_streaming_active_page_groups,
+    build_pcp_streaming_local_slot_ids,
+    estimate_pcp_streaming_schedule_steps_ub, generate_pcp_streaming_schedule,
+    validate_pcp_streaming_local_padded_tokens)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.pcp_layout import (
     apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order,
     build_pcp_logits_indices as _build_pcp_logits_indices,
     build_pcp_rank_major_token_order as _build_pcp_rank_major_token_order,
     pcp_local_token_counts as _pcp_local_token_counts,
-    pcp_query_chunk_ranges as _pcp_query_chunk_ranges,
     pcp_query_start_offsets as _pcp_query_start_offsets,
 )
 from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
@@ -447,95 +448,15 @@ def _build_pcp_local_slot_ids(
     interleave_size: int,
     padded_num_tokens: int,
 ) -> np.ndarray:
-    """Build rank-major local cache slot ids for PCP prefill K/V writes."""
-    if block_size <= 0:
-        raise ValueError(f"Expected positive block_size, got {block_size}.")
-    local_padded_num_tokens = padded_num_tokens // pcp_size
-    slot_ids = np.full(padded_num_tokens, -1, dtype=np.int32)
-    rank_offsets = np.zeros(pcp_size, dtype=np.int64)
-    virtual_block_size = block_size * pcp_size
-
-    for req_idx, q_len in enumerate(q_lens):
-        q_len = int(q_len)
-        seq_len = int(seq_lens[req_idx])
-        q_global_base = seq_len - q_len
-        if q_global_base < 0:
-            raise ValueError("seq_lens_per_req must be >= "
-                             "num_scheduled_tokens_per_req.")
-        for pcp_rank in range(pcp_size):
-            for chunk_start, chunk_end in _pcp_query_chunk_ranges(
-                    q_len, q_global_base, pcp_rank, pcp_size,
-                    interleave_size):
-                positions = np.arange(chunk_start, chunk_end, dtype=np.int64)
-                block_indices = positions // virtual_block_size
-                virtual_offsets = positions - block_indices * virtual_block_size
-                is_local = ((virtual_offsets // interleave_size) %
-                            pcp_size) == pcp_rank
-                if not np.all(is_local):
-                    raise ValueError("PCP slot mapping produced a non-local "
-                                     "token for its packed rank.")
-                local_offsets = (
-                    (virtual_offsets //
-                     (pcp_size * interleave_size)) * interleave_size +
-                    (virtual_offsets % interleave_size))
-                block_numbers = block_tables[req_idx,
-                                             block_indices].astype(np.int32)
-                local_slots = (block_numbers * block_size +
-                               local_offsets).astype(np.int32)
-
-                dst_start = (pcp_rank * local_padded_num_tokens +
-                             rank_offsets[pcp_rank])
-                dst_end = dst_start + local_slots.shape[0]
-                if dst_end > (pcp_rank + 1) * local_padded_num_tokens:
-                    raise ValueError(
-                        "PCP local slot count exceeds padded local capacity.")
-                slot_ids[dst_start:dst_end] = local_slots
-                rank_offsets[pcp_rank] += local_slots.shape[0]
-
-    return slot_ids
-
-
-def _estimate_pcp_streaming_schedule_steps_ub(
-    q_lens: np.ndarray,
-    capacity_tokens: int,
-    block_size: int,
-    pcp_size: int,
-    interleave_size: int,
-    num_lanes: int,
-    q_block_size: int,
-    kv_pages_per_block: int = 1,
-) -> int:
-    max_global_pages = cdiv(capacity_tokens, block_size)
-    kv_pages_per_block = max(1, int(kv_pages_per_block))
-    max_steps = 0
-    for consumer_rank in range(pcp_size):
-        lane_lengths = np.zeros(num_lanes, dtype=np.int64)
-        for q_len in q_lens:
-            q_len = int(q_len)
-            if q_len <= 0:
-                continue
-            q_global_base = max(0, capacity_tokens - q_len)
-            for q_global, tile_len in _iter_pcp_q_tiles(
-                    q_len,
-                    q_global_base,
-                    consumer_rank,
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size,
-                    bq_sz=q_block_size):
-                q_global_last = _q_global_last_for_strided_tile(
-                    q_global,
-                    tile_len,
-                    pcp_size=pcp_size,
-                    interleave_size=interleave_size)
-                effective_pages = min(max_global_pages,
-                                      q_global_last // block_size + 1)
-                scheduled_pages = (
-                    cdiv(effective_pages,
-                         pcp_size * kv_pages_per_block) * pcp_size)
-                target_lane = int(np.argmin(lane_lengths))
-                lane_lengths[target_lane] += scheduled_pages
-        max_steps = max(max_steps, int(lane_lengths.max(initial=0)))
-    return max_steps
+    return build_pcp_streaming_local_slot_ids(
+        q_lens=q_lens,
+        seq_lens=seq_lens,
+        block_tables=block_tables,
+        block_size=block_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        padded_num_tokens=padded_num_tokens,
+    )
 
 
 def _build_pcp_decode_attention_metadata(
@@ -702,15 +623,14 @@ def _build_pcp_attention_metadata(
     streaming_schedule = None
     streaming_active_page_groups = None
     if build_streaming_schedule:
-        local_padded_num_tokens = padded_num_tokens // pcp_size
-        if local_padded_num_tokens % streaming_q_block_size != 0:
-            raise ValueError(
-                "PCP streaming schedule requires local padded tokens to be a "
-                "multiple of streaming_q_block_size: got "
-                f"{local_padded_num_tokens=} and {streaming_q_block_size=}.")
+        validate_pcp_streaming_local_padded_tokens(
+            padded_num_tokens=padded_num_tokens,
+            pcp_size=pcp_size,
+            q_block_size=streaming_q_block_size,
+        )
         virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
         source_block_tables = block_tables[:, :virtual_blocks_per_req]
-        max_streaming_steps = _estimate_pcp_streaming_schedule_steps_ub(
+        max_streaming_steps = estimate_pcp_streaming_schedule_steps_ub(
             q_lens_full,
             capacity_tokens=virtual_blocks_per_req * pcp_size * block_size,
             block_size=block_size,
@@ -735,13 +655,9 @@ def _build_pcp_attention_metadata(
             pad_steps_to=max_streaming_steps,
             kv_pages_per_block=streaming_kv_pages_per_block,
         )
-        actual_steps = int(streaming_schedule_host.global_actual_steps[0])
-        if actual_steps % pcp_size != 0:
-            raise ValueError("PCP streaming schedule steps must be padded to a "
-                             "PCP page group.")
         streaming_schedule = streaming_schedule_host.packed_schedule
-        streaming_active_page_groups = np.array([actual_steps // pcp_size],
-                                                dtype=np.int32)
+        streaming_active_page_groups = build_pcp_streaming_active_page_groups(
+            streaming_schedule_host)
 
     return _PCPAttentionMetadataHost(
         slot_ids=_build_pcp_local_slot_ids(

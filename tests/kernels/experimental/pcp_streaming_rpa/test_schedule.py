@@ -18,12 +18,30 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    ScheduleField, generate_pcp_streaming_schedule,
-    unpack_pcp_streaming_schedule_field, validate_pcp_streaming_schedule)
+    PcpStreamingSchedule, ScheduleField,
+    build_pcp_streaming_active_page_groups,
+    generate_pcp_streaming_schedule, unpack_pcp_streaming_schedule_field,
+    validate_pcp_streaming_schedule)
+from tests.kernels.experimental.pcp_streaming_rpa.schedule_reference import (
+    generate_pcp_streaming_schedule_reference)
+
+
+def _assert_schedule_equal(actual: PcpStreamingSchedule,
+                           expected: PcpStreamingSchedule):
+    for field in dataclasses.fields(PcpStreamingSchedule):
+        name = field.name
+        actual_value = getattr(actual, name)
+        expected_value = getattr(expected, name)
+        if actual_value is None or expected_value is None:
+            assert actual_value is expected_value
+        else:
+            np.testing.assert_array_equal(actual_value,
+                                          expected_value,
+                                          err_msg=name)
 
 
 def test_generate_schedule_uses_interleave_q_ownership_and_page_mapping():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12],
         cu_q_lens=[0, 7],
         q_start_offsets=[5],
@@ -63,7 +81,7 @@ def test_generate_schedule_uses_interleave_q_ownership_and_page_mapping():
 
 
 def test_schedule_q_offsets_follow_rank_major_packed_order_across_requests():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12, 3],
         cu_q_lens=[0, 7, 10],
         q_start_offsets=[5, 0],
@@ -88,7 +106,7 @@ def test_schedule_q_offsets_follow_rank_major_packed_order_across_requests():
 
 
 def test_validate_schedule_lane_invariant_accepts_generated_schedule():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[16],
         cu_q_lens=[0, 16],
         q_start_offsets=[0],
@@ -104,7 +122,7 @@ def test_validate_schedule_lane_invariant_accepts_generated_schedule():
 
 
 def test_generate_schedule_can_pad_kv_pages_to_pcp_groups():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[10],
         cu_q_lens=[0, 2],
         q_start_offsets=[8],
@@ -138,8 +156,48 @@ def test_generate_schedule_can_pad_kv_pages_to_pcp_groups():
     validate_pcp_streaming_schedule(schedule)
 
 
-def test_generate_schedule_can_pad_steps_without_changing_actual_steps():
+def test_build_active_page_groups_from_padded_schedule():
     schedule = generate_pcp_streaming_schedule(
+        kv_lens=[8],
+        cu_q_lens=[0, 8],
+        q_start_offsets=[0],
+        block_tables=np.array([[100]], dtype=np.int32),
+        page_size=2,
+        pcp_size=4,
+        interleave_size=2,
+        num_lanes=1,
+        bq_sz=2,
+        pad_kv_pages_to_pcp_group=True,
+    )
+
+    np.testing.assert_array_equal(
+        build_pcp_streaming_active_page_groups(schedule),
+        np.array([1], dtype=np.int32),
+    )
+
+
+def test_build_active_page_groups_rejects_unpadded_schedule_steps():
+    schedule = generate_pcp_streaming_schedule(
+        kv_lens=[8],
+        cu_q_lens=[0, 8],
+        q_start_offsets=[0],
+        block_tables=np.array([[100]], dtype=np.int32),
+        page_size=2,
+        pcp_size=4,
+        interleave_size=2,
+        num_lanes=1,
+        bq_sz=2,
+        pad_kv_pages_to_pcp_group=True,
+    )
+    schedule = dataclasses.replace(
+        schedule, global_actual_steps=np.array([5], dtype=np.int32))
+
+    with pytest.raises(ValueError, match="PCP page group"):
+        build_pcp_streaming_active_page_groups(schedule)
+
+
+def test_generate_schedule_can_pad_steps_without_changing_actual_steps():
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[10],
         cu_q_lens=[0, 2],
         q_start_offsets=[8],
@@ -171,9 +229,9 @@ def test_generate_schedule_can_pad_steps_without_changing_actual_steps():
 def test_generate_schedule_rejects_too_small_step_padding():
     with pytest.raises(ValueError, match="pad_steps_to"):
         generate_pcp_streaming_schedule(
-            kv_lens=[10],
-            cu_q_lens=[0, 2],
-            q_start_offsets=[8],
+            kv_lens=[16],
+            cu_q_lens=[0, 16],
+            q_start_offsets=[0],
             block_tables=np.array([[100, 101]], dtype=np.int32),
             page_size=2,
             pcp_size=4,
@@ -186,7 +244,7 @@ def test_generate_schedule_rejects_too_small_step_padding():
 
 
 def test_schedule_packed_fields_match_unpacked_arrays():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12],
         cu_q_lens=[0, 7],
         q_start_offsets=[5],
@@ -231,7 +289,7 @@ def test_schedule_packed_fields_match_unpacked_arrays():
 
 
 def test_schedule_packed_field_rejects_invalid_field_index():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12],
         cu_q_lens=[0, 7],
         q_start_offsets=[5],
@@ -249,7 +307,7 @@ def test_schedule_packed_field_rejects_invalid_field_index():
 
 
 def test_validate_schedule_lane_invariant_rejects_q_offset_change_inside_tile():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12],
         cu_q_lens=[0, 7],
         q_start_offsets=[5],
@@ -266,6 +324,93 @@ def test_validate_schedule_lane_invariant_rejects_q_offset_change_inside_tile():
 
     with pytest.raises(ValueError, match="q_hbm_offset changed"):
         validate_pcp_streaming_schedule(bad_schedule)
+
+
+def test_vectorized_schedule_matches_reference_for_aligned_qwen_shape():
+    q_len = 4096
+    q_start = 4096
+    kv_len = q_start + q_len
+    pcp_size = 8
+    page_size = interleave_size = 32
+    block_tables = np.arange(64, dtype=np.int32)[None, :]
+
+    actual = generate_pcp_streaming_schedule(
+        kv_lens=[kv_len],
+        cu_q_lens=[0, q_len],
+        q_start_offsets=[q_start],
+        block_tables=block_tables,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        num_lanes=1,
+        bq_sz=256,
+        pad_kv_pages_to_pcp_group=True,
+        pad_steps_to=128,
+        kv_pages_per_block=8,
+    )
+    expected = generate_pcp_streaming_schedule_reference(
+        kv_lens=[kv_len],
+        cu_q_lens=[0, q_len],
+        q_start_offsets=[q_start],
+        block_tables=block_tables,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        num_lanes=1,
+        bq_sz=256,
+        pad_kv_pages_to_pcp_group=True,
+        pad_steps_to=128,
+        kv_pages_per_block=8,
+    )
+
+    _assert_schedule_equal(actual, expected)
+    validate_pcp_streaming_schedule(actual)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"num_lanes": 2}, "num_lanes == 1"),
+        ({"cu_q_lens": [0, 4]}, "q_len"),
+        ({"q_start_offsets": [2], "kv_lens": [10]}, "q_start_offset"),
+        ({"pad_kv_pages_to_pcp_group": False},
+         "pad_kv_pages_to_pcp_group=True"),
+        ({"bq_sz": 3}, "bq_sz"),
+    ],
+)
+def test_vectorized_schedule_rejects_unsupported_shapes(kwargs, match):
+    args = {
+        "kv_lens": [8],
+        "cu_q_lens": [0, 8],
+        "q_start_offsets": [0],
+        "block_tables": np.array([[100]], dtype=np.int32),
+        "page_size": 2,
+        "pcp_size": 4,
+        "interleave_size": 2,
+        "num_lanes": 1,
+        "bq_sz": 2,
+        "pad_kv_pages_to_pcp_group": True,
+    }
+    args.update(kwargs)
+
+    with pytest.raises(NotImplementedError, match=match):
+        generate_pcp_streaming_schedule(**args)
+
+
+def test_vectorized_schedule_rejects_multiple_active_requests():
+    with pytest.raises(NotImplementedError, match="one active request"):
+        generate_pcp_streaming_schedule(
+            kv_lens=[8, 8],
+            cu_q_lens=[0, 8, 16],
+            q_start_offsets=[0, 0],
+            block_tables=np.array([[100], [200]], dtype=np.int32),
+            page_size=2,
+            pcp_size=4,
+            interleave_size=2,
+            num_lanes=1,
+            bq_sz=2,
+            pad_kv_pages_to_pcp_group=True,
+        )
 
 
 def test_generate_schedule_rejects_non_aligned_page_and_interleave_size():

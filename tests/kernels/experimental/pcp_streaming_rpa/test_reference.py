@@ -16,10 +16,10 @@ import numpy as np
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.reference import (
     execute_pcp_streaming_reference)
-from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    generate_pcp_streaming_schedule)
 from tpu_inference.layers.common.pcp_layout import (
     build_pcp_rank_major_token_order)
+from tests.kernels.experimental.pcp_streaming_rpa.schedule_reference import (
+    generate_pcp_streaming_schedule_reference)
 
 
 def _pack_q_rank_major(q_full, token_order, pcp_size):
@@ -91,7 +91,7 @@ def _run_reference_case(q_len, q_global_base, kv_len, num_lanes):
     q_by_rank = _pack_q_rank_major(q_full, token_order, pcp_size)
     kv_cache = _build_pcp_kv_cache(k_full, v_full, block_tables, page_size,
                                    pcp_size)
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[kv_len],
         cu_q_lens=[0, q_len],
         q_start_offsets=[q_global_base],

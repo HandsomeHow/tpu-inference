@@ -19,8 +19,8 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
-    generate_pcp_streaming_schedule)
+from tests.kernels.experimental.pcp_streaming_rpa.schedule_reference import (
+    generate_pcp_streaming_schedule_reference)
 
 pytestmark = pytest.mark.skipif(
     jax.local_devices()[0].platform != "tpu",
@@ -72,7 +72,7 @@ def _stage_schedule_steps(packed_schedule):
 
 
 def test_packed_schedule_step_can_be_staged_from_hbm_to_vmem():
-    schedule = generate_pcp_streaming_schedule(
+    schedule = generate_pcp_streaming_schedule_reference(
         kv_lens=[12],
         cu_q_lens=[0, 7],
         q_start_offsets=[5],
