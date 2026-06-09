@@ -19,8 +19,6 @@ import pytest
 
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField, generate_pcp_streaming_schedule,
-    generate_pcp_streaming_schedule_template,
-    materialize_pcp_streaming_schedule_template,
     unpack_pcp_streaming_schedule_field, validate_pcp_streaming_schedule)
 
 
@@ -248,84 +246,6 @@ def test_schedule_packed_field_rejects_invalid_field_index():
     with pytest.raises(ValueError, match="invalid schedule field"):
         unpack_pcp_streaming_schedule_field(schedule.packed_schedule,
                                             ScheduleField.NUM_FIELDS)
-
-
-def test_schedule_template_materializes_runtime_page_ids():
-    block_tables = np.array([[101, 103, 107, 109]], dtype=np.int32)
-    full = generate_pcp_streaming_schedule(
-        kv_lens=[16],
-        cu_q_lens=[0, 8],
-        q_start_offsets=[8],
-        block_tables=block_tables,
-        page_size=2,
-        pcp_size=4,
-        interleave_size=2,
-        num_lanes=1,
-        bq_sz=4,
-        pad_kv_pages_to_pcp_group=True,
-        pad_steps_to=12,
-    )
-    template = generate_pcp_streaming_schedule_template(
-        kv_lens=[16],
-        cu_q_lens=[0, 8],
-        q_start_offsets=[8],
-        block_tables=block_tables,
-        page_size=2,
-        pcp_size=4,
-        interleave_size=2,
-        num_lanes=1,
-        bq_sz=4,
-        pad_kv_pages_to_pcp_group=True,
-        pad_steps_to=12,
-    )
-
-    patched = materialize_pcp_streaming_schedule_template(
-        template, block_tables)
-
-    np.testing.assert_array_equal(patched, full.packed_schedule)
-    np.testing.assert_array_equal(template.actual_steps, full.actual_steps)
-    np.testing.assert_array_equal(template.global_actual_steps,
-                                  full.global_actual_steps)
-
-
-def test_schedule_template_materializes_grouped_page_ids_with_tail_padding():
-    block_tables = np.array([[101, 103, 107, 109, 113]], dtype=np.int32)
-    full = generate_pcp_streaming_schedule(
-        kv_lens=[37],
-        cu_q_lens=[0, 9],
-        q_start_offsets=[28],
-        block_tables=block_tables,
-        page_size=2,
-        pcp_size=4,
-        interleave_size=2,
-        num_lanes=1,
-        bq_sz=4,
-        pad_kv_pages_to_pcp_group=True,
-        pad_steps_to=24,
-        kv_pages_per_block=2,
-    )
-    template = generate_pcp_streaming_schedule_template(
-        kv_lens=[37],
-        cu_q_lens=[0, 9],
-        q_start_offsets=[28],
-        block_tables=block_tables,
-        page_size=2,
-        pcp_size=4,
-        interleave_size=2,
-        num_lanes=1,
-        bq_sz=4,
-        pad_kv_pages_to_pcp_group=True,
-        pad_steps_to=24,
-        kv_pages_per_block=2,
-    )
-
-    patched = materialize_pcp_streaming_schedule_template(
-        template, block_tables)
-
-    np.testing.assert_array_equal(patched, full.packed_schedule)
-    np.testing.assert_array_equal(template.actual_steps, full.actual_steps)
-    np.testing.assert_array_equal(template.global_actual_steps,
-                                  full.global_actual_steps)
 
 
 def test_validate_schedule_lane_invariant_rejects_q_offset_change_inside_tile():

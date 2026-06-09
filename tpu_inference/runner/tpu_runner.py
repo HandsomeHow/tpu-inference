@@ -15,7 +15,6 @@
 import functools
 import logging
 import random
-import time
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -53,9 +52,7 @@ import tpu_inference.envs as envs
 from tpu_inference import utils as common_utils
 from tpu_inference.kernels.experimental.pcp_streaming_rpa.schedule import (
     ScheduleField, _iter_pcp_q_tiles, _q_global_last_for_strided_tile,
-    PcpStreamingScheduleTemplate, generate_pcp_streaming_schedule,
-    generate_pcp_streaming_schedule_template,
-    materialize_pcp_streaming_schedule_template)
+    generate_pcp_streaming_schedule)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.pcp_layout import (
     apply_pcp_rank_major_token_order as _apply_pcp_rank_major_token_order,
@@ -441,51 +438,6 @@ class _PCPAttentionMetadataHost:
     streaming_active_page_groups: np.ndarray | None = None
 
 
-@dataclass(frozen=True)
-class _PCPStreamingScheduleTemplateKey:
-    q_lens: tuple[int, ...]
-    kv_lens: tuple[int, ...]
-    q_start_offsets: tuple[int, ...]
-    source_block_table_shape: tuple[int, int]
-    padded_num_tokens: int
-    pcp_size: int
-    block_size: int
-    interleave_size: int
-    streaming_num_lanes: int
-    streaming_q_block_size: int
-    streaming_kv_pages_per_block: int
-    pad_steps_to: int
-    pad_kv_pages_to_pcp_group: bool
-
-
-class _PCPStreamingScheduleTemplateCache:
-    """Caches logical PCP streaming schedules without physical page ids."""
-
-    def __init__(self) -> None:
-        self._templates: dict[_PCPStreamingScheduleTemplateKey,
-                              PcpStreamingScheduleTemplate] = {}
-        self.misses = 0
-
-    def get_or_create(
-        self,
-        key: _PCPStreamingScheduleTemplateKey,
-        factory: Callable[[], PcpStreamingScheduleTemplate],
-    ) -> PcpStreamingScheduleTemplate:
-        template = self._templates.get(key)
-        if template is None:
-            template = factory()
-            self._templates[key] = template
-            self.misses += 1
-        return template
-
-    def clear(self) -> None:
-        self._templates.clear()
-        self.misses = 0
-
-    def __len__(self) -> int:
-        return len(self._templates)
-
-
 def _build_pcp_local_slot_ids(
     q_lens: np.ndarray,
     seq_lens: np.ndarray,
@@ -691,296 +643,6 @@ def _build_pcp_decode_attention_metadata(
     }
 
 
-def _pcp_streaming_schedule_template_cache_supported(
-    q_lens: np.ndarray,
-    kv_lens: np.ndarray,
-    source_block_tables: np.ndarray,
-    block_size: int,
-    interleave_size: int,
-    streaming_num_lanes: int,
-    streaming_q_block_size: int,
-    streaming_kv_pages_per_block: int,
-    pad_steps_to: int,
-) -> bool:
-    if source_block_tables.ndim != 2:
-        return False
-    if q_lens.ndim != 1 or kv_lens.ndim != 1 or q_lens.size != kv_lens.size:
-        return False
-    if source_block_tables.shape[0] < q_lens.size:
-        return False
-    if block_size != interleave_size:
-        return False
-    if streaming_num_lanes <= 0 or streaming_q_block_size <= 0:
-        return False
-    if streaming_kv_pages_per_block <= 0:
-        return False
-    if streaming_kv_pages_per_block > ScheduleField.MAX_KV_PAGES_PER_BLOCK:
-        return False
-    if pad_steps_to < 0:
-        return False
-    return True
-
-
-def _make_pcp_streaming_schedule_template_key(
-    q_lens: np.ndarray,
-    kv_lens: np.ndarray,
-    q_start_offsets: np.ndarray,
-    source_block_tables: np.ndarray,
-    padded_num_tokens: int,
-    pcp_size: int,
-    block_size: int,
-    interleave_size: int,
-    streaming_num_lanes: int,
-    streaming_q_block_size: int,
-    streaming_kv_pages_per_block: int,
-    pad_steps_to: int,
-    pad_kv_pages_to_pcp_group: bool,
-) -> _PCPStreamingScheduleTemplateKey:
-    return _PCPStreamingScheduleTemplateKey(
-        q_lens=tuple(int(x) for x in q_lens.tolist()),
-        kv_lens=tuple(int(x) for x in kv_lens.tolist()),
-        q_start_offsets=tuple(int(x) for x in q_start_offsets.tolist()),
-        source_block_table_shape=tuple(
-            int(x) for x in source_block_tables.shape),
-        padded_num_tokens=int(padded_num_tokens),
-        pcp_size=int(pcp_size),
-        block_size=int(block_size),
-        interleave_size=int(interleave_size),
-        streaming_num_lanes=int(streaming_num_lanes),
-        streaming_q_block_size=int(streaming_q_block_size),
-        streaming_kv_pages_per_block=int(streaming_kv_pages_per_block),
-        pad_steps_to=int(pad_steps_to),
-        pad_kv_pages_to_pcp_group=bool(pad_kv_pages_to_pcp_group),
-    )
-
-
-def _pcp_padded_tokens_for_prefill_chunk(
-    q_len: int,
-    q_start_offset: int,
-    num_token_paddings_per_dp: list[int],
-    pcp_size: int,
-    interleave_size: int,
-) -> int:
-    local_counts = _pcp_local_token_counts(
-        [q_len],
-        pcp_size,
-        interleave_size,
-        token_start_offsets_per_req=np.asarray([q_start_offset],
-                                               dtype=np.int32),
-    )
-    max_num_scheduled_tokens = max(int(q_len),
-                                   int(local_counts.max()) * pcp_size)
-    padded_num_tokens = runner_utils.get_padded_token_len(
-        num_token_paddings_per_dp, max_num_scheduled_tokens)
-    return common_utils.align_to(padded_num_tokens, pcp_size)
-
-
-def _prewarm_pcp_streaming_schedule_template_cache(
-    cache: _PCPStreamingScheduleTemplateCache,
-    *,
-    max_sequence_len: int,
-    chunk_size: int,
-    pages_per_seq: int,
-    max_num_reqs_per_dp_rank: int,
-    num_token_paddings_per_dp: list[int],
-    pcp_size: int,
-    block_size: int,
-    interleave_size: int,
-    streaming_num_lanes: int,
-    streaming_q_block_size: int,
-    streaming_kv_pages_per_block: int,
-) -> int:
-    if pcp_size <= 1 or max_sequence_len <= 0 or chunk_size <= 0:
-        return 0
-    virtual_blocks_per_req = cdiv(pages_per_seq, pcp_size)
-    source_block_tables = np.zeros(
-        (max_num_reqs_per_dp_rank, virtual_blocks_per_req), dtype=np.int32)
-    if not _pcp_streaming_schedule_template_cache_supported(
-            np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32),
-            np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32),
-            source_block_tables,
-            block_size,
-            interleave_size,
-            streaming_num_lanes,
-            streaming_q_block_size,
-            streaming_kv_pages_per_block,
-            pad_steps_to=0,
-    ):
-        return 0
-
-    generated = 0
-    seq_len = 0
-    while seq_len < max_sequence_len:
-        q_len = min(chunk_size, max_sequence_len - seq_len)
-        q_start_offset = seq_len
-        seq_len += q_len
-
-        q_lens = np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32)
-        kv_lens = np.zeros(max_num_reqs_per_dp_rank, dtype=np.int32)
-        q_lens[0] = q_len
-        kv_lens[0] = seq_len
-        q_start_offsets = kv_lens - q_lens
-        cu_q_lens = np.pad(np.cumsum(q_lens, dtype=np.int32), (1, 0))
-        padded_num_tokens = _pcp_padded_tokens_for_prefill_chunk(
-            q_len,
-            q_start_offset,
-            num_token_paddings_per_dp,
-            pcp_size,
-            interleave_size,
-        )
-        local_padded_num_tokens = padded_num_tokens // pcp_size
-        if local_padded_num_tokens % streaming_q_block_size != 0:
-            continue
-        max_streaming_steps = _estimate_pcp_streaming_schedule_steps_ub(
-            q_lens,
-            capacity_tokens=virtual_blocks_per_req * pcp_size * block_size,
-            block_size=block_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            num_lanes=streaming_num_lanes,
-            q_block_size=streaming_q_block_size,
-            kv_pages_per_block=streaming_kv_pages_per_block,
-        )
-        key = _make_pcp_streaming_schedule_template_key(
-            q_lens=q_lens,
-            kv_lens=kv_lens,
-            q_start_offsets=q_start_offsets,
-            source_block_tables=source_block_tables,
-            padded_num_tokens=padded_num_tokens,
-            pcp_size=pcp_size,
-            block_size=block_size,
-            interleave_size=interleave_size,
-            streaming_num_lanes=streaming_num_lanes,
-            streaming_q_block_size=streaming_q_block_size,
-            streaming_kv_pages_per_block=streaming_kv_pages_per_block,
-            pad_steps_to=max_streaming_steps,
-            pad_kv_pages_to_pcp_group=True,
-        )
-        misses_before = cache.misses
-        kv_lens_copy = kv_lens.copy()
-        cu_q_lens_copy = cu_q_lens.copy()
-        q_start_offsets_copy = q_start_offsets.copy()
-
-        def make_template(
-            kv=kv_lens_copy,
-            cu=cu_q_lens_copy,
-            qso=q_start_offsets_copy,
-            sbt=source_block_tables,
-            steps=max_streaming_steps,
-        ) -> PcpStreamingScheduleTemplate:
-            return generate_pcp_streaming_schedule_template(
-                kv_lens=kv,
-                cu_q_lens=cu,
-                q_start_offsets=qso,
-                block_tables=sbt,
-                page_size=block_size,
-                pcp_size=pcp_size,
-                interleave_size=interleave_size,
-                num_lanes=streaming_num_lanes,
-                bq_sz=streaming_q_block_size,
-                pad_kv_pages_to_pcp_group=True,
-                pad_steps_to=steps,
-                kv_pages_per_block=streaming_kv_pages_per_block,
-            )
-
-        cache.get_or_create(
-            key,
-            make_template,
-        )
-        generated += cache.misses - misses_before
-    return generated
-
-
-def _build_pcp_streaming_schedule_host(
-    kv_lens: np.ndarray,
-    cu_q_lens: np.ndarray,
-    q_start_offsets: np.ndarray,
-    source_block_tables: np.ndarray,
-    padded_num_tokens: int,
-    pcp_size: int,
-    block_size: int,
-    interleave_size: int,
-    streaming_num_lanes: int,
-    streaming_q_block_size: int,
-    streaming_kv_pages_per_block: int,
-    pad_steps_to: int,
-    streaming_schedule_template_cache: Optional[
-        _PCPStreamingScheduleTemplateCache],
-) -> tuple[np.ndarray, np.ndarray]:
-    pad_kv_pages_to_pcp_group = True
-
-    def generate_full_schedule() -> tuple[np.ndarray, np.ndarray]:
-        schedule = generate_pcp_streaming_schedule(
-            kv_lens=kv_lens,
-            cu_q_lens=cu_q_lens,
-            q_start_offsets=q_start_offsets,
-            block_tables=source_block_tables,
-            page_size=block_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            num_lanes=streaming_num_lanes,
-            bq_sz=streaming_q_block_size,
-            pad_kv_pages_to_pcp_group=pad_kv_pages_to_pcp_group,
-            pad_steps_to=pad_steps_to,
-            kv_pages_per_block=streaming_kv_pages_per_block,
-        )
-        return schedule.packed_schedule, schedule.global_actual_steps
-
-    if (streaming_schedule_template_cache is None
-            or not _pcp_streaming_schedule_template_cache_supported(
-                cu_q_lens[1:] - cu_q_lens[:-1],
-                kv_lens,
-                source_block_tables,
-                block_size,
-                interleave_size,
-                streaming_num_lanes,
-                streaming_q_block_size,
-                streaming_kv_pages_per_block,
-                pad_steps_to,
-            )):
-        return generate_full_schedule()
-
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    key = _make_pcp_streaming_schedule_template_key(
-        q_lens=q_lens,
-        kv_lens=kv_lens,
-        q_start_offsets=q_start_offsets,
-        source_block_tables=source_block_tables,
-        padded_num_tokens=padded_num_tokens,
-        pcp_size=pcp_size,
-        block_size=block_size,
-        interleave_size=interleave_size,
-        streaming_num_lanes=streaming_num_lanes,
-        streaming_q_block_size=streaming_q_block_size,
-        streaming_kv_pages_per_block=streaming_kv_pages_per_block,
-        pad_steps_to=pad_steps_to,
-        pad_kv_pages_to_pcp_group=pad_kv_pages_to_pcp_group,
-    )
-
-    template = streaming_schedule_template_cache.get_or_create(
-        key,
-        lambda: generate_pcp_streaming_schedule_template(
-            kv_lens=kv_lens,
-            cu_q_lens=cu_q_lens,
-            q_start_offsets=q_start_offsets,
-            block_tables=source_block_tables,
-            page_size=block_size,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            num_lanes=streaming_num_lanes,
-            bq_sz=streaming_q_block_size,
-            pad_kv_pages_to_pcp_group=pad_kv_pages_to_pcp_group,
-            pad_steps_to=pad_steps_to,
-            kv_pages_per_block=streaming_kv_pages_per_block,
-        ),
-    )
-    return (
-        materialize_pcp_streaming_schedule_template(template,
-                                                    source_block_tables),
-        template.global_actual_steps,
-    )
-
-
 def _build_pcp_attention_metadata(
     num_scheduled_tokens_per_req: list[int] | np.ndarray,
     seq_lens_per_req: list[int] | np.ndarray,
@@ -994,8 +656,6 @@ def _build_pcp_attention_metadata(
     streaming_num_lanes: int = 1,
     streaming_q_block_size: int = 256,
     streaming_kv_pages_per_block: int = 1,
-    streaming_schedule_template_cache: Optional[
-        _PCPStreamingScheduleTemplateCache] = None,
 ) -> _PCPAttentionMetadataHost:
     """Build runner-owned local-Q/full-KV metadata for one DP rank."""
     if pcp_size <= 1:
@@ -1061,27 +721,25 @@ def _build_pcp_attention_metadata(
             kv_pages_per_block=streaming_kv_pages_per_block,
         )
         cu_q_lens = np.pad(np.cumsum(q_lens_full, dtype=np.int32), (1, 0))
-        streaming_schedule, global_actual_steps = (
-            _build_pcp_streaming_schedule_host(
-                kv_lens=kv_lens_full,
-                cu_q_lens=cu_q_lens,
-                q_start_offsets=q_global_base,
-                source_block_tables=source_block_tables,
-                padded_num_tokens=padded_num_tokens,
-                pcp_size=pcp_size,
-                block_size=block_size,
-                interleave_size=interleave_size,
-                streaming_num_lanes=streaming_num_lanes,
-                streaming_q_block_size=streaming_q_block_size,
-                streaming_kv_pages_per_block=streaming_kv_pages_per_block,
-                pad_steps_to=max_streaming_steps,
-                streaming_schedule_template_cache=(
-                    streaming_schedule_template_cache),
-            ))
-        actual_steps = int(global_actual_steps[0])
+        streaming_schedule_host = generate_pcp_streaming_schedule(
+            kv_lens=kv_lens_full,
+            cu_q_lens=cu_q_lens,
+            q_start_offsets=q_global_base,
+            block_tables=source_block_tables,
+            page_size=block_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            num_lanes=streaming_num_lanes,
+            bq_sz=streaming_q_block_size,
+            pad_kv_pages_to_pcp_group=True,
+            pad_steps_to=max_streaming_steps,
+            kv_pages_per_block=streaming_kv_pages_per_block,
+        )
+        actual_steps = int(streaming_schedule_host.global_actual_steps[0])
         if actual_steps % pcp_size != 0:
             raise ValueError("PCP streaming schedule steps must be padded to a "
                              "PCP page group.")
+        streaming_schedule = streaming_schedule_host.packed_schedule
         streaming_active_page_groups = np.array([actual_steps // pcp_size],
                                                 dtype=np.int32)
 
@@ -1200,8 +858,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
         self.batch_counter = 0
-        self._pcp_streaming_schedule_template_cache = (
-            _PCPStreamingScheduleTemplateCache())
 
         self.kv_caches: list[jax.Array] = []
         self.layer_name_to_kvcache_index: dict[str, int] = {}
@@ -1636,85 +1292,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if has_kv_transfer_group():
             get_kv_transfer_group().register_runner(self)
 
-        self._prewarm_pcp_streaming_schedule_template_cache()
-
     def delete_kv_cache(self) -> None:
         self.kv_cache_manager.delete_kv_cache()
 
     def reinitialize_kv_cache(self) -> None:
         self.kv_cache_manager.reinitialize_kv_cache()
-
-    def _prewarm_pcp_streaming_schedule_template_cache(self) -> None:
-        cache = self._pcp_streaming_schedule_template_cache
-        cache.clear()
-        pcp_size, interleave_size = _get_pcp_parallel_config(self.vllm_config)
-        if pcp_size <= 1 or not envs.USE_PCP_STREAMING_RPA_KERNEL:
-            return
-        if not getattr(self, "kv_cache_config", None):
-            return
-        if not self.kv_cache_config.kv_cache_groups:
-            return
-
-        streaming_num_lanes = envs.PCP_STREAMING_RPA_NUM_LANES
-        streaming_q_block_size = envs.PCP_STREAMING_RPA_Q_BLOCK_SIZE
-        streaming_kv_pages_per_block = max(
-            1,
-            min(ScheduleField.MAX_KV_PAGES_PER_BLOCK,
-                envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE // self.block_size),
-        )
-        max_num_reqs_per_dp_rank = self.max_num_reqs // self.dp_size
-        chunk_size = self.scheduler_config.max_num_batched_tokens
-        pages_per_seq_values: set[int] = set()
-        for gid, kv_cache_group in enumerate(
-                self.kv_cache_config.kv_cache_groups):
-            if not _kv_cache_group_supports_pcp_attention_metadata(
-                    kv_cache_group):
-                continue
-            block_table_obj = self.input_batch.block_table[gid]
-            pages_per_seq_values.add(
-                int(block_table_obj.max_num_blocks_per_req))
-
-        if not pages_per_seq_values:
-            return
-
-        start_time = time.perf_counter()
-        generated = 0
-        for pages_per_seq in sorted(pages_per_seq_values):
-            generated += _prewarm_pcp_streaming_schedule_template_cache(
-                cache,
-                max_sequence_len=self.max_model_len,
-                chunk_size=chunk_size,
-                pages_per_seq=pages_per_seq,
-                max_num_reqs_per_dp_rank=max_num_reqs_per_dp_rank,
-                num_token_paddings_per_dp=self.num_tokens_paddings_per_dp,
-                pcp_size=pcp_size,
-                block_size=self.block_size,
-                interleave_size=interleave_size,
-                streaming_num_lanes=streaming_num_lanes,
-                streaming_q_block_size=streaming_q_block_size,
-                streaming_kv_pages_per_block=streaming_kv_pages_per_block,
-            )
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(
-            "Prewarmed PCP streaming schedule templates | templates=%d | "
-            "generated=%d | max_model_len=%d | chunk_size=%d | "
-            "pages_per_seq=%s | max_num_reqs_per_dp_rank=%d | pcp_size=%d | "
-            "block_size=%d | interleave_size=%d | lanes=%d | q_block_size=%d | "
-            "kv_pages_per_block=%d | elapsed_ms=%.2f",
-            len(cache),
-            generated,
-            self.max_model_len,
-            chunk_size,
-            sorted(pages_per_seq_values),
-            max_num_reqs_per_dp_rank,
-            pcp_size,
-            self.block_size,
-            interleave_size,
-            streaming_num_lanes,
-            streaming_q_block_size,
-            streaming_kv_pages_per_block,
-            elapsed_ms,
-        )
 
     def capture_model(self) -> None:
         self.compilation_manager.capture_model()
@@ -2971,9 +2553,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     envs.PCP_STREAMING_RPA_KV_BLOCK_SIZE // self.block_size,
                 ),
             )
-            pcp_streaming_schedule_template_cache = (
-                self._pcp_streaming_schedule_template_cache
-                if build_pcp_streaming_schedule else None)
             for gid, block_tables_view in block_table_views_by_gid.items():
                 kv_cache_group = self.kv_cache_config.kv_cache_groups[gid]
                 if not _kv_cache_group_supports_pcp_attention_metadata(
@@ -3003,8 +2582,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                     pcp_streaming_q_block_size),
                                 streaming_kv_pages_per_block=(
                                     pcp_streaming_kv_pages_per_block),
-                                streaming_schedule_template_cache=(
-                                    pcp_streaming_schedule_template_cache),
                             ))
                     host_pcp_metadata = _merge_pcp_attention_metadata(
                         metadata_per_dp)
