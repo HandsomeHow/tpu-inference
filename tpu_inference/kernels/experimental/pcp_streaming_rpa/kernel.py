@@ -445,6 +445,7 @@ def _pcp_streaming_attention_page_groups_kernel(
 
                 if round_idx < pcp_size - 1:
                     remote_op.wait()
+                    util.local_barrier(prev_device_id, next_device_id)
 
             l_broadcast = jnp.broadcast_to(l, acc.shape)
             o_vmem_ref[...] = jnp.where(l_broadcast > 0, acc / l_broadcast,
@@ -630,6 +631,7 @@ def _pcp_streaming_attention_page_groups_multi_head_kernel(
 
                 if round_idx < pcp_size - 1:
                     remote_op.wait()
+                    util.local_barrier(prev_device_id, next_device_id)
 
             l = jnp.stack(l_states, axis=1)
             acc = jnp.stack(acc_states, axis=1)
