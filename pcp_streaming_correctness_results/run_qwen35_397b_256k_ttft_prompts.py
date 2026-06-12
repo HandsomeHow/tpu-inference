@@ -304,6 +304,7 @@ def run_mode(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = AutoTokenizer.from_pretrained(str(MODEL), trust_remote_code=True)
     served_model_name, cmd = server_command(args.mode, args.port)
     env = mode_env(args.mode)
+    prompt_len = args.prompt_len
     env_record_keys = [
         "PYTHONPATH",
         "JAX_PLATFORMS",
@@ -328,7 +329,7 @@ def run_mode(args: argparse.Namespace) -> dict[str, Any]:
         "served_model_name": served_model_name,
         "server_command": cmd,
         "server_env": {key: env.get(key) for key in env_record_keys},
-        "prompt_len": PROMPT_LEN,
+        "prompt_len": prompt_len,
         "warmup_prompt_len": WARMUP_PROMPT_LEN,
         "prompt_kinds": prompt_kinds,
         "results": [],
@@ -366,10 +367,10 @@ def run_mode(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 print(
                     f"[{now_stamp()}] measure {args.mode}/{kind} "
-                    f"prompt_len={PROMPT_LEN}",
+                    f"prompt_len={prompt_len}",
                     flush=True,
                 )
-                ids = prompt_ids(kind, PROMPT_LEN, tokenizer)
+                ids = prompt_ids(kind, prompt_len, tokenizer)
                 preview = tokenizer.decode(ids[:128], skip_special_tokens=False)
                 measure = post_streaming_completion(
                     endpoint=endpoint,
@@ -385,7 +386,7 @@ def run_mode(args: argparse.Namespace) -> dict[str, Any]:
                     "warmup": warmup,
                     "measure": measure,
                 }
-                out_json = run_dir / f"{args.mode}_{kind}_prompt{PROMPT_LEN}.json"
+                out_json = run_dir / f"{args.mode}_{kind}_prompt{prompt_len}.json"
                 out_json.write_text(json.dumps(result, indent=2, sort_keys=True))
                 summary["results"].append({
                     "prompt_kind": kind,
@@ -418,6 +419,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["pcp8", "tp8"], required=True)
     parser.add_argument("--prompt-kinds", default="repeated,semantic")
+    parser.add_argument("--prompt-len", type=int, default=PROMPT_LEN)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument(
         "--out-dir",

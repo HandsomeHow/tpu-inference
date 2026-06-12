@@ -222,6 +222,23 @@ HLO computation: main.1247_spmd; HLO module: jit_step_fun
 This should be treated as a TP=8 batched-RPA runtime/compiler/kernel failure
 for this exact 256K configuration, not as a slow TTFT measurement.
 
+### 128K Semantic Follow-Up
+
+Because the 256K TP=8 batched-RPA runs failed after `196608` prompt tokens had
+already been computed, a shorter real-semantic prompt was run to check whether
+TP=8 can complete below that length. The same server limits and request shape
+were kept, and only the measured prompt length changed to `131072`.
+
+| Serving mode | Prompt kind | Prompt length | 128K TTFT | Status |
+| --- | --- | ---: | ---: | --- |
+| TP=8, PCP=1, batched RPA | `semantic` | `131072` | `12.996951603796333 s` | success |
+| PCP=8, TP=1, PCP streaming RPA | `semantic` | `131072` | `10.917537875007838 s` | success |
+
+Both runs returned the same first token id `7948` (`" warm"`). For this 128K
+semantic prompt, PCP=8 was `2.079413728788495 s` faster than TP=8, about
+`16.0%` lower TTFT relative to the TP=8 measurement. Equivalently, TP=8 was
+about `19.0%` slower than PCP=8.
+
 ### Prompt and Request Code
 
 The measured request was sent to `/v1/completions` with token ids directly in
@@ -261,6 +278,9 @@ def prompt_ids(kind, length, tokenizer):
 
 Run from the `tpu-inference` repo root.
 
+The script defaults to `--prompt-len 262144`; shorter prompt scans can pass an
+explicit `--prompt-len`.
+
 PCP=8, both prompt variants:
 
 ```bash
@@ -290,6 +310,30 @@ a separate server process:
   pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py \
   --mode tp8 \
   --prompt-kinds semantic \
+  --port 18200
+```
+
+128K semantic TP=8 batched-RPA:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py \
+  --mode tp8 \
+  --prompt-kinds semantic \
+  --prompt-len 131072 \
+  --out-dir pcp_streaming_correctness_results/ttft_128k_prompt_kinds \
+  --port 18200
+```
+
+128K semantic PCP=8:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py \
+  --mode pcp8 \
+  --prompt-kinds semantic \
+  --prompt-len 131072 \
+  --out-dir pcp_streaming_correctness_results/ttft_128k_prompt_kinds \
   --port 18200
 ```
 
@@ -384,4 +428,10 @@ TP=8 batched-RPA server command:
 
 /mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-054615/tp8/tp8_summary.json
 /mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-054615/tp8/server.log
+
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_128k_prompt_kinds/20260612-075035/tp8/tp8_summary.json
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_128k_prompt_kinds/20260612-075035/tp8/server.log
+
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_128k_prompt_kinds/20260612-075540/pcp8/pcp8_summary.json
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_128k_prompt_kinds/20260612-075540/pcp8/server.log
 ```
