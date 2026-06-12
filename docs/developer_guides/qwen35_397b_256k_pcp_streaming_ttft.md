@@ -160,3 +160,228 @@ For comparison, the same 256K PCP service before eager template prewarm measured
 about `35.43-35.72 s` TTFT with the same first token and logprob. The eager
 prewarm run moved the roughly 64-template host generation cost into engine
 initialization.
+
+## 2026-06-12 Prompt Variants and TP=8 Batched-RPA Rerun
+
+This follow-up reran the PCP=8 case with two explicit prompt construction
+methods, then changed only the parallel serving mode from PCP=8 to TP=8 and
+enabled the batched RPA kernel. The request shape and main serving limits were
+kept the same.
+
+- repo revision: `1a58adb4b487d6483f3b0e4540999ab02ad164c9`
+- model: `/home/xiaohao_yxh/workspace/models/Qwen3.5-397B-A17B-FP8`
+- prompt length: `262144`
+- warmup prompt length: `32768`
+- chunked prefill size: `4096`
+- max model length: `263168`
+- max generated tokens: `1`
+- stream: enabled
+- expert parallel: enabled
+- block size: `32`
+- prompt variants:
+  - `repeated`: token id `23066` repeated `262144` times
+  - `semantic`: a deterministic coherent technical paragraph tokenized,
+    repeated, and truncated to `262144` tokens
+- measurement script:
+  `pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py`
+
+### Result Summary
+
+| Serving mode | Prompt kind | 256K TTFT | Status |
+| --- | --- | ---: | --- |
+| PCP=8, TP=1, PCP streaming RPA | `repeated` | `29.330640106927603 s` | success |
+| PCP=8, TP=1, PCP streaming RPA | `semantic` | `28.02062379801646 s` | success |
+| TP=8, PCP=1, batched RPA | `repeated` | n/a | EngineCore fatal before first token |
+| TP=8, PCP=1, batched RPA | `semantic` | n/a | EngineCore fatal before first token |
+
+The PCP=8 `semantic` TTFT is close to the earlier single-prompt result
+`28.477003111038357 s`. The TP=8 batched-RPA configuration did not produce a
+valid TTFT for either prompt kind because the engine terminated before any
+token-bearing streaming chunk was returned.
+
+The TP=8 logs confirmed the intended runtime mode:
+
+```text
+Using experimental batched RPA kernel
+Init mesh | mesh=Mesh(... 'model': 8, ... 'pcp': 1, ...)
+regular_attn_shape=(num_blocks, (32, 8, 2, 256))
+```
+
+Both TP=8 failures occurred while processing the 256K measured request after
+`196608` prompt tokens had been computed and the next `4096` token chunk was
+scheduled:
+
+```text
+num_computed_tokens=[196608]
+total_num_scheduled_tokens=4096
+jax.errors.JaxRuntimeError: INTERNAL: E0200: RuntimeUnexpectedCoreHalt
+Detailed error: ... HLO: RPAm-p32-b2-q1024-k1024.1;
+HLO computation: main.1247_spmd; HLO module: jit_step_fun
+```
+
+This should be treated as a TP=8 batched-RPA runtime/compiler/kernel failure
+for this exact 256K configuration, not as a slow TTFT measurement.
+
+### Prompt and Request Code
+
+The measured request was sent to `/v1/completions` with token ids directly in
+the `prompt` field to avoid retokenization differences:
+
+```python
+payload = {
+    "model": served_model_name,
+    "prompt": ids,
+    "add_special_tokens": False,
+    "temperature": 0.0,
+    "repetition_penalty": 1.0,
+    "max_tokens": 1,
+    "logprobs": 1,
+    "return_tokens_as_token_ids": True,
+    "stream": True,
+    "stream_options": {"include_usage": True},
+}
+```
+
+Prompt construction:
+
+```python
+REPEATED_TOKEN_ID = 23066
+
+def prompt_ids(kind, length, tokenizer):
+    if kind == "repeated":
+        return [REPEATED_TOKEN_ID] * length
+    if kind == "semantic":
+        base = tokenizer.encode(SEMANTIC_TEXT, add_special_tokens=False)
+        repeats = (length + len(base) - 1) // len(base)
+        return (base * repeats)[:length]
+    raise ValueError(f"unknown prompt kind: {kind}")
+```
+
+### Reproduction Commands
+
+Run from the `tpu-inference` repo root.
+
+PCP=8, both prompt variants:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py \
+  --mode pcp8 \
+  --prompt-kinds repeated,semantic \
+  --port 18200
+```
+
+TP=8 batched-RPA, both prompt variants:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py \
+  --mode tp8 \
+  --prompt-kinds repeated,semantic \
+  --port 18200
+```
+
+Because the first TP=8 measured prompt killed the engine before the second
+prompt kind could run in the same process, the semantic TP=8 case was rerun as
+a separate server process:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  pcp_streaming_correctness_results/run_qwen35_397b_256k_ttft_prompts.py \
+  --mode tp8 \
+  --prompt-kinds semantic \
+  --port 18200
+```
+
+### Server Environment
+
+Common environment:
+
+```bash
+export PYTHONPATH="/mnt/data/workspace/llm/vllm:/mnt/data/workspace/llm/tpu-inference:${PYTHONPATH:-}"
+export JAX_PLATFORMS=tpu,cpu
+export SKIP_JAX_PRECOMPILE=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export NEW_MODEL_DESIGN=1
+```
+
+PCP=8 kernel environment:
+
+```bash
+export USE_BATCHED_RPA_KERNEL=0
+export USE_PCP_STREAMING_RPA_KERNEL=1
+export PCP_STREAMING_RPA_NUM_LANES=1
+export PCP_STREAMING_RPA_Q_BLOCK_SIZE=256
+export PCP_STREAMING_RPA_KV_BLOCK_SIZE=256
+```
+
+TP=8 batched-RPA kernel environment:
+
+```bash
+export USE_BATCHED_RPA_KERNEL=1
+export USE_PCP_STREAMING_RPA_KERNEL=0
+export PCP_STREAMING_RPA_NUM_LANES=1
+export PCP_STREAMING_RPA_Q_BLOCK_SIZE=256
+export PCP_STREAMING_RPA_KV_BLOCK_SIZE=256
+```
+
+### Server Commands
+
+PCP=8 server command:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  -m vllm.entrypoints.openai.api_server \
+  --host 127.0.0.1 \
+  --port 18200 \
+  --model /home/xiaohao_yxh/workspace/models/Qwen3.5-397B-A17B-FP8 \
+  --served-model-name qwen397b-pcp8-ep8-tp1-256k \
+  --trust-remote-code \
+  --max-model-len 263168 \
+  --enable-expert-parallel \
+  --block-size 32 \
+  --gpu-memory-utilization 0.7 \
+  --no-enable-prefix-caching \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 1 \
+  --enable-chunked-prefill \
+  --no-async-scheduling \
+  --prefill-context-parallel-size 8 \
+  --cp-kv-cache-interleave-size 32
+```
+
+TP=8 batched-RPA server command:
+
+```bash
+/mnt/data/workspace/llm/.venv-qwen35-pcp8/bin/python3 \
+  -m vllm.entrypoints.openai.api_server \
+  --host 127.0.0.1 \
+  --port 18200 \
+  --model /home/xiaohao_yxh/workspace/models/Qwen3.5-397B-A17B-FP8 \
+  --served-model-name qwen397b-tp8-ep8-256k-batched-rpa \
+  --trust-remote-code \
+  --max-model-len 263168 \
+  --enable-expert-parallel \
+  --block-size 32 \
+  --gpu-memory-utilization 0.7 \
+  --no-enable-prefix-caching \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 1 \
+  --enable-chunked-prefill \
+  --no-async-scheduling \
+  --tensor-parallel-size 8
+```
+
+### Output Artifacts
+
+```text
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-052702/pcp8/pcp8_summary.json
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-052702/pcp8/server.log
+
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-053631/tp8/tp8_summary.json
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-053631/tp8/server.log
+
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-054615/tp8/tp8_summary.json
+/mnt/data/workspace/llm/tpu-inference/pcp_streaming_correctness_results/ttft_256k_prompt_kinds/20260612-054615/tp8/server.log
+```
